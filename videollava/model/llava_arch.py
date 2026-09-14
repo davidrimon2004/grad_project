@@ -38,7 +38,20 @@ class LlavaMetaModel:
             # VisAlign (Agrawal et al.): projects [text_embed || avg_pooled_visual_embed]
             # back down to hidden_size, refining every text token with global visual context
             # before it enters the LLM. See Eq. 2-4 of the paper.
+            # VisAlign (Agrawal et al.): projects [text_embed || avg_pooled_visual_embed]
+            # back down to hidden_size, refining every text token with global visual context
+            # before it enters the LLM. See Eq. 2-4 of the paper.
             self.visalign_proj = nn.Linear(config.hidden_size * 2, config.hidden_size)
+            
+            # Thesis Ablation: Early Multi-Head Attention (Self & Cross)
+            num_heads = getattr(config, "mha_fusion_heads", 8)
+            self.early_fusion_attn = nn.MultiheadAttention(
+                embed_dim=config.hidden_size,
+                num_heads=num_heads,
+                dropout=0.0,
+                batch_first=True
+            )
+            self.early_fusion_ln = nn.LayerNorm(config.hidden_size)
 
     def get_image_tower(self):
         image_tower = getattr(self, 'image_tower', None)
@@ -159,6 +172,42 @@ class LlavaMetaForCausalLM(ABC):
         # Eq. 4 (partial): project back down to dt -> visually-grounded text embeddings
         t_hat = self.get_visalign_proj()(fused.to(self.get_visalign_proj().weight.dtype))
         return t_hat.to(text_embeds.dtype)
+    
+    def get_early_fusion_attn(self):
+        return self.get_model().early_fusion_attn
+
+    def get_early_fusion_ln(self):
+        return self.get_model().early_fusion_ln
+
+    def text_self_attention_fuse(self, text_embeds):
+        """
+        Thesis Ablation: Self-attention on textual embeddings before sequence assembly.
+        No visual cues are used here.
+        """
+        if text_embeds.shape[0] == 0:
+            return text_embeds
+
+        # [1, Nt, dt] - Query, Key, and Value are ALL just the text
+        q = text_embeds.unsqueeze(0)
+        k = text_embeds.unsqueeze(0)
+        v = text_embeds.unsqueeze(0)
+
+        attn_layer = self.get_early_fusion_attn()
+        target_dtype = attn_layer.in_proj_weight.dtype
+
+        attn_out, _ = attn_layer(
+            query=q.to(target_dtype),
+            key=k.to(target_dtype),
+            value=v.to(target_dtype),
+            need_weights=False
+        )
+
+        # Residual connection + LayerNorm
+        fused = text_embeds + attn_out.squeeze(0).to(text_embeds.dtype)
+        ln_layer = self.get_early_fusion_ln()
+        t_hat = ln_layer(fused.to(ln_layer.weight.dtype)).to(text_embeds.dtype)
+
+        return t_hat
 
     def encode_images(self, images):
         image_features = self.get_model().get_image_tower()(images)
@@ -312,15 +361,20 @@ class LlavaMetaForCausalLM(ABC):
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
 
-            # --- VisAlign: refine every text-token embedding with a global visual summary ---
-            # cur_new_input_embeds alternates [text_0, visual_0, text_1, visual_1, ..., text_num_images]
-            # text chunks sit at even indices, visual chunks at odd indices.
-            if getattr(self.config, "use_visalign", False) and num_images > 0:
-                visual_chunks = [c for idx, c in enumerate(cur_new_input_embeds) if idx % 2 == 1]
-                all_visual = torch.cat(visual_chunks, dim=0)  # all visual tokens for this sample
-                for idx in range(0, len(cur_new_input_embeds), 2):
-                    cur_new_input_embeds[idx] = self.visalign_fuse(cur_new_input_embeds[idx], all_visual)
-            # ---------------------------------------------------------------------------------
+           # --- Thesis Early Fusion Interception ---
+            if num_images > 0:
+                # 1. Thesis Ablation: Text-Only Self Attention
+                if getattr(self.config, "use_text_self_attn", False):
+                    for idx in range(0, len(cur_new_input_embeds), 2):
+                        cur_new_input_embeds[idx] = self.text_self_attention_fuse(cur_new_input_embeds[idx])
+                
+                # 2. VisAlign Baseline (Average Pooling)
+                elif getattr(self.config, "use_visalign", False):
+                    visual_chunks = [c for idx, c in enumerate(cur_new_input_embeds) if idx % 2 == 1]
+                    all_visual = torch.cat(visual_chunks, dim=0)
+                    for idx in range(0, len(cur_new_input_embeds), 2):
+                        cur_new_input_embeds[idx] = self.visalign_fuse(cur_new_input_embeds[idx], all_visual)
+            # ---------------------------------------- 
 
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
