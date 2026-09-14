@@ -35,6 +35,10 @@ class LlavaMetaModel:
             self.video_tower = build_video_tower(config, delay_load=True)
         if getattr(config, "mm_image_tower", None) is not None or getattr(config, "mm_video_tower", None) is not None:
             self.mm_projector = build_vision_projector(config)
+            # VisAlign (Agrawal et al.): projects [text_embed || avg_pooled_visual_embed]
+            # back down to hidden_size, refining every text token with global visual context
+            # before it enters the LLM. See Eq. 2-4 of the paper.
+            self.visalign_proj = nn.Linear(config.hidden_size * 2, config.hidden_size)
 
     def get_image_tower(self):
         image_tower = getattr(self, 'image_tower', None)
@@ -133,6 +137,28 @@ class LlavaMetaForCausalLM(ABC):
 
     def get_video_tower(self):
         return self.get_model().get_video_tower()
+
+    def get_visalign_proj(self):
+        return self.get_model().visalign_proj
+
+    def visalign_fuse(self, text_embeds, visual_embeds):
+        """
+        VisAlign (Agrawal et al., arXiv:2511.05017), Eq. 2-4.
+        text_embeds:   [Nt, dt] textual token embeddings for one sample
+        visual_embeds: [Nv, dt] projected visual token embeddings for the same sample
+        Returns fused textual embeddings T_hat: [Nt, dt]. Visual embeddings are
+        NOT modified here -- only the text side is refined, per the paper.
+        """
+        if text_embeds.shape[0] == 0:
+            return text_embeds
+        # Eq. 2: global visual summary via average pooling
+        v_hat = visual_embeds.mean(dim=0, keepdim=True)  # [1, dt]
+        v_hat = v_hat.expand(text_embeds.shape[0], -1)   # [Nt, dt]
+        # Eq. 3: concat text embedding with global visual summary along dt
+        fused = torch.cat([text_embeds, v_hat], dim=-1)  # [Nt, 2*dt]
+        # Eq. 4 (partial): project back down to dt -> visually-grounded text embeddings
+        t_hat = self.get_visalign_proj()(fused.to(self.get_visalign_proj().weight.dtype))
+        return t_hat.to(text_embeds.dtype)
 
     def encode_images(self, images):
         image_features = self.get_model().get_image_tower()(images)
@@ -285,6 +311,16 @@ class LlavaMetaForCausalLM(ABC):
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+
+            # --- VisAlign: refine every text-token embedding with a global visual summary ---
+            # cur_new_input_embeds alternates [text_0, visual_0, text_1, visual_1, ..., text_num_images]
+            # text chunks sit at even indices, visual chunks at odd indices.
+            if getattr(self.config, "use_visalign", False) and num_images > 0:
+                visual_chunks = [c for idx, c in enumerate(cur_new_input_embeds) if idx % 2 == 1]
+                all_visual = torch.cat(visual_chunks, dim=0)  # all visual tokens for this sample
+                for idx in range(0, len(cur_new_input_embeds), 2):
+                    cur_new_input_embeds[idx] = self.visalign_fuse(cur_new_input_embeds[idx], all_visual)
+            # ---------------------------------------------------------------------------------
 
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
