@@ -182,30 +182,44 @@ class LlavaMetaForCausalLM(ABC):
     def text_self_attention_fuse(self, text_embeds):
         """
         Thesis Ablation: Self-attention on textual embeddings before sequence assembly.
-        No visual cues are used here.
+        Applies a strict causal mask to prevent forward-looking label leakage during training.
         """
         if text_embeds.shape[0] == 0:
             return text_embeds
 
         # [1, Nt, dt] - Query, Key, and Value are ALL just the text
         q = text_embeds.unsqueeze(0)
-        k = text_embeds.unsqueeze(0)
-        v = text_embeds.unsqueeze(0)
-
+        
         attn_layer = self.get_early_fusion_attn()
-        target_dtype = attn_layer.in_proj_weight.dtype
+        
+        # Safely extract the exact device and dtype of the attention layer's weights
+        ref_param = next(attn_layer.parameters())
+        target_dtype = ref_param.dtype
+        target_device = ref_param.device
+        
+        # --- CAUSAL MASK GENERATION ---
+        nt = text_embeds.shape[0]
+        # Creates an (Nt, Nt) matrix with 0 on and below the diagonal, and -inf above it
+        causal_mask = torch.triu(
+            torch.full((nt, nt), float("-inf"), device=target_device, dtype=target_dtype),
+            diagonal=1
+        )
+        # ------------------------------
 
+        # Pass the causal mask into the attn_mask argument
         attn_out, _ = attn_layer(
-            query=q.to(target_dtype),
-            key=k.to(target_dtype),
-            value=v.to(target_dtype),
+            query=q.to(device=target_device, dtype=target_dtype),
+            key=q.to(device=target_device, dtype=target_dtype),
+            value=q.to(device=target_device, dtype=target_dtype),
+            attn_mask=causal_mask,
+            is_causal=True,  # Enables PyTorch FlashAttention optimizations if available
             need_weights=False
         )
 
         # Residual connection + LayerNorm
         fused = text_embeds + attn_out.squeeze(0).to(text_embeds.dtype)
         ln_layer = self.get_early_fusion_ln()
-        t_hat = ln_layer(fused.to(ln_layer.weight.dtype)).to(text_embeds.dtype)
+        t_hat = ln_layer(fused.to(next(ln_layer.parameters()).dtype)).to(text_embeds.dtype)
 
         return t_hat
 
