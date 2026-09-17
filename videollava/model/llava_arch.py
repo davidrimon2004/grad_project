@@ -35,15 +35,10 @@ class LlavaMetaModel:
             self.video_tower = build_video_tower(config, delay_load=True)
         if getattr(config, "mm_image_tower", None) is not None or getattr(config, "mm_video_tower", None) is not None:
             self.mm_projector = build_vision_projector(config)
-            # VisAlign (Agrawal et al.): projects [text_embed || avg_pooled_visual_embed]
-            # back down to hidden_size, refining every text token with global visual context
-            # before it enters the LLM. See Eq. 2-4 of the paper.
-            # VisAlign (Agrawal et al.): projects [text_embed || avg_pooled_visual_embed]
-            # back down to hidden_size, refining every text token with global visual context
-            # before it enters the LLM. See Eq. 2-4 of the paper.
-            self.visalign_proj = nn.Linear(config.hidden_size * 2, config.hidden_size)
-            
-            # Thesis Ablation: Early Multi-Head Attention (Self & Cross)
+
+            # Early-Fusion via Multi-Head Cross-Attention: text tokens query the
+            # visual tokens directly, so every text embedding is refined with
+            # fine-grained visual context before entering the LLM.
             num_heads = getattr(config, "mha_fusion_heads", 8)
             self.early_fusion_attn = nn.MultiheadAttention(
                 embed_dim=config.hidden_size,
@@ -151,72 +146,55 @@ class LlavaMetaForCausalLM(ABC):
     def get_video_tower(self):
         return self.get_model().get_video_tower()
 
-    def get_visalign_proj(self):
-        return self.get_model().visalign_proj
-
-    def visalign_fuse(self, text_embeds, visual_embeds):
-        """
-        VisAlign (Agrawal et al., arXiv:2511.05017), Eq. 2-4.
-        text_embeds:   [Nt, dt] textual token embeddings for one sample
-        visual_embeds: [Nv, dt] projected visual token embeddings for the same sample
-        Returns fused textual embeddings T_hat: [Nt, dt]. Visual embeddings are
-        NOT modified here -- only the text side is refined, per the paper.
-        """
-        if text_embeds.shape[0] == 0:
-            return text_embeds
-        # Eq. 2: global visual summary via average pooling
-        v_hat = visual_embeds.mean(dim=0, keepdim=True)  # [1, dt]
-        v_hat = v_hat.expand(text_embeds.shape[0], -1)   # [Nt, dt]
-        # Eq. 3: concat text embedding with global visual summary along dt
-        fused = torch.cat([text_embeds, v_hat], dim=-1)  # [Nt, 2*dt]
-        # Eq. 4 (partial): project back down to dt -> visually-grounded text embeddings
-        t_hat = self.get_visalign_proj()(fused.to(self.get_visalign_proj().weight.dtype))
-        return t_hat.to(text_embeds.dtype)
-    
     def get_early_fusion_attn(self):
         return self.get_model().early_fusion_attn
 
     def get_early_fusion_ln(self):
         return self.get_model().early_fusion_ln
 
-    def text_self_attention_fuse(self, text_embeds):
+    def cross_attention_fuse(self, text_embeds, visual_embeds):
         """
-        Thesis Ablation: Self-attention on textual embeddings before sequence assembly.
-        Applies a strict causal mask to prevent forward-looking label leakage during training.
+        Early-fusion via Multi-Head Cross-Attention.
+
+        Every text token issues a query that attends over the *visual* token
+        sequence for that sample, so text embeddings are refined with
+        fine-grained (per-visual-token) visual context before entering the LLM.
+        This replaces both the text-only self-attention approach (which never
+        looked at the visual tokens at all) and the average-pooling approach
+        (which only exposed text to a single, global visual summary vector).
+
+        text_embeds:   [Nt, dt] textual token embeddings for one sample
+        visual_embeds: [Nv, dt] projected visual token embeddings for the same sample
+                       (all image/video tokens belonging to this sample, concatenated)
+        Returns fused textual embeddings T_hat: [Nt, dt]. Visual embeddings are
+        NOT modified here -- only the text side is refined.
         """
-        if text_embeds.shape[0] == 0:
+        if text_embeds.shape[0] == 0 or visual_embeds.shape[0] == 0:
             return text_embeds
 
-        # [1, Nt, dt] - Query, Key, and Value are ALL just the text
-        q = text_embeds.unsqueeze(0)
-        
         attn_layer = self.get_early_fusion_attn()
-        
+
         # Safely extract the exact device and dtype of the attention layer's weights
         ref_param = next(attn_layer.parameters())
         target_dtype = ref_param.dtype
         target_device = ref_param.device
-        
-        # --- CAUSAL MASK GENERATION ---
-        nt = text_embeds.shape[0]
-        # Creates an (Nt, Nt) matrix with 0 on and below the diagonal, and -inf above it
-        causal_mask = torch.triu(
-            torch.full((nt, nt), float("-inf"), device=target_device, dtype=target_dtype),
-            diagonal=1
-        )
-        # ------------------------------
 
-        # Pass the causal mask into the attn_mask argument
+        # Query = text tokens, Key = Value = visual tokens: [1, Nt, dt] / [1, Nv, dt]
+        q = text_embeds.unsqueeze(0).to(device=target_device, dtype=target_dtype)
+        kv = visual_embeds.unsqueeze(0).to(device=target_device, dtype=target_dtype)
+
+        # No causal mask here: causality/label-leakage only matters along the text
+        # sequence dimension. Keys/values come from the visual sequence, so every
+        # text token is free to attend to every visual token without leaking any
+        # future *text* information.
         attn_out, _ = attn_layer(
-            query=q.to(device=target_device, dtype=target_dtype),
-            key=q.to(device=target_device, dtype=target_dtype),
-            value=q.to(device=target_device, dtype=target_dtype),
-            attn_mask=causal_mask,
-            is_causal=True,  # Enables PyTorch FlashAttention optimizations if available
+            query=q,
+            key=kv,
+            value=kv,
             need_weights=False
         )
 
-        # Residual connection + LayerNorm
+        # Residual connection + LayerNorm (text-side residual, same as the other ablations)
         fused = text_embeds + attn_out.squeeze(0).to(text_embeds.dtype)
         ln_layer = self.get_early_fusion_ln()
         t_hat = ln_layer(fused.to(next(ln_layer.parameters()).dtype)).to(text_embeds.dtype)
@@ -375,20 +353,13 @@ class LlavaMetaForCausalLM(ABC):
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
 
-           # --- Thesis Early Fusion Interception ---
+            # --- Early Fusion: Multi-Head Cross-Attention (text queries, visual keys/values) ---
             if num_images > 0:
-                # 1. Thesis Ablation: Text-Only Self Attention
-                if getattr(self.config, "use_text_self_attn", False):
-                    for idx in range(0, len(cur_new_input_embeds), 2):
-                        cur_new_input_embeds[idx] = self.text_self_attention_fuse(cur_new_input_embeds[idx])
-                
-                # 2. VisAlign Baseline (Average Pooling)
-                elif getattr(self.config, "use_visalign", False):
-                    visual_chunks = [c for idx, c in enumerate(cur_new_input_embeds) if idx % 2 == 1]
-                    all_visual = torch.cat(visual_chunks, dim=0)
-                    for idx in range(0, len(cur_new_input_embeds), 2):
-                        cur_new_input_embeds[idx] = self.visalign_fuse(cur_new_input_embeds[idx], all_visual)
-            # ---------------------------------------- 
+                visual_chunks = [c for idx, c in enumerate(cur_new_input_embeds) if idx % 2 == 1]
+                all_visual = torch.cat(visual_chunks, dim=0)
+                for idx in range(0, len(cur_new_input_embeds), 2):
+                    cur_new_input_embeds[idx] = self.cross_attention_fuse(cur_new_input_embeds[idx], all_visual)
+            # --------------------------------------------------------------------------------
 
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
