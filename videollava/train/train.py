@@ -891,6 +891,7 @@ def train():
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
+        model_args, data_args, training_args, _ = parser.parse_args_into_dataclasses(return_remaining_strings=True)
     local_rank = training_args.local_rank
 
     # Ensure PyTorch distributed is initialized so DeepSpeed bypasses mpi4py discovery
