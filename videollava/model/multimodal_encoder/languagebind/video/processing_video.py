@@ -1,4 +1,5 @@
 
+import sys
 import torch
 import cv2
 import decord
@@ -8,10 +9,46 @@ from decord import VideoReader, cpu
 from torchvision import transforms
 from transformers import ProcessorMixin, BatchEncoding
 from transformers.image_processing_utils import BatchFeature
-from pytorchvideo.data.encoded_video import EncodedVideo
 from torchvision.transforms import Compose, Lambda, ToTensor
-from torchvision.transforms._transforms_video import NormalizeVideo, RandomCropVideo, RandomHorizontalFlipVideo, CenterCropVideo
-from pytorchvideo.transforms import ApplyTransformToKey, ShortSideScale, UniformTemporalSubsample
+
+# Fix torchvision 0.15+ compatibility for pytorchvideo
+try:
+    import torchvision.transforms.functional as F_t
+    sys.modules['torchvision.transforms.functional_tensor'] = F_t
+except Exception:
+    pass
+
+try:
+    from torchvision.transforms._transforms_video import NormalizeVideo, RandomCropVideo, RandomHorizontalFlipVideo, CenterCropVideo
+except Exception:
+    from torchvision.transforms import NormalizeVideo, RandomCropVideo, RandomHorizontalFlipVideo, CenterCropVideo
+
+try:
+    from pytorchvideo.data.encoded_video import EncodedVideo
+    from pytorchvideo.transforms import ApplyTransformToKey, ShortSideScale, UniformTemporalSubsample
+except Exception:
+    EncodedVideo = None
+    ApplyTransformToKey = None
+    UniformTemporalSubsample = None
+
+    class ShortSideScale(torch.nn.Module):
+        def __init__(self, size, interpolation="bilinear"):
+            super().__init__()
+            self.size = size
+            self.interpolation = interpolation
+
+        def forward(self, x):
+            # x is (C, T, H, W)
+            _, _, h, w = x.shape
+            if (w <= h and w == self.size) or (h <= w and h == self.size):
+                return x
+            if w < h:
+                ow = self.size
+                oh = int(self.size * h / w)
+            else:
+                oh = self.size
+                ow = int(self.size * w / h)
+            return torch.nn.functional.interpolate(x, size=(oh, ow), mode=self.interpolation, align_corners=False)
 
 decord.bridge.set_bridge('torch')
 
