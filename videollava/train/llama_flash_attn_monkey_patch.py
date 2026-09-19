@@ -6,11 +6,19 @@ import torch
 import transformers
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
 
+HAS_FLASH_ATTN = False
 try:
-    from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
+    except ImportError:
+        from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func as flash_attn_unpadded_qkvpacked_func
+    from flash_attn.bert_padding import unpad_input, pad_input
+    HAS_FLASH_ATTN = True
 except ImportError:
-    from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func as flash_attn_unpadded_qkvpacked_func
-from flash_attn.bert_padding import unpad_input, pad_input
+    HAS_FLASH_ATTN = False
+    flash_attn_unpadded_qkvpacked_func = None
+    unpad_input = None
+    pad_input = None
 
 
 def forward(
@@ -103,12 +111,22 @@ def _prepare_decoder_attention_mask(
 
 
 def replace_llama_attn_with_flash_attn():
+    if not HAS_FLASH_ATTN:
+        warnings.warn("flash_attn is not installed. Using standard PyTorch / SDPA attention instead.")
+        return
+
+    if not torch.cuda.is_available():
+        warnings.warn("CUDA is not available. Skipping flash_attn monkey patch.")
+        return
+
     cuda_major, cuda_minor = torch.cuda.get_device_capability()
     if cuda_major < 8:
         warnings.warn(
-            "Flash attention is only supported on A100 or H100 GPU during training due to head dim > 64 backward."
-            "ref: https://github.com/HazyResearch/flash-attention/issues/190#issuecomment-1523359593"
+            "Flash attention is only supported on Ampere/Hopper (A100/H100) GPUs during training due to head dim > 64 backward."
+            f" Detected compute capability {cuda_major}.{cuda_minor}. Using standard PyTorch attention."
         )
+        return
+
     transformers.models.llama.modeling_llama.LlamaModel._prepare_decoder_attention_mask = (
         _prepare_decoder_attention_mask
     )
