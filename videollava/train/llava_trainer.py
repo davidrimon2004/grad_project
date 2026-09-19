@@ -186,19 +186,26 @@ class LLaVATrainer(Trainer):
         if not hasattr(self, "tokenizer") or self.tokenizer is None:
             self.tokenizer = proc
 
-    def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
-        if self.train_dataset is None or not has_length(self.train_dataset):
+    def _get_train_sampler(self, dataset=None, *args, **kwargs) -> Optional[torch.utils.data.Sampler]:
+        train_ds = dataset if dataset is not None else self.train_dataset
+        if train_ds is None or not has_length(train_ds):
             return None
 
         if self.args.group_by_modality_length:
-            lengths = self.train_dataset.modality_lengths
-            return LengthGroupedSampler(
-                self.args.train_batch_size,
-                world_size=self.args.world_size * self.args.gradient_accumulation_steps,
-                lengths=lengths,
-                group_by_modality=True,
-            )
-        else:
+            lengths = getattr(train_ds, "modality_lengths", None)
+            if lengths is None and hasattr(self.train_dataset, "modality_lengths"):
+                lengths = self.train_dataset.modality_lengths
+            if lengths is not None:
+                return LengthGroupedSampler(
+                    self.args.train_batch_size,
+                    world_size=self.args.world_size * self.args.gradient_accumulation_steps,
+                    lengths=lengths,
+                    group_by_modality=True,
+                )
+
+        try:
+            return super()._get_train_sampler(dataset, *args, **kwargs)
+        except TypeError:
             return super()._get_train_sampler()
 
     def create_optimizer(self):
