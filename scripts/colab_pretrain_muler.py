@@ -737,12 +737,14 @@ class VideoLLaVAPretrainingEngine:
             cmd.extend(["--fp16", "True"])
 
         # DeepSpeed integration
-        if self.args.deepspeed_config and os.path.exists(self.args.deepspeed_config):
-            ds_config = self.args.deepspeed_config
-            if self.hw_config["vram_gb"] < 16.0 and ds_config == "./scripts/zero2.json" and os.path.exists("./scripts/zero2_offload.json"):
-                ds_config = "./scripts/zero2_offload.json"
-                log_info("Auto-switching to './scripts/zero2_offload.json' for optimal CPU optimizer offloading on T4 GPU.")
-            cmd.extend(["--deepspeed", ds_config])
+        # Note: DeepSpeed does not support 4-bit / 8-bit quantized models (.to() calls crash bitsandbytes).
+        # When bits in [4, 8], native PyTorch Trainer handles training with minimal VRAM overhead
+        # because only the small mm_projector adapter is being optimized.
+        if self.hw_config.get("bits", 16) not in [4, 8]:
+            if self.args.deepspeed_config and os.path.exists(self.args.deepspeed_config):
+                cmd.extend(["--deepspeed", self.args.deepspeed_config])
+        else:
+            log_info("Quantized backbone active: Using native PyTorch Trainer with FP16 and gradient accumulation (DeepSpeed bypassed to prevent .to() quantization conflicts).")
 
         return cmd
 

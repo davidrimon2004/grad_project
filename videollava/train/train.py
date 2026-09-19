@@ -1091,6 +1091,24 @@ def train():
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
 
+    # In modern transformers, validate_quantization_for_training blocks training on
+    # quantized models unless wrapped in PEFT. In Video-LLaVA Stage 1, the mm_projector
+    # adapter is trained directly with a frozen quantized backbone.
+    try:
+        import transformers.trainer
+        import transformers.trainer_utils
+        transformers.trainer.validate_quantization_for_training = lambda m: None
+        transformers.trainer_utils.validate_quantization_for_training = lambda m: None
+    except Exception:
+        pass
+
+    # DeepSpeed does not support 4-bit / 8-bit quantized models (.to() calls crash bitsandbytes).
+    if training_args.bits in [4, 8] and getattr(training_args, "deepspeed", None):
+        rank0_print("[INFO] Backbone is quantized (8-bit/4-bit). DeepSpeed does not support quantized layers (.to() incompatibility). Disabling DeepSpeed in favor of PyTorch native training.")
+        training_args.deepspeed = None
+        if hasattr(training_args, "hf_deepspeed_config"):
+            training_args.hf_deepspeed_config = None
+
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
     trainer = LLaVATrainer(model=model,

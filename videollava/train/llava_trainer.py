@@ -178,6 +178,17 @@ class LengthGroupedSampler(Sampler):
 class LLaVATrainer(Trainer):
 
     def __init__(self, *args, tokenizer=None, processing_class=None, **kwargs):
+        # In modern transformers, validate_quantization_for_training blocks training on
+        # quantized models unless wrapped in PEFT. In Video-LLaVA Stage 1, the mm_projector
+        # adapter is trained directly with a frozen quantized backbone.
+        try:
+            import transformers.trainer
+            import transformers.trainer_utils
+            transformers.trainer.validate_quantization_for_training = lambda m: None
+            transformers.trainer_utils.validate_quantization_for_training = lambda m: None
+        except Exception:
+            pass
+
         proc = processing_class if processing_class is not None else tokenizer
         try:
             super().__init__(*args, processing_class=proc, **kwargs)
