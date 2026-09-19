@@ -891,8 +891,26 @@ def train():
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
-        model_args, data_args, training_args, _ = parser.parse_args_into_dataclasses(return_remaining_strings=True)
     local_rank = training_args.local_rank
+
+    # Ensure PyTorch distributed is initialized so DeepSpeed bypasses mpi4py discovery
+    if not torch.distributed.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("LOCAL_RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        try:
+            torch.distributed.init_process_group(
+                backend=backend,
+                init_method="env://",
+                rank=int(os.environ["RANK"]),
+                world_size=int(os.environ["WORLD_SIZE"])
+            )
+        except Exception as e:
+            rank0_print(f"Warning: Could not initialize torch.distributed process group: {e}")
+
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
     bnb_model_from_pretrained_args = {}
