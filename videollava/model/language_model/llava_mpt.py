@@ -109,5 +109,5 @@ class LlavaMPTForCausalLM(MPTForCausalLM, LlavaMetaForCausalLM):
         return {'input_ids': input_ids, 'attention_mask': attention_mask, 'prefix_mask': prefix_mask, 'sequence_id': sequence_id, 'past_key_values': past_key_values, 'use_cache': kwargs.get('use_cache', True), "images": kwargs.get("images", None)}
 
 
-AutoConfig.register("llava_mpt", LlavaMPTConfig)
-AutoModelForCausalLM.register(LlavaMPTConfig, LlavaMPTForCausalLM)
+AutoConfig.register("llava_mpt", LlavaMPTConfig, exist_ok=True)
+AutoModelForCausalLM.register(LlavaMPTConfig, LlavaMPTForCausalLM, exist_ok=True)
