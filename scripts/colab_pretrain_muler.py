@@ -632,19 +632,19 @@ def detect_colab_hardware_and_tune() -> Dict:
     target_effective_batch_size = 32
 
     if vram_gb >= 38.0:  # A100 (40GB / 80GB)
-        micro_batch_size = 16
-        grad_accum = max(1, target_effective_batch_size // (micro_batch_size * max(1, device_count)))
-        num_workers = 8
-    elif vram_gb >= 22.0:  # L4 (24GB) or V100 (32GB)
         micro_batch_size = 8
         grad_accum = max(1, target_effective_batch_size // (micro_batch_size * max(1, device_count)))
         num_workers = 4
-    elif vram_gb >= 14.0:  # T4 (16GB) or V100 (16GB)
+    elif vram_gb >= 22.0:  # L4 (24GB) or V100 (32GB)
         micro_batch_size = 4
         grad_accum = max(1, target_effective_batch_size // (micro_batch_size * max(1, device_count)))
         num_workers = 4
-    else:  # Small GPUs (<14GB)
+    elif vram_gb >= 14.0:  # T4 (16GB) or V100 (16GB)
         micro_batch_size = 2
+        grad_accum = max(1, target_effective_batch_size // (micro_batch_size * max(1, device_count)))
+        num_workers = 2
+    else:  # Small GPUs (<14GB)
+        micro_batch_size = 1
         grad_accum = max(1, target_effective_batch_size // (micro_batch_size * max(1, device_count)))
         num_workers = 2
 
@@ -742,6 +742,7 @@ class VideoLLaVAPretrainingEngine:
         env["PYTHONPATH"] = f"{os.getcwd()}:{env.get('PYTHONPATH', '')}"
         env["WANDB_DISABLED"] = "true"
         env["TOKENIZERS_PARALLELISM"] = "false"
+        env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
         process = subprocess.Popen(cmd, env=env)
 
