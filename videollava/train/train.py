@@ -948,12 +948,14 @@ def train():
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
+                torch_dtype=compute_dtype,
                 **bnb_model_from_pretrained_args
             )
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
+            torch_dtype=compute_dtype,
             **bnb_model_from_pretrained_args
         )
     model.config.use_cache = False
@@ -1044,6 +1046,9 @@ def train():
             data_args.video_processor = video_tower.video_processor
             data_args.is_multimodal = True
             data_args.num_frames = video_tower.config.num_frames
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     # =============================================================================================================
 
 
