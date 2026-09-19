@@ -19,7 +19,8 @@ dependencies = [
     "pydantic>=1", "markdown2[all]", "numpy", "scikit-learn",
     "requests", "httpx>=0.24.0", "uvicorn", "fastapi",
     "einops>=0.6.1", "einops-exts>=0.0.4", "timm>=0.6.13",
-    "tensorboardX>=2.6", "gradio>=3.37.0", "gradio_client>=0.7.0"
+    "tensorboardX>=2.6", "gradio>=3.37.0", "gradio_client>=0.7.0",
+    "decord"
 ]
 
 [project.optional-dependencies]

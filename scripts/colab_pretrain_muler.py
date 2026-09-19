@@ -6,16 +6,15 @@ Original Video-LLaVA Datasets:
   - Image Pretrain: LLaVA-558K (images in `llava_image/`, annotations `llava_image_.json`)
   - Video Pretrain: Valley Video 100K-702K (videos in `valley/`, annotations `valley_.json`)
 
-Features:
-  1. Automated Google Drive mounting and persistent storage management.
-  2. Inbound Data Muler: Downloads/caches archives from HuggingFace to Drive, then mules
-     and extracts them at high speed to Colab local ephemeral SSD (/content/data).
-  3. Outbound Checkpoint Muler: Background daemon & Trainer synchronization that continuously
-     syncs saved checkpoints and multimodal projector weights (mm_projector.bin) back to Google Drive.
-  4. Auto-Resume: Automatically finds the latest checkpoint on Google Drive, mules it to local SSD,
-     and resumes training seamlessly.
-  5. Colab GPU Auto-Tuning: Auto-detects T4, L4, V100, A100 GPUs and configures batch size,
-     gradient accumulation, fp16/bf16, and DeepSpeed/PyTorch settings.
+Architecture (Drive-First):
+  Since Colab's ephemeral SSD (~80 GB) cannot hold the full datasets (images: 27 GB,
+  videos: 460+ GB), we use Google Drive (5 TB) as the primary data store:
+
+  1. Download archives from HuggingFace directly to Google Drive using wget (no cache overhead).
+  2. Extract archives directly on Google Drive (data persists across sessions).
+  3. Download annotation JSONs from the official Google Drive zip.
+  4. Train reading image/video data from Google Drive paths.
+  5. Only checkpoints use the local SSD for fast I/O, and get synced back to Drive.
 """
 
 import os
@@ -93,31 +92,46 @@ def mount_google_drive(mount_point: str = "/content/drive") -> bool:
 
 
 # ==============================================================================
-# Inbound Data Muler: Google Drive <-> Local SSD
+# Inbound Data Muler: HuggingFace -> Google Drive (Drive-First Architecture)
 # ==============================================================================
 
 class InboundDataMuler:
     """
-    Manages downloading, storing in Google Drive, and muling (staging/extracting)
-    the original Video-LLaVA pretraining datasets onto local high-speed SSD.
+    Manages downloading and extracting the original Video-LLaVA pretraining
+    datasets directly on Google Drive (since Colab SSD is too small for the
+    full dataset). Training reads data from Drive paths.
     """
 
     HF_DATASET_REPO = "LanguageBind/Video-LLaVA"
-    
+    HF_BASE_URL = "https://huggingface.co/datasets/LanguageBind/Video-LLaVA/resolve/main"
+
+    # Official annotations zip from Video-LLaVA authors (Google Drive file ID)
+    ANNOTATIONS_GDRIVE_ID = "1zGRyVSUMoczGq6cjQFmT0prH67bu2wXD"
+
     # Official archives for Video-LLaVA Pretraining Stage 1
     # 1. LLaVA-558K Image archive: llava_image.zip
     # 2. Valley Video archive: valley_2.zip.001 to valley_2.zip.012
-    # 3. Pretraining annotations: chat.json / llava_image_.json / valley_.json
     VALLEY_PARTS = [f"valley_2.zip.{i:03d}" for i in range(1, 13)]
 
     def __init__(self, drive_data_dir: str, local_scratch_dir: str):
         self.drive_data_dir = Path(drive_data_dir)
         self.local_scratch_dir = Path(local_scratch_dir)
-        
-        # Local paths for trainer
+
+        # Data lives on Google Drive (persistent, 5 TB)
+        self.drive_image_folder = self.drive_data_dir / "llava_image"
+        self.drive_video_folder = self.drive_data_dir / "valley"
+        self.drive_json_folder = self.drive_data_dir / "annotations"
+
+        # Local SSD paths (only for annotations & demo data)
+        self.local_json_folder = self.local_scratch_dir / "pt_json"
         self.local_image_folder = self.local_scratch_dir / "llava_image"
         self.local_video_folder = self.local_scratch_dir / "valley"
-        self.local_json_folder = self.local_scratch_dir / "pt_json"
+
+        # Annotation file paths (on Drive after extraction)
+        self.drive_image_json = self.drive_json_folder / "llava_image_.json"
+        self.drive_video_json = self.drive_json_folder / "valley_.json"
+
+        # Local annotation paths (tiny files, copied to SSD for fast reads)
         self.local_image_json = self.local_json_folder / "llava_image_.json"
         self.local_video_json = self.local_json_folder / "valley_.json"
 
@@ -130,213 +144,282 @@ class InboundDataMuler:
     MIN_REAL_IMAGE_FILES = 10
     MIN_REAL_VIDEO_FILES = 5
 
-    def verify_local_dataset(self) -> bool:
-        """Check if REAL (non-demo) datasets are already extracted and ready on local SSD."""
-        image_json_ok = self.local_image_json.is_file() and self.local_image_json.stat().st_size > 0
-        video_json_ok = self.local_video_json.is_file() and self.local_video_json.stat().st_size > 0
+    def verify_drive_dataset(self) -> bool:
+        """Check if REAL datasets are already extracted and ready on Google Drive."""
+        image_json_ok = self.drive_image_json.is_file() and self.drive_image_json.stat().st_size > 0
+        video_json_ok = self.drive_video_json.is_file() and self.drive_video_json.stat().st_size > 0
 
-        # Count actual media files — demo mode only creates 1 of each
-        num_images = sum(1 for _ in self.local_image_folder.iterdir()) if self.local_image_folder.is_dir() else 0
-        num_videos = sum(1 for _ in self.local_video_folder.iterdir()) if self.local_video_folder.is_dir() else 0
+        num_images = sum(1 for _ in self.drive_image_folder.iterdir()) if self.drive_image_folder.is_dir() else 0
+        num_videos = sum(1 for _ in self.drive_video_folder.iterdir()) if self.drive_video_folder.is_dir() else 0
         image_dir_ok = num_images >= self.MIN_REAL_IMAGE_FILES
         video_dir_ok = num_videos >= self.MIN_REAL_VIDEO_FILES
 
         return image_json_ok and video_json_ok and image_dir_ok and video_dir_ok
 
-    def download_from_hf_to_drive(self, download_images: bool = True, download_videos: bool = True):
-        """
-        Download pretraining archives from HuggingFace directly to Google Drive
-        so that datasets are saved permanently and never lost across Colab sessions.
-        """
-        log_header("Step 1: Downloading & Caching Datasets to Google Drive")
+    def _wget_download(self, url: str, output_path: str, desc: str = ""):
+        """Download a file using wget (no double-caching, direct write to destination)."""
+        log_info(f"Downloading {desc or url}...")
+        cmd = [
+            "wget", "-c",  # -c enables resume of partial downloads
+            "--progress=bar:force:noscroll",
+            "-O", output_path,
+            url
+        ]
+        result = subprocess.run(cmd, check=False)
+        if result.returncode != 0:
+            log_err(f"wget failed for {desc or url} (exit code {result.returncode})")
+            return False
+        log_success(f"Downloaded {desc}")
+        return True
+
+    def download_annotations(self):
+        """Download annotation JSONs from the official Google Drive zip."""
+        if self.drive_image_json.exists() and self.drive_video_json.exists():
+            log_success("Annotation JSONs already present on Drive.")
+            return True
+
+        self.drive_json_folder.mkdir(parents=True, exist_ok=True)
+        log_info("Downloading annotation JSONs from official Video-LLaVA Google Drive zip...")
+
+        # Install gdown if needed
         try:
-            from huggingface_hub import hf_hub_download
+            import gdown
         except ImportError:
-            log_info("Installing huggingface_hub for dataset download...")
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"], check=True)
-            from huggingface_hub import hf_hub_download
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "gdown"], check=True)
+            import gdown
 
-        # 1. Download annotation JSON files
-        log_info("Checking annotation files on Google Drive...")
-        drive_json_dir = self.drive_data_dir / "pt_json"
-        drive_json_dir.mkdir(parents=True, exist_ok=True)
-
-        for json_name in ["llava_image_.json", "valley_.json", "chat.json"]:
-            dest_file = drive_json_dir / json_name
-            if not dest_file.exists():
-                log_info(f"Downloading {json_name} from {self.HF_DATASET_REPO} to Google Drive...")
+        # Download the annotations zip
+        annot_zip = self.drive_data_dir / "annotations.zip"
+        if not annot_zip.exists():
+            try:
+                gdown.download(
+                    id=self.ANNOTATIONS_GDRIVE_ID,
+                    output=str(annot_zip),
+                    quiet=False
+                )
+            except Exception as e:
+                log_err(f"Failed to download annotations zip: {e}")
+                log_info("Trying alternative download with gdown fuzzy mode...")
                 try:
-                    downloaded_path = hf_hub_download(
-                        repo_id=self.HF_DATASET_REPO,
-                        filename=f"pt_json/{json_name}" if json_name != "chat.json" else json_name,
-                        repo_type="dataset",
-                        local_dir=str(self.drive_data_dir),
-                        local_dir_use_symlinks=False
-                    )
-                    log_success(f"Saved {json_name} -> {downloaded_path}")
-                except Exception as e:
-                    log_warn(f"Could not download {json_name} directly: {e}")
+                    url = f"https://drive.google.com/uc?id={self.ANNOTATIONS_GDRIVE_ID}"
+                    gdown.download(url, str(annot_zip), quiet=False, fuzzy=True)
+                except Exception as e2:
+                    log_err(f"Alternative download also failed: {e2}")
+                    return False
 
-        # 2. Download Image Archive (LLaVA 558K)
-        if download_images:
-            image_archive = self.drive_data_dir / "llava_image.zip"
-            if not image_archive.exists():
-                log_info(f"Downloading llava_image.zip to Google Drive ({self.drive_data_dir})...")
-                try:
-                    hf_hub_download(
-                        repo_id=self.HF_DATASET_REPO,
-                        filename="llava_image.zip",
-                        repo_type="dataset",
-                        local_dir=str(self.drive_data_dir),
-                        local_dir_use_symlinks=False
-                    )
-                    log_success("llava_image.zip downloaded to Google Drive.")
-                except Exception as e:
-                    log_err(f"Error downloading llava_image.zip: {e}")
-            else:
-                log_success(f"llava_image.zip already exists on Google Drive ({image_archive.stat().st_size / (1024**3):.2f} GB)")
+        if annot_zip.exists() and annot_zip.stat().st_size > 0:
+            log_info("Extracting annotations zip...")
+            # Extract to a temp dir first to find the JSONs
+            extract_dir = self.drive_data_dir / "_annot_extract"
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["unzip", "-q", "-o", str(annot_zip), "-d", str(extract_dir)], check=True)
 
-        # 3. Download Video Archive (Valley multi-part)
-        if download_videos:
-            for part in self.VALLEY_PARTS:
-                part_file = self.drive_data_dir / part
-                if not part_file.exists():
-                    log_info(f"Downloading {part} to Google Drive...")
-                    try:
-                        hf_hub_download(
-                            repo_id=self.HF_DATASET_REPO,
-                            filename=part,
-                            repo_type="dataset",
-                            local_dir=str(self.drive_data_dir),
-                            local_dir_use_symlinks=False
-                        )
-                        log_success(f"Downloaded {part}")
-                    except Exception as e:
-                        log_warn(f"Error downloading {part}: {e}")
+            # Find and copy the JSON files we need
+            found_any = False
+            for json_name in ["llava_image_.json", "valley_.json", "chat.json"]:
+                # Search recursively for the file
+                matches = list(extract_dir.rglob(json_name))
+                if matches:
+                    shutil.copy2(matches[0], self.drive_json_folder / json_name)
+                    log_success(f"Found and saved {json_name}")
+                    found_any = True
                 else:
-                    log_info(f"Archive part {part} already exists on Drive.")
+                    log_warn(f"Could not find {json_name} in annotations zip")
 
-    def mule_archives_to_ssd(self, cleanup_zip_after_extract: bool = True):
-        """
-        Fast copy of dataset archives from Google Drive to local Colab NVMe/SSD,
-        followed by high-speed local unzipping to avoid Drive FUSE I/O latency.
-        """
-        log_header("Step 2: Muling Data from Google Drive to Local Ephemeral SSD")
+            # If we didn't find specific names, look for any JSON files
+            if not found_any:
+                log_info("Searching for any annotation JSONs in the zip...")
+                for jf in extract_dir.rglob("*.json"):
+                    dest = self.drive_json_folder / jf.name
+                    shutil.copy2(jf, dest)
+                    log_info(f"  Extracted: {jf.name} ({jf.stat().st_size / 1024:.0f} KB)")
 
-        if self.verify_local_dataset():
-            log_success("All datasets are already muled and extracted on local SSD! Skipping extraction.")
+            # List what we have
+            log_info("Contents of annotations folder:")
+            for f in sorted(self.drive_json_folder.iterdir()):
+                log_info(f"  {f.name} ({f.stat().st_size / (1024*1024):.1f} MB)")
+
+            # Cleanup extraction temp dir
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            return True
+        else:
+            log_err("Annotations zip download produced empty file")
+            return False
+
+    def download_image_archive(self):
+        """Download llava_image.zip directly to Google Drive using wget."""
+        image_archive = self.drive_data_dir / "llava_image.zip"
+
+        if self.drive_image_folder.is_dir() and sum(1 for _ in self.drive_image_folder.iterdir()) >= self.MIN_REAL_IMAGE_FILES:
+            log_success(f"Image dataset already extracted on Drive ({self.drive_image_folder})")
+            return True
+
+        if image_archive.exists() and image_archive.stat().st_size > 1_000_000:
+            log_success(f"llava_image.zip already on Drive ({image_archive.stat().st_size / (1024**3):.2f} GB)")
+        else:
+            url = f"{self.HF_BASE_URL}/llava_image.zip"
+            success = self._wget_download(url, str(image_archive), "llava_image.zip (~27 GB)")
+            if not success:
+                return False
+
+        return True
+
+    def download_video_archives(self):
+        """Download valley_2.zip.* parts directly to Google Drive using wget."""
+        # Check if already extracted
+        if self.drive_video_folder.is_dir() and sum(1 for _ in self.drive_video_folder.iterdir()) >= self.MIN_REAL_VIDEO_FILES:
+            log_success(f"Video dataset already extracted on Drive ({self.drive_video_folder})")
+            return True
+
+        for part_name in self.VALLEY_PARTS:
+            part_file = self.drive_data_dir / part_name
+            if part_file.exists() and part_file.stat().st_size > 1_000_000:
+                log_info(f"{part_name} already on Drive ({part_file.stat().st_size / (1024**3):.2f} GB)")
+                continue
+
+            url = f"{self.HF_BASE_URL}/{part_name}"
+            size_hint = "~42 GB" if part_name != "valley_2.zip.012" else "~2.3 GB"
+            success = self._wget_download(url, str(part_file), f"{part_name} ({size_hint})")
+            if not success:
+                log_warn(f"Failed to download {part_name}, continuing with remaining parts...")
+
+        return True
+
+    def extract_image_archive(self):
+        """Extract llava_image.zip directly on Google Drive."""
+        if self.drive_image_folder.is_dir() and sum(1 for _ in self.drive_image_folder.iterdir()) >= self.MIN_REAL_IMAGE_FILES:
+            log_success("Image dataset already extracted on Drive.")
+            return True
+
+        image_archive = self.drive_data_dir / "llava_image.zip"
+        if not image_archive.exists():
+            log_err("llava_image.zip not found on Drive. Download it first.")
+            return False
+
+        log_info(f"Extracting llava_image.zip on Google Drive ({image_archive.stat().st_size / (1024**3):.2f} GB)...")
+        log_info("(This extracts directly on Drive — slower than SSD but data persists across sessions)")
+        self.drive_image_folder.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            ["unzip", "-q", "-o", str(image_archive), "-d", str(self.drive_data_dir)],
+            check=False
+        )
+        if result.returncode != 0:
+            log_err(f"Image extraction failed (exit code {result.returncode})")
+            return False
+
+        self._fixup_nested_directory(self.drive_image_folder, "llava_image")
+        num_files = sum(1 for _ in self.drive_image_folder.rglob("*") if _.is_file())
+        log_success(f"Extracted {num_files} image files to {self.drive_image_folder}")
+        return True
+
+    def extract_video_archives(self):
+        """Extract valley multi-part zip archives directly on Google Drive."""
+        if self.drive_video_folder.is_dir() and sum(1 for _ in self.drive_video_folder.iterdir()) >= self.MIN_REAL_VIDEO_FILES:
+            log_success("Video dataset already extracted on Drive.")
+            return True
+
+        first_part = self.drive_data_dir / "valley_2.zip.001"
+        if not first_part.exists():
+            log_err("valley_2.zip.001 not found on Drive. Download video archives first.")
+            return False
+
+        self.drive_video_folder.mkdir(parents=True, exist_ok=True)
+
+        log_info("Extracting multi-part Valley video archives on Google Drive...")
+        log_info("(This may take a while — extracting ~460 GB of videos directly on Drive)")
+
+        # Use 7z for multi-part zip extraction
+        has_7z = shutil.which("7z") or shutil.which("7za")
+        if has_7z:
+            seven_z = "7z" if shutil.which("7z") else "7za"
+            cmd = [seven_z, "x", str(first_part), f"-o{self.drive_data_dir}", "-y"]
+            result = subprocess.run(cmd, check=False)
+        else:
+            # Fallback: combine parts with cat, then unzip
+            log_info("Combining multi-part archives with cat...")
+            combined_zip = self.drive_data_dir / "valley_combined.zip"
+            cat_cmd = f"cat {self.drive_data_dir}/valley_2.zip.* > {combined_zip}"
+            result = subprocess.run(cat_cmd, shell=True, check=False)
+            if result.returncode == 0:
+                result = subprocess.run(
+                    ["unzip", "-q", "-o", str(combined_zip), "-d", str(self.drive_data_dir)],
+                    check=False
+                )
+                combined_zip.unlink(missing_ok=True)
+
+        if result.returncode != 0:
+            log_err(f"Video extraction failed (exit code {result.returncode})")
+            return False
+
+        self._fixup_nested_directory(self.drive_video_folder, "valley")
+        num_files = sum(1 for _ in self.drive_video_folder.rglob("*") if _.is_file())
+        log_success(f"Extracted {num_files} video files to {self.drive_video_folder}")
+        return True
+
+    def sync_annotations_to_local(self):
+        """Copy tiny annotation JSON files from Drive to local SSD for fast reads."""
+        self.local_json_folder.mkdir(parents=True, exist_ok=True)
+        for json_name in ["llava_image_.json", "valley_.json", "chat.json"]:
+            drive_src = self.drive_json_folder / json_name
+            local_dst = self.local_json_folder / json_name
+            if drive_src.exists():
+                shutil.copy2(drive_src, local_dst)
+                log_info(f"Synced {json_name} to local SSD ({drive_src.stat().st_size / (1024*1024):.1f} MB)")
+
+    def download_and_prepare_all(self):
+        """Full pipeline: download archives, extract on Drive, sync annotations."""
+        log_header("Step 1: Downloading & Preparing Datasets on Google Drive")
+
+        if self.verify_drive_dataset():
+            log_success("All datasets already present and extracted on Google Drive!")
+            self.sync_annotations_to_local()
+            self.print_dataset_summary()
             return
 
-        local_archives_dir = self.local_scratch_dir / "archives"
-        local_archives_dir.mkdir(parents=True, exist_ok=True)
+        # 1. Download annotations
+        self.download_annotations()
 
-        # 1. Mule Annotations
-        drive_json_dir = self.drive_data_dir / "pt_json"
-        if drive_json_dir.exists():
-            log_info("Muling annotation JSONs to local SSD...")
-            for f in drive_json_dir.glob("*.json"):
-                shutil.copy2(f, self.local_json_folder / f.name)
-        
-        # If specific names exist at drive_data_dir root, copy them
-        for jname in ["llava_image_.json", "valley_.json"]:
-            root_j = self.drive_data_dir / jname
-            if root_j.exists():
-                shutil.copy2(root_j, self.local_json_folder / jname)
+        # 2. Download & extract images
+        self.download_image_archive()
+        self.extract_image_archive()
 
-        # 2. Mule & Extract Image Dataset
-        drive_img_zip = self.drive_data_dir / "llava_image.zip"
-        if drive_img_zip.exists() and not (self.local_image_folder.exists() and any(self.local_image_folder.iterdir())):
-            local_img_zip = local_archives_dir / "llava_image.zip"
-            log_info(f"Muling {drive_img_zip.name} ({drive_img_zip.stat().st_size / (1024**3):.2f} GB) to local SSD...")
-            shutil.copy2(drive_img_zip, local_img_zip)
-            
-            log_info("Extracting llava_image.zip on local SSD...")
-            self.local_image_folder.mkdir(parents=True, exist_ok=True)
-            subprocess.run(["unzip", "-q", "-o", str(local_img_zip), "-d", str(self.local_scratch_dir)], check=True)
-            log_success("llava_image extracted successfully.")
+        # 3. Download & extract videos
+        self.download_video_archives()
+        self.extract_video_archives()
 
-            if cleanup_zip_after_extract and local_img_zip.exists():
-                local_img_zip.unlink()
-                log_info("Cleaned up local llava_image.zip archive to save SSD space.")
-        elif (self.drive_data_dir / "llava_image").is_dir() and not (self.local_image_folder.exists() and any(self.local_image_folder.iterdir())):
-            log_info("Copying uncompressed llava_image folder from Drive to local SSD...")
-            shutil.copytree(self.drive_data_dir / "llava_image", self.local_image_folder, dirs_exist_ok=True)
+        # 4. Sync annotation JSONs to local SSD
+        self.sync_annotations_to_local()
 
-        # 3. Mule & Extract Video Dataset (Valley)
-        valley_parts_present = [self.drive_data_dir / p for p in self.VALLEY_PARTS if (self.drive_data_dir / p).exists()]
-        single_valley_zip = self.drive_data_dir / "valley.zip"
-
-        if not (self.local_video_folder.exists() and any(self.local_video_folder.iterdir())):
-            self.local_video_folder.mkdir(parents=True, exist_ok=True)
-
-            if len(valley_parts_present) > 0:
-                log_info(f"Found {len(valley_parts_present)} Valley multi-part archives on Drive. Muling to local SSD...")
-                for p in valley_parts_present:
-                    shutil.copy2(p, local_archives_dir / p.name)
-
-                # Combine or extract using 7z / cat
-                log_info("Extracting multi-part valley archives on local SSD...")
-                first_part = local_archives_dir / "valley_2.zip.001"
-                
-                # Check if 7z or p7zip is available
-                has_7z = shutil.which("7z") or shutil.which("7za")
-                if has_7z:
-                    cmd = ["7z" if shutil.which("7z") else "7za", "x", str(first_part), f"-o{self.local_scratch_dir}", "-y"]
-                    subprocess.run(cmd, check=True)
-                else:
-                    log_info("Combining multi-part archives with cat...")
-                    combined_zip = local_archives_dir / "valley_combined.zip"
-                    cat_cmd = f"cat {local_archives_dir}/valley_2.zip.* > {combined_zip}"
-                    subprocess.run(cat_cmd, shell=True, check=True)
-                    subprocess.run(["unzip", "-q", "-o", str(combined_zip), "-d", str(self.local_scratch_dir)], check=True)
-                    if combined_zip.exists():
-                        combined_zip.unlink()
-
-                log_success("Valley videos extracted successfully.")
-
-                if cleanup_zip_after_extract:
-                    for p in local_archives_dir.glob("valley_2.zip.*"):
-                        p.unlink()
-            elif single_valley_zip.exists():
-                local_vzip = local_archives_dir / "valley.zip"
-                shutil.copy2(single_valley_zip, local_vzip)
-                subprocess.run(["unzip", "-q", "-o", str(local_vzip), "-d", str(self.local_scratch_dir)], check=True)
-                if cleanup_zip_after_extract:
-                    local_vzip.unlink()
-            elif (self.drive_data_dir / "valley").is_dir():
-                log_info("Copying valley video folder from Drive to local SSD...")
-                shutil.copytree(self.drive_data_dir / "valley", self.local_video_folder, dirs_exist_ok=True)
-
-        # 4. Final Directory & Path Fixups
-        self._fixup_nested_directories()
-
-        log_success(f"Data Muling Complete! Datasets ready at {self.local_scratch_dir}")
+        log_header("Data Preparation Complete!")
         self.print_dataset_summary()
 
-    def _fixup_nested_directories(self):
+    def _fixup_nested_directory(self, target_dir: Path, folder_name: str):
         """Fixes nested directory extractions if archives contained root folders."""
-        for target_dir, folder_name in [(self.local_image_folder, "llava_image"), (self.local_video_folder, "valley")]:
-            nested = target_dir / folder_name
-            if nested.is_dir():
-                log_info(f"Fixing nested directory in {target_dir}...")
-                for item in nested.iterdir():
+        nested = target_dir / folder_name
+        if nested.is_dir():
+            log_info(f"Fixing nested directory in {target_dir}...")
+            for item in nested.iterdir():
+                dest = target_dir / item.name
+                if not dest.exists():
                     shutil.move(str(item), str(target_dir))
-                shutil.rmtree(nested, ignore_errors=True)
+            shutil.rmtree(nested, ignore_errors=True)
 
     def print_dataset_summary(self):
         """Prints counts of images, videos, and annotation samples available."""
-        num_images = len(list(self.local_image_folder.glob("*.*"))) if self.local_image_folder.exists() else 0
-        num_videos = len(list(self.local_video_folder.glob("*.*"))) if self.local_video_folder.exists() else 0
-        
-        log_info(f"Local Image folder: {self.local_image_folder} ({num_images} files)")
-        log_info(f"Local Video folder: {self.local_video_folder} ({num_videos} files)")
-        log_info(f"Image annotations: {self.local_image_json} ({'Found' if self.local_image_json.exists() else 'Missing'})")
-        log_info(f"Video annotations: {self.local_video_json} ({'Found' if self.local_video_json.exists() else 'Missing'})")
+        # Check Drive paths (where data lives)
+        num_images = sum(1 for _ in self.drive_image_folder.rglob("*") if _.is_file()) if self.drive_image_folder.exists() else 0
+        num_videos = sum(1 for _ in self.drive_video_folder.rglob("*") if _.is_file()) if self.drive_video_folder.exists() else 0
+
+        log_info(f"Drive Image folder: {self.drive_image_folder} ({num_images} files)")
+        log_info(f"Drive Video folder: {self.drive_video_folder} ({num_videos} files)")
+        log_info(f"Image annotations: {self.drive_image_json} ({'Found' if self.drive_image_json.exists() else 'Missing'})")
+        log_info(f"Video annotations: {self.drive_video_json} ({'Found' if self.drive_video_json.exists() else 'Missing'}")
 
     def create_demo_subset(self, num_samples: int = 100):
         """
         Creates a lightweight subset of annotations and sample media
         for rapid end-to-end dry runs or quick validation in Colab.
+        Demo data goes on local SSD since it's tiny.
         """
         log_header(f"Creating Fast Demo/Verification Subset ({num_samples} samples)")
         self.local_image_folder.mkdir(parents=True, exist_ok=True)
@@ -458,7 +541,7 @@ class CheckpointMuleDaemon:
         for ckpt in ckpt_dirs:
             ckpt_name = ckpt.name
             drive_dest = self.drive_ckpt_dir / ckpt_name
-            
+
             # Check if this checkpoint is written (has trainer_state.json or pytorch_model/optimizer)
             if not (ckpt / "trainer_state.json").exists() and not (ckpt / "mm_projector.bin").exists() and not (ckpt / "optimizer.pt").exists():
                 continue
@@ -504,7 +587,7 @@ class CheckpointMuleDaemon:
 
         log_header(f"Found Existing Checkpoint on Google Drive: {latest_drive_ckpt.name}")
         log_info(f"Muling {latest_drive_ckpt.name} from Google Drive to local SSD for auto-resume...")
-        
+
         if not local_dest.exists():
             shutil.copytree(latest_drive_ckpt, local_dest, dirs_exist_ok=True)
             log_success(f"Restored {latest_drive_ckpt.name} to {local_dest}")
@@ -691,15 +774,17 @@ def parse_args():
     # Action mode
     parser.add_argument(
         "--action", type=str, default="all",
-        choices=["all", "mule_in", "train", "mule_out", "demo_setup", "status"],
-        help="Action to perform: 'all' (mule + train + sync), 'mule_in' (download & extract), 'train' (only training), 'mule_out' (manual sync), 'demo_setup' (create fast validation subset), or 'status'."
+        choices=["all", "download", "extract", "train", "mule_out", "demo_setup", "status"],
+        help="Action to perform: 'all' (download + extract + train), 'download' (download archives to Drive), "
+             "'extract' (extract on Drive), 'train' (only training), 'mule_out' (manual checkpoint sync), "
+             "'demo_setup' (create fast validation subset), or 'status'."
     )
 
     # Google Drive & Local Storage Paths
     parser.add_argument("--drive_root", type=str, default="/content/drive/MyDrive/Video-LLaVA",
                         help="Root folder in Google Drive for dataset archives and checkpoints.")
     parser.add_argument("--local_scratch_dir", type=str, default="/content/data",
-                        help="Fast local ephemeral SSD path for dataset extraction.")
+                        help="Local SSD path for annotation JSONs and demo data.")
     parser.add_argument("--local_output_dir", type=str, default="/content/checkpoints/videollava-7b-pretrain",
                         help="Local SSD directory where checkpoints are written during training.")
     parser.add_argument("--cache_dir", type=str, default="/content/cache_dir",
@@ -749,11 +834,6 @@ def main():
         keep_local_ckpts=1
     )
 
-    args.image_folder = inbound_muler.local_image_folder
-    args.video_folder = inbound_muler.local_video_folder
-    args.image_json = inbound_muler.local_image_json
-    args.video_json = inbound_muler.local_video_json
-
     if args.action == "status":
         log_header("System & Storage Status")
         detect_colab_hardware_and_tune()
@@ -763,19 +843,32 @@ def main():
         log_info(f"Found {len(existing_ckpts)} checkpoints on Google Drive.")
         return
 
+    # Demo mode: uses local SSD for tiny demo data
     if args.action == "demo_setup" or args.demo_samples > 0:
         inbound_muler.create_demo_subset(num_samples=args.demo_samples if args.demo_samples > 0 else 100)
+        # For demo, point to local SSD paths
+        args.image_folder = inbound_muler.local_image_folder
+        args.video_folder = inbound_muler.local_video_folder
+        args.image_json = inbound_muler.local_image_json
+        args.video_json = inbound_muler.local_video_json
         if args.action == "demo_setup":
             return
+    else:
+        # Full mode: data lives on Google Drive, annotations synced to SSD
+        args.image_folder = inbound_muler.drive_image_folder
+        args.video_folder = inbound_muler.drive_video_folder
+        args.image_json = inbound_muler.local_image_json  # Small JSON on SSD for fast reads
+        args.video_json = inbound_muler.local_video_json
 
-    if args.action in ["all", "mule_in"]:
+    # Download & extract datasets on Google Drive
+    if args.action in ["all", "download", "extract"]:
         if args.demo_samples == 0:
-            if not inbound_muler.verify_local_dataset():
-                inbound_muler.download_from_hf_to_drive(download_images=True, download_videos=True)
-                inbound_muler.mule_archives_to_ssd()
+            if not inbound_muler.verify_drive_dataset():
+                inbound_muler.download_and_prepare_all()
             else:
-                log_success("Full datasets already present on local SSD. Skipping download.")
-        if args.action == "mule_in":
+                log_success("Full datasets already present on Google Drive. Skipping download.")
+                inbound_muler.sync_annotations_to_local()
+        if args.action in ["download", "extract"]:
             return
 
     if args.action in ["all", "train"]:
