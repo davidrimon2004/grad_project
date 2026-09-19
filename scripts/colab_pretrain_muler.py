@@ -126,12 +126,20 @@ class InboundDataMuler:
         self.local_scratch_dir.mkdir(parents=True, exist_ok=True)
         self.local_json_folder.mkdir(parents=True, exist_ok=True)
 
+    # Minimum file counts to distinguish real datasets from demo stubs
+    MIN_REAL_IMAGE_FILES = 10
+    MIN_REAL_VIDEO_FILES = 5
+
     def verify_local_dataset(self) -> bool:
-        """Check if datasets are already extracted and ready on local SSD."""
+        """Check if REAL (non-demo) datasets are already extracted and ready on local SSD."""
         image_json_ok = self.local_image_json.is_file() and self.local_image_json.stat().st_size > 0
         video_json_ok = self.local_video_json.is_file() and self.local_video_json.stat().st_size > 0
-        image_dir_ok = self.local_image_folder.is_dir() and any(self.local_image_folder.iterdir())
-        video_dir_ok = self.local_video_folder.is_dir() and any(self.local_video_folder.iterdir())
+
+        # Count actual media files — demo mode only creates 1 of each
+        num_images = sum(1 for _ in self.local_image_folder.iterdir()) if self.local_image_folder.is_dir() else 0
+        num_videos = sum(1 for _ in self.local_video_folder.iterdir()) if self.local_video_folder.is_dir() else 0
+        image_dir_ok = num_images >= self.MIN_REAL_IMAGE_FILES
+        video_dir_ok = num_videos >= self.MIN_REAL_VIDEO_FILES
 
         return image_json_ok and video_json_ok and image_dir_ok and video_dir_ok
 
@@ -761,9 +769,12 @@ def main():
             return
 
     if args.action in ["all", "mule_in"]:
-        if not inbound_muler.verify_local_dataset() and args.demo_samples == 0:
-            inbound_muler.download_from_hf_to_drive(download_images=True, download_videos=True)
-            inbound_muler.mule_archives_to_ssd()
+        if args.demo_samples == 0:
+            if not inbound_muler.verify_local_dataset():
+                inbound_muler.download_from_hf_to_drive(download_images=True, download_videos=True)
+                inbound_muler.mule_archives_to_ssd()
+            else:
+                log_success("Full datasets already present on local SSD. Skipping download.")
         if args.action == "mule_in":
             return
 
