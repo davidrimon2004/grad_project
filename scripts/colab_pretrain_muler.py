@@ -635,22 +635,27 @@ def detect_colab_hardware_and_tune() -> Dict:
         micro_batch_size = 8
         grad_accum = max(1, target_effective_batch_size // (micro_batch_size * max(1, device_count)))
         num_workers = 4
+        bits = 16
     elif vram_gb >= 22.0:  # L4 (24GB) or V100 (32GB)
         micro_batch_size = 4
         grad_accum = max(1, target_effective_batch_size // (micro_batch_size * max(1, device_count)))
         num_workers = 4
-    elif vram_gb >= 14.0:  # T4 (16GB) or V100 (16GB) - keep micro_batch=1 for safe VRAM headroom
-        micro_batch_size = 1
+        bits = 16
+    elif vram_gb >= 14.0:  # T4 (16GB) or V100 (16GB) - enable 8-bit frozen LLM backbone for 6.5GB VRAM headroom
+        micro_batch_size = 2
         grad_accum = max(1, target_effective_batch_size // (micro_batch_size * max(1, device_count)))
         num_workers = 2
+        bits = 8
     else:  # Small GPUs (<14GB)
         micro_batch_size = 1
         grad_accum = max(1, target_effective_batch_size // (micro_batch_size * max(1, device_count)))
         num_workers = 2
+        bits = 8
 
     config = {
         "fp16": not supports_bf16,
         "bf16": supports_bf16,
+        "bits": bits,
         "per_device_train_batch_size": micro_batch_size,
         "gradient_accumulation_steps": grad_accum,
         "dataloader_num_workers": num_workers,
@@ -660,6 +665,7 @@ def detect_colab_hardware_and_tune() -> Dict:
     }
 
     log_info(f"Hardware Auto-Tuning Configuration:")
+    log_info(f"  • Backbone Quantization: {config['bits']}-bit")
     log_info(f"  • Precision: {'bfloat16 (bf16)' if config['bf16'] else 'float16 (fp16)'}")
     log_info(f"  • Micro Batch Size per GPU: {config['per_device_train_batch_size']}")
     log_info(f"  • Gradient Accumulation Steps: {config['gradient_accumulation_steps']}")
@@ -721,6 +727,9 @@ class VideoLLaVAPretrainingEngine:
             "--report_to", "tensorboard",
             "--cache_dir", str(self.args.cache_dir)
         ]
+
+        if self.hw_config.get("bits", 16) in [4, 8]:
+            cmd.extend(["--bits", str(self.hw_config["bits"])])
 
         if self.hw_config["bf16"]:
             cmd.extend(["--bf16", "True", "--tf32", "True"])
