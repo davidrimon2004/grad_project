@@ -110,8 +110,11 @@ class LanguageBindImageTower(nn.Module):
 
     ############################################################
     def load_model(self):
+        if self.is_loaded:
+            return
         model = LanguageBindImage.from_pretrained(self.image_tower_name, cache_dir=self.cache_dir)
         self.image_tower = model.vision_model
+        self.image_tower.to(torch.float16)
         self.image_tower.requires_grad_(False)
 
         self.image_processor = LanguageBindImageProcessor(model.config)
@@ -192,14 +195,14 @@ class LanguageBindVideoTower(nn.Module):
 
     ############################################################
     def load_model(self):
+        if self.is_loaded:
+            return
         model = LanguageBindVideo.from_pretrained(self.video_tower_name, cache_dir=self.cache_dir)
         self.video_processor = LanguageBindVideoProcessor(model.config)
 
-
-        # model = LanguageBindImage.from_pretrained('LanguageBind/LanguageBind_Image', cache_dir=self.cache_dir)
         self.video_tower = model.vision_model
+        self.video_tower.to(torch.float16)
         self.video_tower.requires_grad_(False)
-
 
         self.is_loaded = True
 

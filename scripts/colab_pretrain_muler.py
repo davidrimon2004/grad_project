@@ -639,8 +639,8 @@ def detect_colab_hardware_and_tune() -> Dict:
         micro_batch_size = 4
         grad_accum = max(1, target_effective_batch_size // (micro_batch_size * max(1, device_count)))
         num_workers = 4
-    elif vram_gb >= 14.0:  # T4 (16GB) or V100 (16GB)
-        micro_batch_size = 2
+    elif vram_gb >= 14.0:  # T4 (16GB) or V100 (16GB) - keep micro_batch=1 for safe VRAM headroom
+        micro_batch_size = 1
         grad_accum = max(1, target_effective_batch_size // (micro_batch_size * max(1, device_count)))
         num_workers = 2
     else:  # Small GPUs (<14GB)
@@ -729,7 +729,11 @@ class VideoLLaVAPretrainingEngine:
 
         # DeepSpeed integration
         if self.args.deepspeed_config and os.path.exists(self.args.deepspeed_config):
-            cmd.extend(["--deepspeed", self.args.deepspeed_config])
+            ds_config = self.args.deepspeed_config
+            if self.hw_config["vram_gb"] < 16.0 and ds_config == "./scripts/zero2.json" and os.path.exists("./scripts/zero2_offload.json"):
+                ds_config = "./scripts/zero2_offload.json"
+                log_info("Auto-switching to './scripts/zero2_offload.json' for optimal CPU optimizer offloading on T4 GPU.")
+            cmd.extend(["--deepspeed", ds_config])
 
         return cmd
 
