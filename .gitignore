@@ -1,0 +1,19 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Cache directories
+cache_dir/
+.cache/
+
+# Local checkpoints and test outputs
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+
+# Virtual environment
+.venv/
+venv/
+env/

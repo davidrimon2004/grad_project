@@ -28,6 +28,28 @@ from .thermal.tokenization_thermal import LanguageBindThermalTokenizer
 from .thermal.processing_thermal import LanguageBindThermalProcessor
 
 
+def sanitize_position_ids(vision_model):
+    """
+    HuggingFace transformers (v4.45+) leaves non-persistent buffers (like position_ids in CLIPVisionEmbeddings)
+    uninitialized as garbage heap memory when loading models via from_pretrained, leading to device-side CUDA assertions
+    or IndexError in vectorized_gather_kernel. This helper guarantees position_ids is correctly bounded and on the target device.
+    """
+    if vision_model is None:
+        return
+    embeddings = getattr(vision_model, 'embeddings', None)
+    if embeddings is not None and hasattr(embeddings, 'position_embedding'):
+        num_pos = embeddings.position_embedding.weight.shape[0]
+        dev = embeddings.position_embedding.weight.device
+        pos_ids = getattr(embeddings, 'position_ids', None)
+        if (pos_ids is None or
+            not isinstance(pos_ids, torch.Tensor) or
+            pos_ids.device != dev or
+            pos_ids.shape[-1] != num_pos or
+            pos_ids.dtype != torch.long or
+            pos_ids.max() >= num_pos or
+            pos_ids.min() < 0):
+            embeddings.position_ids = torch.arange(num_pos, device=dev).unsqueeze(0)
+
 
 config_dict = {
     'thermal': LanguageBindThermalConfig,
@@ -114,7 +136,9 @@ class LanguageBindImageTower(nn.Module):
             return
         model = LanguageBindImage.from_pretrained(self.image_tower_name, cache_dir=self.cache_dir)
         self.image_tower = model.vision_model
+        sanitize_position_ids(self.image_tower)
         self.image_tower.to(torch.float16)
+        sanitize_position_ids(self.image_tower)
         self.image_tower.requires_grad_(False)
 
         self.image_processor = LanguageBindImageProcessor(model.config)
@@ -133,6 +157,7 @@ class LanguageBindImageTower(nn.Module):
 
     @torch.no_grad()
     def forward(self, images):
+        sanitize_position_ids(self.image_tower)
         if type(images) is list:
             image_features = []
             for image in images:
@@ -201,7 +226,9 @@ class LanguageBindVideoTower(nn.Module):
         self.video_processor = LanguageBindVideoProcessor(model.config)
 
         self.video_tower = model.vision_model
+        sanitize_position_ids(self.video_tower)
         self.video_tower.to(torch.float16)
+        sanitize_position_ids(self.video_tower)
         self.video_tower.requires_grad_(False)
 
         self.is_loaded = True
@@ -219,6 +246,7 @@ class LanguageBindVideoTower(nn.Module):
 
     @torch.no_grad()
     def forward(self, videos):
+        sanitize_position_ids(self.video_tower)
         if type(videos) is list:
             video_features = []
             for video in videos:

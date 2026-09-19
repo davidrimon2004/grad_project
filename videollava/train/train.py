@@ -1044,12 +1044,24 @@ def train():
         if model_args.image_tower is not None:
             image_tower = model.get_image_tower()
             image_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+            # Ensure position_ids buffer is valid and on the training device (fixes HF transformers v4.45+ uninitialized buffer bug)
+            sub_tower = getattr(image_tower, 'image_tower', image_tower)
+            emb = getattr(sub_tower, 'embeddings', None)
+            if emb is not None and hasattr(emb, 'position_embedding'):
+                num_pos = emb.position_embedding.weight.shape[0]
+                emb.position_ids = torch.arange(num_pos, device=training_args.device).unsqueeze(0)
 
             data_args.image_processor = image_tower.image_processor
             data_args.is_multimodal = True
         if model_args.video_tower is not None:
             video_tower = model.get_video_tower()
             video_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+            # Ensure position_ids buffer is valid and on the training device
+            sub_tower = getattr(video_tower, 'video_tower', video_tower)
+            emb = getattr(sub_tower, 'embeddings', None)
+            if emb is not None and hasattr(emb, 'position_embedding'):
+                num_pos = emb.position_embedding.weight.shape[0]
+                emb.position_ids = torch.arange(num_pos, device=training_args.device).unsqueeze(0)
 
             data_args.video_processor = video_tower.video_processor
             data_args.is_multimodal = True

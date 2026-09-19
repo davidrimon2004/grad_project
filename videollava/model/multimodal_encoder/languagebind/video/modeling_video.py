@@ -665,6 +665,18 @@ class CLIPVisionTransformer(nn.Module):
             B, _, _, _ = pixel_values.shape
             T = 1
         ###########################
+        if hasattr(self.embeddings, 'position_embedding'):
+            num_pos = self.embeddings.position_embedding.weight.shape[0]
+            dev = self.embeddings.position_embedding.weight.device
+            pos_ids = getattr(self.embeddings, 'position_ids', None)
+            if (pos_ids is None or
+                not isinstance(pos_ids, torch.Tensor) or
+                pos_ids.device != dev or
+                pos_ids.shape[-1] != num_pos or
+                pos_ids.dtype != torch.long or
+                pos_ids.max() >= num_pos or
+                pos_ids.min() < 0):
+                self.embeddings.position_ids = torch.arange(num_pos, device=dev).unsqueeze(0)
         hidden_states = self.embeddings(pixel_values)
         # print(B, T)
         hidden_states = self.patch_dropout(hidden_states, B, T)  ##############################################
