@@ -881,9 +881,16 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
 def train():
     global local_rank
 
+    for i, arg in enumerate(sys.argv):
+        if arg == "--evaluation_strategy":
+            sys.argv[i] = "--eval_strategy"
+
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
+        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+    else:
+        model_args, data_args, training_args, _ = parser.parse_args_into_dataclasses(return_remaining_strings=True)
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 

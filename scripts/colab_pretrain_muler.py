@@ -704,7 +704,7 @@ class VideoLLaVAPretrainingEngine:
             "--per_device_train_batch_size", str(self.hw_config["per_device_train_batch_size"]),
             "--per_device_eval_batch_size", "4",
             "--gradient_accumulation_steps", str(self.hw_config["gradient_accumulation_steps"]),
-            "--evaluation_strategy", "no",
+            "--eval_strategy", "no",
             "--save_strategy", "steps",
             "--save_steps", str(self.args.save_steps),
             "--save_total_limit", str(self.args.save_total_limit),
