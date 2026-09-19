@@ -66,7 +66,10 @@ class LanguageBindDepthProcessor(ProcessorMixin):
     tokenizer_class = ("LanguageBindDepthTokenizer")
 
     def __init__(self, config, tokenizer=None, **kwargs):
-        super().__init__(**kwargs)
+        try:
+            super().__init__(tokenizer=tokenizer, **kwargs)
+        except Exception:
+            pass
         self.config = config
         self.transform = get_depth_transform(config)
         self.image_processor = load_and_transform_depth
