@@ -177,6 +177,15 @@ class LengthGroupedSampler(Sampler):
 
 class LLaVATrainer(Trainer):
 
+    def __init__(self, *args, tokenizer=None, processing_class=None, **kwargs):
+        proc = processing_class if processing_class is not None else tokenizer
+        try:
+            super().__init__(*args, processing_class=proc, **kwargs)
+        except TypeError:
+            super().__init__(*args, tokenizer=proc, **kwargs)
+        if not hasattr(self, "tokenizer") or self.tokenizer is None:
+            self.tokenizer = proc
+
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):
             return None
