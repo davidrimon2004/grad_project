@@ -4,14 +4,59 @@ import torch
 from torch.utils.data import Sampler
 
 from transformers import Trainer
-from transformers.trainer import (
-    is_sagemaker_mp_enabled,
-    get_parameter_names,
-    has_length,
-    ALL_LAYERNORM_LAYERS,
-    ShardedDDPOption,
-    logger,
-)
+from transformers.utils import logging as hf_logging
+
+logger = hf_logging.get_logger(__name__)
+
+# Transformers 4.35+ compatibility helpers
+try:
+    from transformers.trainer_pt_utils import is_sagemaker_mp_enabled
+except ImportError:
+    try:
+        from transformers.utils.import_utils import is_sagemaker_mp_enabled
+    except ImportError:
+        def is_sagemaker_mp_enabled():
+            return False
+
+try:
+    from transformers.trainer_pt_utils import get_parameter_names
+except ImportError:
+    try:
+        from transformers.pytorch_utils import get_parameter_names
+    except ImportError:
+        def get_parameter_names(model, forbidden_layer_types):
+            decay_parameters = []
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                decay_parameters.append(name)
+            return decay_parameters
+
+try:
+    from transformers.trainer_pt_utils import has_length
+except ImportError:
+    def has_length(dataset):
+        try:
+            return len(dataset) is not None
+        except TypeError:
+            return False
+
+try:
+    from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
+except ImportError:
+    try:
+        from transformers.trainer import ALL_LAYERNORM_LAYERS
+    except ImportError:
+        ALL_LAYERNORM_LAYERS = [torch.nn.LayerNorm]
+
+try:
+    from transformers.trainer_utils import ShardedDDPOption
+except ImportError:
+    try:
+        from transformers.trainer import ShardedDDPOption
+    except ImportError:
+        class ShardedDDPOption:
+            SIMPLE = "simple"
 from typing import List, Optional
 
 
