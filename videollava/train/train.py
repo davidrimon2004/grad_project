@@ -25,8 +25,18 @@ import pathlib
 from typing import Dict, Optional, Sequence, List
 
 import torch
-
 import transformers
+
+# In modern transformers, validate_quantization_for_training blocks training on
+# quantized models unless wrapped in PEFT. In Video-LLaVA Stage 1, the mm_projector
+# adapter is trained directly with a frozen quantized backbone.
+try:
+    import transformers.trainer
+    import transformers.trainer_utils
+    transformers.trainer.validate_quantization_for_training = lambda m: None
+    transformers.trainer_utils.validate_quantization_for_training = lambda m: None
+except Exception:
+    pass
 
 from videollava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, \
     DEFAULT_IM_END_TOKEN, DEFAULT_VIDEO_TOKEN, DEFAULT_VID_START_TOKEN, DEFAULT_VID_END_TOKEN, MAX_IMAGE_LENGTH, \
@@ -1090,17 +1100,6 @@ def train():
                 if hasattr(module, 'weight'):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
-
-    # In modern transformers, validate_quantization_for_training blocks training on
-    # quantized models unless wrapped in PEFT. In Video-LLaVA Stage 1, the mm_projector
-    # adapter is trained directly with a frozen quantized backbone.
-    try:
-        import transformers.trainer
-        import transformers.trainer_utils
-        transformers.trainer.validate_quantization_for_training = lambda m: None
-        transformers.trainer_utils.validate_quantization_for_training = lambda m: None
-    except Exception:
-        pass
 
     # DeepSpeed does not support 4-bit / 8-bit quantized models (.to() calls crash bitsandbytes).
     if training_args.bits in [4, 8] and getattr(training_args, "deepspeed", None):
