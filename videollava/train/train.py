@@ -973,8 +973,16 @@ def train():
 
     if training_args.bits in [4, 8]:
         from peft import prepare_model_for_kbit_training
-        model.config.torch_dtype=(torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
+        model.config.torch_dtype = (torch.bfloat16 if training_args.bf16 else (torch.float16 if training_args.fp16 else torch.float32))
+        model.config.fp16 = training_args.fp16
+        model.config.bf16 = training_args.bf16
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
+        if training_args.fp16:
+            if hasattr(model.get_model(), 'embed_tokens'):
+                model.get_model().embed_tokens.to(torch.float16)
+        elif training_args.bf16:
+            if hasattr(model.get_model(), 'embed_tokens'):
+                model.get_model().embed_tokens.to(torch.bfloat16)
 
     if training_args.gradient_checkpointing:
         if hasattr(model, "enable_input_require_grads"):
@@ -1128,6 +1136,8 @@ def train():
                 if hasattr(module, 'weight'):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
+                    elif training_args.fp16 and module.weight.dtype == torch.float32:
+                        module = module.to(torch.float16)
 
     # DeepSpeed does not support 4-bit / 8-bit quantized models (.to() calls crash bitsandbytes).
     if training_args.bits in [4, 8] and getattr(training_args, "deepspeed", None):

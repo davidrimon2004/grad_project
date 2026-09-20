@@ -215,17 +215,23 @@ class LlavaMetaForCausalLM(ABC):
         attn_layer = self.get_early_fusion_attn()
         ln_layer = self.get_early_fusion_ln()
 
+        # Determine target precision (float16 or bfloat16)
+        target_dtype = torch.bfloat16 if getattr(self.config, 'bf16', False) else torch.float16
+        if text_embeds.dtype != target_dtype:
+            text_embeds = text_embeds.to(target_dtype)
+        if visual_embeds.dtype != target_dtype:
+            visual_embeds = visual_embeds.to(target_dtype)
+
         # Ensure attention and layernorm match the device and dtype of incoming embeddings
         ref_param = next(attn_layer.parameters())
-        if ref_param.device != text_embeds.device or ref_param.dtype != text_embeds.dtype:
-            attn_layer.to(device=text_embeds.device, dtype=text_embeds.dtype)
+        if ref_param.device != text_embeds.device or ref_param.dtype != target_dtype:
+            attn_layer.to(device=text_embeds.device, dtype=target_dtype)
             ref_param = next(attn_layer.parameters())
 
         ref_ln = next(ln_layer.parameters())
-        if ref_ln.device != text_embeds.device or ref_ln.dtype != text_embeds.dtype:
-            ln_layer.to(device=text_embeds.device, dtype=text_embeds.dtype)
+        if ref_ln.device != text_embeds.device or ref_ln.dtype != target_dtype:
+            ln_layer.to(device=text_embeds.device, dtype=target_dtype)
 
-        target_dtype = ref_param.dtype
         target_device = ref_param.device
 
         # Query = text tokens, Key = Value = visual tokens: [1, Nt, dt] / [1, Nv, dt]
@@ -244,8 +250,8 @@ class LlavaMetaForCausalLM(ABC):
         )
 
         # Residual connection + LayerNorm (text-side residual, same as the other ablations)
-        fused = text_embeds + attn_out.squeeze(0).to(text_embeds.dtype)
-        t_hat = ln_layer(fused.to(next(ln_layer.parameters()).dtype)).to(text_embeds.dtype)
+        fused = text_embeds + attn_out.squeeze(0).to(target_dtype)
+        t_hat = ln_layer(fused.to(next(ln_layer.parameters()).dtype)).to(target_dtype)
 
         return t_hat
 
@@ -452,6 +458,9 @@ class LlavaMetaForCausalLM(ABC):
                     position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
 
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
+        target_dtype = torch.bfloat16 if getattr(self.config, 'bf16', False) else torch.float16
+        if new_input_embeds.dtype != target_dtype:
+            new_input_embeds = new_input_embeds.to(target_dtype)
 
         if _labels is None:
             new_labels = None
