@@ -134,6 +134,10 @@ class LlavaMetaModel:
                 dropout=0.0,
                 batch_first=True
             )
+            # Zero-initialize the output projection so at initialization, cross-attention output is 0.
+            # This preserves the pretrained Vicuna text embeddings scale exactly and guarantees numerical stability.
+            nn.init.zeros_(self.early_fusion_attn.out_proj.weight)
+            nn.init.zeros_(self.early_fusion_attn.out_proj.bias)
         else:
             for p in self.early_fusion_attn.parameters():
                 p.requires_grad = True
@@ -181,6 +185,8 @@ class LlavaMetaForCausalLM(ABC):
                 dropout=0.0,
                 batch_first=True
             )
+            nn.init.zeros_(attn.out_proj.weight)
+            nn.init.zeros_(attn.out_proj.bias)
             model.early_fusion_attn = attn
         return attn
 
@@ -234,8 +240,9 @@ class LlavaMetaForCausalLM(ABC):
 
         target_device = ref_param.device
 
-        # Pass inputs matching ref_param.dtype so it works seamlessly both under autocast (AMP) and standalone
-        q = text_embeds.unsqueeze(0).to(device=target_device, dtype=ref_param.dtype)
+        # Pre-LayerNorm on text query before cross-attention for numerical stability
+        q_raw = text_embeds.unsqueeze(0).to(device=target_device, dtype=next(ln_layer.parameters()).dtype)
+        q = ln_layer(q_raw).to(dtype=ref_param.dtype)
         kv = visual_embeds.unsqueeze(0).to(device=target_device, dtype=ref_param.dtype)
 
         # No causal mask here: causality/label-leakage only matters along the text
@@ -249,11 +256,10 @@ class LlavaMetaForCausalLM(ABC):
             need_weights=False
         )
 
-        # Residual connection + LayerNorm (text-side residual, same as the other ablations)
+        # Residual connection without scale explosion (preserves native LLaMA embedding scale of ~0.02)
         fused = text_embeds + attn_out.squeeze(0).to(target_dtype)
-        t_hat = ln_layer(fused.to(next(ln_layer.parameters()).dtype)).to(target_dtype)
 
-        return t_hat
+        return fused
 
     def encode_images(self, images):
         image_features = self.get_model().get_image_tower()(images)

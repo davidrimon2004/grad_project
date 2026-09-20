@@ -723,7 +723,7 @@ class VideoLLaVAPretrainingEngine:
             "--save_total_limit", str(self.args.save_total_limit),
             "--learning_rate", str(self.args.learning_rate),
             "--weight_decay", "0.",
-            "--warmup_ratio", "0.03",
+            "--warmup_ratio", "0.2" if "pt_json" in str(self.args.image_json) else "0.03",
             "--lr_scheduler_type", "cosine",
             "--logging_steps", "1",
             "--model_max_length", "2048",
