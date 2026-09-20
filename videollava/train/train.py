@@ -1177,8 +1177,29 @@ def train():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+    ckpts = [p for p in pathlib.Path(training_args.output_dir).glob("checkpoint-*") if p.is_dir()]
+    valid_resume_ckpts = [c for c in ckpts if (c / "trainer_state.json").exists()]
+    if valid_resume_ckpts:
+        rank0_print(f"[INFO] Resuming training from checkpoint: {valid_resume_ckpts[-1]}")
         trainer.train(resume_from_checkpoint=True)
+    elif ckpts:
+        # Checkpoint directory exists but without trainer_state.json (e.g. from previous run)
+        latest_ckpt = max(ckpts, key=lambda p: int(p.name.split("-")[1]) if len(p.name.split("-")) > 1 and p.name.split("-")[1].isdigit() else 0)
+        adapter_path = latest_ckpt / "mm_projector.bin"
+        if adapter_path.exists():
+            rank0_print(f"[INFO] Found previous adapter checkpoint at {adapter_path}. Loading weights into model...")
+            adapter_weights = torch.load(adapter_path, map_location="cpu")
+            proj_weights = {k.split("mm_projector.")[1]: v for k, v in adapter_weights.items() if "mm_projector." in k}
+            if proj_weights:
+                model.get_model().mm_projector.load_state_dict(proj_weights, strict=False)
+            early_attn = {k.split("early_fusion_attn.")[1]: v for k, v in adapter_weights.items() if "early_fusion_attn." in k}
+            if early_attn and hasattr(model.get_model(), "early_fusion_attn") and model.get_model().early_fusion_attn is not None:
+                model.get_model().early_fusion_attn.load_state_dict(early_attn, strict=False)
+            early_ln = {k.split("early_fusion_ln.")[1]: v for k, v in adapter_weights.items() if "early_fusion_ln." in k}
+            if early_ln and hasattr(model.get_model(), "early_fusion_ln") and model.get_model().early_fusion_ln is not None:
+                model.get_model().early_fusion_ln.load_state_dict(early_ln, strict=False)
+            rank0_print("[SUCCESS] Successfully loaded previous adapter checkpoint weights.")
+        trainer.train()
     else:
         trainer.train()
     trainer.save_state()

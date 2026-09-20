@@ -333,6 +333,7 @@ class LLaVATrainer(Trainer):
             if getattr(self.args, "local_rank", -1) in [0, -1]:
                 self.model.config.save_pretrained(output_dir)
                 torch.save(weight_to_save, os.path.join(output_dir, 'mm_projector.bin'))
+                self.state.save_to_json(os.path.join(output_dir, "trainer_state.json"))
         else:
             try:
                 super()._save_checkpoint(model, trial, metrics=metrics)

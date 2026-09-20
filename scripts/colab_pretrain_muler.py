@@ -610,16 +610,14 @@ def detect_colab_hardware_and_tune(args=None) -> Dict:
 
     device_count = torch.cuda.device_count()
     if device_count == 0:
-        log_warn("No CUDA GPU detected! Running on CPU (Pretraining will be extremely slow).")
-        return {
-            "fp16": False,
-            "bf16": False,
-            "per_device_train_batch_size": 1,
-            "gradient_accumulation_steps": 32,
-            "dataloader_num_workers": 2,
-            "device_name": "CPU",
-            "vram_gb": 0
-        }
+        log_err("=" * 60)
+        log_err("CRITICAL ERROR: No CUDA GPU detected in this Colab session!")
+        log_err("Video-LLaVA cannot run on CPU. Please enable a GPU in Google Colab:")
+        log_err("  1. In the top menu, click 'Runtime' -> 'Change runtime type'.")
+        log_err("  2. Under 'Hardware accelerator', select 'T4 GPU'.")
+        log_err("  3. Click 'Save' and re-run the notebook.")
+        log_err("=" * 60)
+        sys.exit(1)
 
     gpu_name = torch.cuda.get_device_name(0)
     vram_bytes = torch.cuda.get_device_properties(0).total_memory
