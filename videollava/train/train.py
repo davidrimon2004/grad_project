@@ -187,7 +187,7 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
-    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler']
+    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'early_fusion']
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
@@ -206,7 +206,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
 
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
-        keys_to_match = ['mm_projector']
+        keys_to_match = ['mm_projector', 'early_fusion']
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
 
@@ -932,7 +932,7 @@ def train():
             quantization_config=BitsAndBytesConfig(
                 load_in_4bit=training_args.bits == 4,
                 load_in_8bit=training_args.bits == 8,
-                llm_int8_skip_modules=["mm_projector"],
+                llm_int8_skip_modules=["mm_projector", "early_fusion_attn", "early_fusion_ln"],
                 llm_int8_threshold=6.0,
                 llm_int8_has_fp16_weight=False,
                 bnb_4bit_compute_dtype=compute_dtype,
@@ -1085,14 +1085,30 @@ def train():
             model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = True
+            if hasattr(model.get_model(), 'early_fusion_attn') and model.get_model().early_fusion_attn is not None:
+                for p in model.get_model().early_fusion_attn.parameters():
+                    p.requires_grad = True
+            if hasattr(model.get_model(), 'early_fusion_ln') and model.get_model().early_fusion_ln is not None:
+                for p in model.get_model().early_fusion_ln.parameters():
+                    p.requires_grad = True
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = False
+            if hasattr(model.get_model(), 'early_fusion_attn') and model.get_model().early_fusion_attn is not None:
+                for p in model.get_model().early_fusion_attn.parameters():
+                    p.requires_grad = False
+            if hasattr(model.get_model(), 'early_fusion_ln') and model.get_model().early_fusion_ln is not None:
+                for p in model.get_model().early_fusion_ln.parameters():
+                    p.requires_grad = False
 
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
+            if hasattr(model.get_model(), 'early_fusion_attn') and model.get_model().early_fusion_attn is not None:
+                model.get_model().early_fusion_attn.to(dtype=compute_dtype, device=training_args.device)
+            if hasattr(model.get_model(), 'early_fusion_ln') and model.get_model().early_fusion_ln is not None:
+                model.get_model().early_fusion_ln.to(dtype=compute_dtype, device=training_args.device)
 
         model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_projector_lr = training_args.mm_projector_lr

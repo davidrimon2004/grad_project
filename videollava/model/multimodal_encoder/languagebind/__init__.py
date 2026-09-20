@@ -140,6 +140,7 @@ class LanguageBindImageTower(nn.Module):
         self.image_tower.to(torch.float16)
         sanitize_position_ids(self.image_tower)
         self.image_tower.requires_grad_(False)
+        self.image_tower.eval()
 
         self.image_processor = LanguageBindImageProcessor(model.config)
 
@@ -158,6 +159,7 @@ class LanguageBindImageTower(nn.Module):
     @torch.no_grad()
     def forward(self, images):
         sanitize_position_ids(self.image_tower)
+        self.image_tower.eval()
         if type(images) is list:
             image_features = []
             for image in images:
@@ -230,6 +232,7 @@ class LanguageBindVideoTower(nn.Module):
         self.video_tower.to(torch.float16)
         sanitize_position_ids(self.video_tower)
         self.video_tower.requires_grad_(False)
+        self.video_tower.eval()
 
         self.is_loaded = True
 
@@ -247,6 +250,7 @@ class LanguageBindVideoTower(nn.Module):
     @torch.no_grad()
     def forward(self, videos):
         sanitize_position_ids(self.video_tower)
+        self.video_tower.eval()
         if type(videos) is list:
             video_features = []
             for video in videos:

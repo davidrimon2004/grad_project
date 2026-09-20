@@ -126,12 +126,36 @@ class LlavaMetaModel:
             for p in self.mm_projector.parameters():
                 p.requires_grad = True
 
+        if getattr(self, 'early_fusion_attn', None) is None:
+            num_heads = getattr(self.config, "mha_fusion_heads", 8)
+            self.early_fusion_attn = nn.MultiheadAttention(
+                embed_dim=self.config.hidden_size,
+                num_heads=num_heads,
+                dropout=0.0,
+                batch_first=True
+            )
+        else:
+            for p in self.early_fusion_attn.parameters():
+                p.requires_grad = True
+
+        if getattr(self, 'early_fusion_ln', None) is None:
+            self.early_fusion_ln = nn.LayerNorm(self.config.hidden_size)
+        else:
+            for p in self.early_fusion_ln.parameters():
+                p.requires_grad = True
+
         if pretrain_mm_mlp_adapter is not None:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
             def get_w(weights, keyword):
                 return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
 
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
+            early_attn_weights = get_w(mm_projector_weights, 'early_fusion_attn')
+            if len(early_attn_weights) > 0:
+                self.early_fusion_attn.load_state_dict(early_attn_weights)
+            early_ln_weights = get_w(mm_projector_weights, 'early_fusion_ln')
+            if len(early_ln_weights) > 0:
+                self.early_fusion_ln.load_state_dict(early_ln_weights)
 
 
 class LlavaMetaForCausalLM(ABC):
@@ -147,10 +171,26 @@ class LlavaMetaForCausalLM(ABC):
         return self.get_model().get_video_tower()
 
     def get_early_fusion_attn(self):
-        return self.get_model().early_fusion_attn
+        model = self.get_model()
+        attn = getattr(model, 'early_fusion_attn', None)
+        if attn is None:
+            num_heads = getattr(self.config, "mha_fusion_heads", 8)
+            attn = nn.MultiheadAttention(
+                embed_dim=self.config.hidden_size,
+                num_heads=num_heads,
+                dropout=0.0,
+                batch_first=True
+            )
+            model.early_fusion_attn = attn
+        return attn
 
     def get_early_fusion_ln(self):
-        return self.get_model().early_fusion_ln
+        model = self.get_model()
+        ln = getattr(model, 'early_fusion_ln', None)
+        if ln is None:
+            ln = nn.LayerNorm(self.config.hidden_size)
+            model.early_fusion_ln = ln
+        return ln
 
     def cross_attention_fuse(self, text_embeds, visual_embeds):
         """
@@ -173,9 +213,18 @@ class LlavaMetaForCausalLM(ABC):
             return text_embeds
 
         attn_layer = self.get_early_fusion_attn()
+        ln_layer = self.get_early_fusion_ln()
 
-        # Safely extract the exact device and dtype of the attention layer's weights
+        # Ensure attention and layernorm match the device and dtype of incoming embeddings
         ref_param = next(attn_layer.parameters())
+        if ref_param.device != text_embeds.device or ref_param.dtype != text_embeds.dtype:
+            attn_layer.to(device=text_embeds.device, dtype=text_embeds.dtype)
+            ref_param = next(attn_layer.parameters())
+
+        ref_ln = next(ln_layer.parameters())
+        if ref_ln.device != text_embeds.device or ref_ln.dtype != text_embeds.dtype:
+            ln_layer.to(device=text_embeds.device, dtype=text_embeds.dtype)
+
         target_dtype = ref_param.dtype
         target_device = ref_param.device
 
@@ -196,7 +245,6 @@ class LlavaMetaForCausalLM(ABC):
 
         # Residual connection + LayerNorm (text-side residual, same as the other ablations)
         fused = text_embeds + attn_out.squeeze(0).to(text_embeds.dtype)
-        ln_layer = self.get_early_fusion_ln()
         t_hat = ln_layer(fused.to(next(ln_layer.parameters()).dtype)).to(text_embeds.dtype)
 
         return t_hat
