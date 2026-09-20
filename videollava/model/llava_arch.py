@@ -466,6 +466,10 @@ class LlavaMetaForCausalLM(ABC):
         if _position_ids is None:
             position_ids = None
 
+        del images_minibatch, videos_minibatch, tmp_image_features, new_tmp, new_input_embeds_padded
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):

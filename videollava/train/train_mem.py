@@ -2,6 +2,9 @@
 # Adopted from tatsu-lab@stanford_alpaca. Below is the original copyright:
 # Make it more memory efficient by monkey patching the LLaMA model with FlashAttn.
 
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 # Need to call this before importing transformers.
 from videollava.train.llama_flash_attn_monkey_patch import replace_llama_attn_with_flash_attn
 

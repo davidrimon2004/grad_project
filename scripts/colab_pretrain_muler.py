@@ -601,7 +601,7 @@ class CheckpointMuleDaemon:
 # Hardware Auto-Tuning Engine for Google Colab
 # ==============================================================================
 
-def detect_colab_hardware_and_tune() -> Dict:
+def detect_colab_hardware_and_tune(args=None) -> Dict:
     """
     Detects available GPU (T4, L4, V100, A100), VRAM size, and computes optimal
     batch size, gradient accumulation, fp16/bf16, and DeepSpeed settings.
@@ -641,16 +641,23 @@ def detect_colab_hardware_and_tune() -> Dict:
         grad_accum = max(1, target_effective_batch_size // (micro_batch_size * max(1, device_count)))
         num_workers = 4
         bits = 16
-    elif vram_gb >= 14.0:  # T4 (16GB) or V100 (16GB) - enable 8-bit frozen LLM backbone for 6.5GB VRAM headroom
+    elif vram_gb >= 18.0:  # 20GB+ cards
         micro_batch_size = 2
         grad_accum = max(1, target_effective_batch_size // (micro_batch_size * max(1, device_count)))
         num_workers = 2
         bits = 8
-    else:  # Small GPUs (<14GB)
+    else:  # Tesla T4 (14.6GB), V100 (16GB), or smaller GPUs - micro_batch_size=1 fits safely in 14.6GB VRAM
         micro_batch_size = 1
         grad_accum = max(1, target_effective_batch_size // (micro_batch_size * max(1, device_count)))
         num_workers = 2
         bits = 8
+
+    # Allow CLI overrides if explicitly passed
+    if args is not None and getattr(args, "per_device_train_batch_size", None) is not None:
+        micro_batch_size = args.per_device_train_batch_size
+        grad_accum = max(1, target_effective_batch_size // (micro_batch_size * max(1, device_count)))
+    if args is not None and getattr(args, "gradient_accumulation_steps", None) is not None:
+        grad_accum = args.gradient_accumulation_steps
 
     config = {
         "fp16": not supports_bf16,
@@ -823,6 +830,10 @@ def parse_args():
                         help="Path to DeepSpeed configuration json.")
     parser.add_argument("--demo_samples", type=int, default=0,
                         help="If > 0, generates a lightweight demo subset with X samples for fast testing.")
+    parser.add_argument("--per_device_train_batch_size", type=int, default=None,
+                        help="Override per-device train micro-batch size (defaults to auto-tuned).")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=None,
+                        help="Override gradient accumulation steps (defaults to auto-tuned).")
     parser.add_argument("--auto_resume", action="store_true", default=True,
                         help="Automatically check Google Drive for existing checkpoints to resume from.")
 
@@ -852,7 +863,7 @@ def main():
 
     if args.action == "status":
         log_header("System & Storage Status")
-        detect_colab_hardware_and_tune()
+        detect_colab_hardware_and_tune(args)
         inbound_muler.print_dataset_summary()
         log_info(f"Google Drive Checkpoint Directory: {drive_ckpt_dir}")
         existing_ckpts = list(Path(drive_ckpt_dir).glob("checkpoint-*"))
@@ -888,7 +899,7 @@ def main():
             return
 
     if args.action in ["all", "train"]:
-        hw_config = detect_colab_hardware_and_tune()
+        hw_config = detect_colab_hardware_and_tune(args)
 
         resume_ckpt = None
         if args.auto_resume:
