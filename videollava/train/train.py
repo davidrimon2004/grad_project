@@ -15,6 +15,7 @@
 #    limitations under the License.
 
 import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import sys
 import copy
 import random
@@ -1130,14 +1131,29 @@ def train():
             if isinstance(module, LoraLayer):
                 if training_args.bf16:
                     module = module.to(torch.bfloat16)
+                elif training_args.fp16:
+                    module = module.to(torch.float16)
             if 'norm' in name:
-                module = module.to(torch.float32)
+                # Keep RMSNorm in compute_dtype (fp16/bf16) to avoid upcasting hidden_states to float32.
+                # If norm is float32, hidden_states becomes float32, which disables memory-efficient SDPA
+                # attention on Turing/Ampere GPUs and forces bitsandbytes 8-bit linear to allocate duplicate
+                # float32<->float16 cast buffers on every projection, causing massive CUDA OOM.
+                if model_args.tune_mm_mlp_adapter or not any(p.requires_grad for p in module.parameters()):
+                    module = module.to(compute_dtype)
+                else:
+                    module = module.to(torch.float32)
             if 'lm_head' in name or 'embed_tokens' in name:
                 if hasattr(module, 'weight'):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
                     elif training_args.fp16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.float16)
+
+        # Ensure all non-quantized float32 parameters (e.g. upcast by prepare_model_for_kbit_training)
+        # are in compute_dtype (fp16/bf16) so activations remain strictly in compute_dtype.
+        for param in model.parameters():
+            if param.dtype == torch.float32 and param.__class__.__name__ not in ["Params4bit", "Int8Params"]:
+                param.data = param.data.to(compute_dtype)
 
     # DeepSpeed does not support 4-bit / 8-bit quantized models (.to() calls crash bitsandbytes).
     if training_args.bits in [4, 8] and getattr(training_args, "deepspeed", None):
@@ -1152,6 +1168,9 @@ def train():
                     tokenizer=tokenizer,
                     args=training_args,
                     **data_module)
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
