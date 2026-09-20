@@ -1113,11 +1113,15 @@ def train():
                     p.requires_grad = False
 
         if training_args.bits in [4, 8]:
-            model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
+            # In native PyTorch FP16 AMP training, trainable parameters must have float32 master weights
+            # so that their gradients are float32, allowing PyTorch's GradScaler to unscale them without error.
+            # When bf16 is used, compute_dtype (bfloat16) can be used directly as GradScaler is not involved.
+            adapter_dtype = torch.bfloat16 if training_args.bf16 else torch.float32
+            model.get_model().mm_projector.to(dtype=adapter_dtype, device=training_args.device)
             if hasattr(model.get_model(), 'early_fusion_attn') and model.get_model().early_fusion_attn is not None:
-                model.get_model().early_fusion_attn.to(dtype=compute_dtype, device=training_args.device)
+                model.get_model().early_fusion_attn.to(dtype=adapter_dtype, device=training_args.device)
             if hasattr(model.get_model(), 'early_fusion_ln') and model.get_model().early_fusion_ln is not None:
-                model.get_model().early_fusion_ln.to(dtype=compute_dtype, device=training_args.device)
+                model.get_model().early_fusion_ln.to(dtype=adapter_dtype, device=training_args.device)
 
         model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_projector_lr = training_args.mm_projector_lr
@@ -1149,10 +1153,11 @@ def train():
                     elif training_args.fp16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.float16)
 
-        # Ensure all non-quantized float32 parameters (e.g. upcast by prepare_model_for_kbit_training)
-        # are in compute_dtype (fp16/bf16) so activations remain strictly in compute_dtype.
+        # Ensure all FROZEN non-quantized float32 parameters (e.g. upcast by prepare_model_for_kbit_training)
+        # in the LLM backbone are in compute_dtype (fp16/bf16) so hidden states stay strictly in compute_dtype.
+        # Trainable parameters (requires_grad=True) must remain float32 for PyTorch AMP GradScaler compatibility.
         for param in model.parameters():
-            if param.dtype == torch.float32 and param.__class__.__name__ not in ["Params4bit", "Int8Params"]:
+            if not param.requires_grad and param.dtype == torch.float32 and param.__class__.__name__ not in ["Params4bit", "Int8Params"]:
                 param.data = param.data.to(compute_dtype)
 
     # DeepSpeed does not support 4-bit / 8-bit quantized models (.to() calls crash bitsandbytes).

@@ -222,21 +222,21 @@ class LlavaMetaForCausalLM(ABC):
         if visual_embeds.dtype != target_dtype:
             visual_embeds = visual_embeds.to(target_dtype)
 
-        # Ensure attention and layernorm match the device and dtype of incoming embeddings
+        # Ensure attention and layernorm match the device of incoming embeddings
         ref_param = next(attn_layer.parameters())
-        if ref_param.device != text_embeds.device or ref_param.dtype != target_dtype:
-            attn_layer.to(device=text_embeds.device, dtype=target_dtype)
+        if ref_param.device != text_embeds.device:
+            attn_layer.to(device=text_embeds.device)
             ref_param = next(attn_layer.parameters())
 
         ref_ln = next(ln_layer.parameters())
-        if ref_ln.device != text_embeds.device or ref_ln.dtype != target_dtype:
-            ln_layer.to(device=text_embeds.device, dtype=target_dtype)
+        if ref_ln.device != text_embeds.device:
+            ln_layer.to(device=text_embeds.device)
 
         target_device = ref_param.device
 
-        # Query = text tokens, Key = Value = visual tokens: [1, Nt, dt] / [1, Nv, dt]
-        q = text_embeds.unsqueeze(0).to(device=target_device, dtype=target_dtype)
-        kv = visual_embeds.unsqueeze(0).to(device=target_device, dtype=target_dtype)
+        # Pass inputs matching ref_param.dtype so it works seamlessly both under autocast (AMP) and standalone
+        q = text_embeds.unsqueeze(0).to(device=target_device, dtype=ref_param.dtype)
+        kv = visual_embeds.unsqueeze(0).to(device=target_device, dtype=ref_param.dtype)
 
         # No causal mask here: causality/label-leakage only matters along the text
         # sequence dimension. Keys/values come from the visual sequence, so every
@@ -257,13 +257,17 @@ class LlavaMetaForCausalLM(ABC):
 
     def encode_images(self, images):
         image_features = self.get_model().get_image_tower()(images)
-        image_features = self.get_model().mm_projector(image_features)
+        proj = self.get_model().mm_projector
+        proj_dtype = next(proj.parameters()).dtype
+        image_features = proj(image_features.to(proj_dtype))
         return image_features
 
     def encode_videos(self, videos):  # [mini_b, c, t, h, w]
         b, _, t, _, _ = videos.shape
         video_features = self.get_model().get_video_tower()(videos)  # [mini_b, t, n, c]
-        video_features = self.get_model().mm_projector(video_features)
+        proj = self.get_model().mm_projector
+        proj_dtype = next(proj.parameters()).dtype
+        video_features = proj(video_features.to(proj_dtype))
         return video_features
 
     def prepare_inputs_labels_for_multimodal(
