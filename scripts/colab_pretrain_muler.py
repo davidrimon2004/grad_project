@@ -900,8 +900,13 @@ def main():
         hw_config = detect_colab_hardware_and_tune(args)
 
         resume_ckpt = None
-        if args.auto_resume:
+        if args.auto_resume and args.demo_samples == 0:
             resume_ckpt = outbound_muler.restore_latest_checkpoint_from_drive()
+        elif args.demo_samples > 0:
+            log_info("Demo mode active: Google Drive auto-resume disabled to guarantee fresh dry-run verification.")
+            for old_ckpt in Path(args.local_output_dir).glob("checkpoint-*"):
+                if old_ckpt.is_dir():
+                    shutil.rmtree(old_ckpt, ignore_errors=True)
 
         outbound_muler.start()
 

@@ -56,7 +56,7 @@ local_rank = None
 
 
 def rank0_print(*args):
-    if local_rank == 0:
+    if local_rank in [0, -1, None]:
         print(*args)
 
 
