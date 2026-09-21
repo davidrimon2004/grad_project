@@ -669,9 +669,16 @@ def detect_colab_hardware_and_tune(args=None) -> Dict:
         "effective_batch_size": micro_batch_size * grad_accum * max(1, device_count)
     }
 
+    # For FP16 mixed precision on T4/V100 (where bf16 is unavailable), cross-attention and MLP adapters
+    # are numerically stable with lr in [1e-4, 2e-4]. lr >= 1e-3 causes FP16 attention logit explosion and divergence.
+    if not supports_bf16 and args is not None and getattr(args, "learning_rate", 1e-3) >= 1e-3:
+        log_info(f"FP16 precision active on {gpu_name}: Auto-tuning learning rate from {args.learning_rate} to 2e-4 to ensure FP16 numerical stability.")
+        args.learning_rate = 2e-4
+
     log_info(f"Hardware Auto-Tuning Configuration:")
     log_info(f"  • Backbone Quantization: {config['bits']}-bit")
     log_info(f"  • Precision: {'bfloat16 (bf16)' if config['bf16'] else 'float16 (fp16)'}")
+    log_info(f"  • Learning Rate: {getattr(args, 'learning_rate', '1e-3')}")
     log_info(f"  • Micro Batch Size per GPU: {config['per_device_train_batch_size']}")
     log_info(f"  • Gradient Accumulation Steps: {config['gradient_accumulation_steps']}")
     log_info(f"  • Total Effective Batch Size: {config['effective_batch_size']}")
