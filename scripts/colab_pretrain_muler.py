@@ -727,6 +727,7 @@ class VideoLLaVAPretrainingEngine:
             "--model_max_length", "2048",
             "--tokenizer_model_max_length", "3072",
             "--gradient_checkpointing", "True",
+            "--max_grad_norm", "1.0",
             "--dataloader_num_workers", str(self.hw_config["dataloader_num_workers"]),
             "--lazy_preprocess", "True",
             "--report_to", "tensorboard",
@@ -735,6 +736,7 @@ class VideoLLaVAPretrainingEngine:
 
         if self.hw_config.get("bits", 16) in [4, 8]:
             cmd.extend(["--bits", str(self.hw_config["bits"])])
+            cmd.extend(["--optim", "paged_adamw_8bit"])
 
         if self.hw_config["bf16"]:
             cmd.extend(["--bf16", "True", "--tf32", "True"])

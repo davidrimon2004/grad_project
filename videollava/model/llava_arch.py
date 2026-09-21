@@ -262,7 +262,8 @@ class LlavaMetaForCausalLM(ABC):
         return fused
 
     def encode_images(self, images):
-        image_features = self.get_model().get_image_tower()(images)
+        with torch.no_grad():
+            image_features = self.get_model().get_image_tower()(images)
         proj = self.get_model().mm_projector
         proj_dtype = next(proj.parameters()).dtype
         image_features = proj(image_features.to(proj_dtype))
@@ -270,7 +271,8 @@ class LlavaMetaForCausalLM(ABC):
 
     def encode_videos(self, videos):  # [mini_b, c, t, h, w]
         b, _, t, _, _ = videos.shape
-        video_features = self.get_model().get_video_tower()(videos)  # [mini_b, t, n, c]
+        with torch.no_grad():
+            video_features = self.get_model().get_video_tower()(videos)  # [mini_b, t, n, c]
         proj = self.get_model().mm_projector
         proj_dtype = next(proj.parameters()).dtype
         video_features = proj(video_features.to(proj_dtype))
