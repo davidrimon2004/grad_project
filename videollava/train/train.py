@@ -933,7 +933,7 @@ def train():
             quantization_config=BitsAndBytesConfig(
                 load_in_4bit=training_args.bits == 4,
                 load_in_8bit=training_args.bits == 8,
-                llm_int8_skip_modules=["mm_projector", "early_fusion_attn", "early_fusion_ln"],
+                llm_int8_skip_modules=["mm_projector", "early_fusion_attn", "early_fusion_ln", "early_fusion_kv_ln"],
                 llm_int8_threshold=6.0,
                 llm_int8_has_fp16_weight=False,
                 bnb_4bit_compute_dtype=compute_dtype,
@@ -1094,23 +1094,17 @@ def train():
             model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = True
-            if hasattr(model.get_model(), 'early_fusion_attn') and model.get_model().early_fusion_attn is not None:
-                for p in model.get_model().early_fusion_attn.parameters():
-                    p.requires_grad = True
-            if hasattr(model.get_model(), 'early_fusion_ln') and model.get_model().early_fusion_ln is not None:
-                for p in model.get_model().early_fusion_ln.parameters():
-                    p.requires_grad = True
+            for name, param in model.get_model().named_parameters():
+                if 'early_fusion' in name:
+                    param.requires_grad = True
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = False
-            if hasattr(model.get_model(), 'early_fusion_attn') and model.get_model().early_fusion_attn is not None:
-                for p in model.get_model().early_fusion_attn.parameters():
-                    p.requires_grad = False
-            if hasattr(model.get_model(), 'early_fusion_ln') and model.get_model().early_fusion_ln is not None:
-                for p in model.get_model().early_fusion_ln.parameters():
-                    p.requires_grad = False
+            for name, param in model.get_model().named_parameters():
+                if 'early_fusion' in name:
+                    param.requires_grad = False
 
         if training_args.bits in [4, 8]:
             # In native PyTorch FP16 AMP training, trainable parameters must have float32 master weights
@@ -1118,10 +1112,11 @@ def train():
             # When bf16 is used, compute_dtype (bfloat16) can be used directly as GradScaler is not involved.
             adapter_dtype = torch.bfloat16 if training_args.bf16 else torch.float32
             model.get_model().mm_projector.to(dtype=adapter_dtype, device=training_args.device)
-            if hasattr(model.get_model(), 'early_fusion_attn') and model.get_model().early_fusion_attn is not None:
-                model.get_model().early_fusion_attn.to(dtype=adapter_dtype, device=training_args.device)
-            if hasattr(model.get_model(), 'early_fusion_ln') and model.get_model().early_fusion_ln is not None:
-                model.get_model().early_fusion_ln.to(dtype=adapter_dtype, device=training_args.device)
+            for name, module in model.get_model().named_children():
+                if 'early_fusion' in name:
+                    module.to(dtype=adapter_dtype, device=training_args.device)
+            if hasattr(model.get_model(), 'early_fusion_gate') and model.get_model().early_fusion_gate is not None:
+                model.get_model().early_fusion_gate.data = model.get_model().early_fusion_gate.data.to(dtype=adapter_dtype, device=training_args.device)
 
         model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_projector_lr = training_args.mm_projector_lr
@@ -1198,6 +1193,12 @@ def train():
             early_ln = {k.split("early_fusion_ln.")[1]: v for k, v in adapter_weights.items() if "early_fusion_ln." in k}
             if early_ln and hasattr(model.get_model(), "early_fusion_ln") and model.get_model().early_fusion_ln is not None:
                 model.get_model().early_fusion_ln.load_state_dict(early_ln, strict=False)
+            early_kv_ln = {k.split("early_fusion_kv_ln.")[1]: v for k, v in adapter_weights.items() if "early_fusion_kv_ln." in k}
+            if early_kv_ln and hasattr(model.get_model(), "early_fusion_kv_ln") and model.get_model().early_fusion_kv_ln is not None:
+                model.get_model().early_fusion_kv_ln.load_state_dict(early_kv_ln, strict=False)
+            gate_key = [k for k in adapter_weights.keys() if "early_fusion_gate" in k]
+            if gate_key and hasattr(model.get_model(), "early_fusion_gate") and model.get_model().early_fusion_gate is not None:
+                model.get_model().early_fusion_gate.data.copy_(adapter_weights[gate_key[0]])
             rank0_print("[SUCCESS] Successfully loaded previous adapter checkpoint weights.")
         trainer.train()
     else:

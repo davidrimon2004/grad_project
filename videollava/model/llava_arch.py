@@ -148,6 +148,17 @@ class LlavaMetaModel:
             for p in self.early_fusion_ln.parameters():
                 p.requires_grad = True
 
+        if getattr(self, 'early_fusion_kv_ln', None) is None:
+            self.early_fusion_kv_ln = nn.LayerNorm(self.config.hidden_size)
+        else:
+            for p in self.early_fusion_kv_ln.parameters():
+                p.requires_grad = True
+
+        if getattr(self, 'early_fusion_gate', None) is None:
+            self.register_parameter('early_fusion_gate', nn.Parameter(torch.zeros(1)))
+        else:
+            self.early_fusion_gate.requires_grad = True
+
         if pretrain_mm_mlp_adapter is not None:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
             def get_w(weights, keyword):
@@ -160,6 +171,12 @@ class LlavaMetaModel:
             early_ln_weights = get_w(mm_projector_weights, 'early_fusion_ln')
             if len(early_ln_weights) > 0:
                 self.early_fusion_ln.load_state_dict(early_ln_weights)
+            early_kv_ln_weights = get_w(mm_projector_weights, 'early_fusion_kv_ln')
+            if len(early_kv_ln_weights) > 0:
+                self.early_fusion_kv_ln.load_state_dict(early_kv_ln_weights)
+            gate_key = [k for k in mm_projector_weights.keys() if "early_fusion_gate" in k]
+            if len(gate_key) > 0:
+                self.early_fusion_gate.data.copy_(mm_projector_weights[gate_key[0]])
 
 
 class LlavaMetaForCausalLM(ABC):
@@ -198,6 +215,22 @@ class LlavaMetaForCausalLM(ABC):
             model.early_fusion_ln = ln
         return ln
 
+    def get_early_fusion_kv_ln(self):
+        model = self.get_model()
+        kv_ln = getattr(model, 'early_fusion_kv_ln', None)
+        if kv_ln is None:
+            kv_ln = nn.LayerNorm(self.config.hidden_size)
+            model.early_fusion_kv_ln = kv_ln
+        return kv_ln
+
+    def get_early_fusion_gate(self):
+        model = self.get_model()
+        gate = getattr(model, 'early_fusion_gate', None)
+        if gate is None:
+            gate = nn.Parameter(torch.zeros(1))
+            model.register_parameter('early_fusion_gate', gate)
+        return gate
+
     def cross_attention_fuse(self, text_embeds, visual_embeds):
         """
         Early-fusion via Multi-Head Cross-Attention.
@@ -220,6 +253,8 @@ class LlavaMetaForCausalLM(ABC):
 
         attn_layer = self.get_early_fusion_attn()
         ln_layer = self.get_early_fusion_ln()
+        kv_ln_layer = self.get_early_fusion_kv_ln()
+        gate = self.get_early_fusion_gate()
 
         # Determine target precision (float16 or bfloat16)
         target_dtype = torch.bfloat16 if getattr(self.config, 'bf16', False) else torch.float16
@@ -228,7 +263,7 @@ class LlavaMetaForCausalLM(ABC):
         if visual_embeds.dtype != target_dtype:
             visual_embeds = visual_embeds.to(target_dtype)
 
-        # Ensure attention and layernorm match the device of incoming embeddings
+        # Ensure attention and layernorms match the device of incoming embeddings
         ref_param = next(attn_layer.parameters())
         if ref_param.device != text_embeds.device:
             attn_layer.to(device=text_embeds.device)
@@ -238,12 +273,24 @@ class LlavaMetaForCausalLM(ABC):
         if ref_ln.device != text_embeds.device:
             ln_layer.to(device=text_embeds.device)
 
+        ref_kv_ln = next(kv_ln_layer.parameters())
+        if ref_kv_ln.device != text_embeds.device:
+            kv_ln_layer.to(device=text_embeds.device)
+
+        if gate.device != text_embeds.device:
+            model = self.get_model()
+            model.early_fusion_gate.data = model.early_fusion_gate.data.to(device=text_embeds.device)
+            gate = model.early_fusion_gate
+
         target_device = ref_param.device
 
-        # Pre-LayerNorm on text query before cross-attention for numerical stability
+        # Pre-LayerNorm on text query and visual key/values for scale matching & numerical stability.
+        # This keeps attention logits strictly unit-variance regardless of visual sequence length (256 vs 2048).
         q_raw = text_embeds.unsqueeze(0).to(device=target_device, dtype=next(ln_layer.parameters()).dtype)
         q = ln_layer(q_raw).to(dtype=ref_param.dtype)
-        kv = visual_embeds.unsqueeze(0).to(device=target_device, dtype=ref_param.dtype)
+
+        kv_raw = visual_embeds.unsqueeze(0).to(device=target_device, dtype=next(kv_ln_layer.parameters()).dtype)
+        kv = kv_ln_layer(kv_raw).to(dtype=ref_param.dtype)
 
         # No causal mask here: causality/label-leakage only matters along the text
         # sequence dimension. Keys/values come from the visual sequence, so every
@@ -256,8 +303,12 @@ class LlavaMetaForCausalLM(ABC):
             need_weights=False
         )
 
-        # Residual connection without scale explosion (preserves native LLaMA embedding scale of ~0.02)
-        fused = text_embeds + attn_out.squeeze(0).to(target_dtype)
+        # Gated residual connection with tanh gating:
+        # At step 0, gate = 0 => tanh(0) = 0 => fused = text_embeds exactly (100% baseline preservation).
+        # Smoothly introduces cross-attention signals without disrupting Vicuna's text embedding scale (~0.02)
+        # or causing FP16 overflow at Video-LLaVA's standard pretraining learning rate (1e-3).
+        gate_val = torch.tanh(gate).to(target_dtype)
+        fused = text_embeds + gate_val * attn_out.squeeze(0).to(target_dtype)
 
         return fused
 
