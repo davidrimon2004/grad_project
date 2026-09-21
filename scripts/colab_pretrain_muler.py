@@ -426,19 +426,23 @@ class InboundDataMuler:
         self.local_video_folder.mkdir(parents=True, exist_ok=True)
         self.local_json_folder.mkdir(parents=True, exist_ok=True)
 
-        # Create dummy image & video if none exist
+        # Create varied dummy images & videos
         from PIL import Image
-        dummy_img_path = self.local_image_folder / "sample_0.jpg"
-        if not dummy_img_path.exists():
-            img = Image.new("RGB", (224, 224), color=(73, 109, 137))
-            img.save(dummy_img_path)
+        colors = [
+            (73, 109, 137), (180, 70, 70), (70, 160, 90),
+            (200, 180, 60), (130, 80, 160)
+        ]
+        for c_idx, color in enumerate(colors):
+            p = self.local_image_folder / f"sample_{c_idx}.jpg"
+            if not p.exists():
+                Image.new("RGB", (224, 224), color=color).save(p)
 
         # Create image annotations
         img_annots = []
         for i in range(num_samples):
             img_annots.append({
                 "id": f"img_sample_{i}",
-                "image": "sample_0.jpg",
+                "image": f"sample_{i % len(colors)}.jpg",
                 "conversations": [
                     {"from": "human", "value": "<image>\nProvide a brief description of the given image."},
                     {"from": "gpt", "value": f"This is a pretraining alignment sample number {i} for Video-LLaVA."}
@@ -447,23 +451,25 @@ class InboundDataMuler:
         with open(self.local_image_json, "w") as f:
             json.dump(img_annots, f, indent=2)
 
-        # Create dummy video if none exists
-        dummy_vid_path = self.local_video_folder / "sample_0.mp4"
-        if not dummy_vid_path.exists():
-            try:
-                subprocess.run(
-                    ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=blue:s=224x224:d=1", "-c:v", "libx264", str(dummy_vid_path)],
-                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-            except Exception:
-                dummy_vid_path.touch()
+        # Create varied dummy videos
+        vid_colors = ["blue", "red", "green", "yellow", "magenta"]
+        for v_idx, v_color in enumerate(vid_colors):
+            vp = self.local_video_folder / f"sample_{v_idx}.mp4"
+            if not vp.exists():
+                try:
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c={v_color}:s=224x224:d=1", "-c:v", "libx264", str(vp)],
+                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                except Exception:
+                    vp.touch()
 
         # Create video annotations
         vid_annots = []
         for i in range(num_samples):
             vid_annots.append({
                 "id": f"vid_sample_{i}",
-                "video": "sample_0.mp4",
+                "video": f"sample_{i % len(vid_colors)}.mp4",
                 "conversations": [
                     {"from": "human", "value": "<video>\nDescribe the key actions happening in this video."},
                     {"from": "gpt", "value": f"This is a video alignment sample number {i} for Video-LLaVA."}

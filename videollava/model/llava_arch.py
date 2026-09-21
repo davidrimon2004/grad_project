@@ -134,10 +134,6 @@ class LlavaMetaModel:
                 dropout=0.0,
                 batch_first=True
             )
-            # Zero-initialize the output projection so at initialization, cross-attention output is 0.
-            # This preserves the pretrained Vicuna text embeddings scale exactly and guarantees numerical stability.
-            nn.init.zeros_(self.early_fusion_attn.out_proj.weight)
-            nn.init.zeros_(self.early_fusion_attn.out_proj.bias)
         else:
             for p in self.early_fusion_attn.parameters():
                 p.requires_grad = True
@@ -202,8 +198,6 @@ class LlavaMetaForCausalLM(ABC):
                 dropout=0.0,
                 batch_first=True
             )
-            nn.init.zeros_(attn.out_proj.weight)
-            nn.init.zeros_(attn.out_proj.bias)
             model.early_fusion_attn = attn
         return attn
 
