@@ -293,7 +293,21 @@ class InboundDataMuler:
             except Exception:
                 pass
 
-            # 4. Force OS buffer sync and garbage collection
+            # 4. CRITICAL: Clear stale Google DriveFS local upload cache.
+            # When Drive FUSE crashes or flushes uncleanly, it leaves its entire local
+            # upload buffer (up to 40+ GB per part) under /root/.config/Google/DriveFS.
+            # This directory is safe to delete — all uploaded data is already on Drive's
+            # servers. Clearing it reclaims SSD space for the next part's staging download.
+            drivefs_cache = Path("/root/.config/Google/DriveFS")
+            if drivefs_cache.exists():
+                cache_size_gb = sum(
+                    f.stat().st_size for f in drivefs_cache.rglob("*") if f.is_file()
+                ) / (1024 ** 3)
+                if cache_size_gb > 1.0:  # Only log if it's actually significant
+                    log_info(f"Clearing stale DriveFS local cache ({cache_size_gb:.1f} GB) to reclaim SSD space...")
+                shutil.rmtree(str(drivefs_cache), ignore_errors=True)
+
+            # 5. Force OS buffer sync and garbage collection
             import gc
             gc.collect()
             try:
@@ -302,6 +316,7 @@ class InboundDataMuler:
                 pass
         except Exception as e:
             log_warn(f"Cache pruning warning: {e}")
+
 
     def _flush_drive_fuse_cache(self):
         """Flushes and remounts Google Drive FUSE to release local SSD write cache."""
