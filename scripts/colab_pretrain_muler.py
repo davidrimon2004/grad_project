@@ -335,12 +335,26 @@ class InboundDataMuler:
 
         start_t = time.time()
         try:
-            with open(local_path, "rb") as fsrc, open(drive_path, "wb") as fdst:
+            # Open with r+b to allow fallocate hole-punching if supported by filesystem
+            open_mode = "r+b" if os.access(local_path, os.W_OK) else "rb"
+            with open(local_path, open_mode) as fsrc, open(drive_path, "wb") as fdst:
+                offset = 0
                 while True:
                     buf = fsrc.read(chunk_size)
                     if not buf:
                         break
                     fdst.write(buf)
+                    # Real-time block deallocation: punch holes in source file on local SSD
+                    # as blocks are read. This instantly returns disk blocks to local VM SSD,
+                    # completely preventing Drive FUSE write buffers from filling the disk!
+                    try:
+                        if open_mode == "r+b" and hasattr(os, "fallocate"):
+                            # 0x03 = FALLOC_FL_PUNCH_HOLE (0x02) | FALLOC_FL_KEEP_SIZE (0x01)
+                            os.fallocate(fsrc.fileno(), 0x03, offset, len(buf))
+                    except Exception:
+                        pass
+                    offset += len(buf)
+
             elapsed = max(time.time() - start_t, 1.0)
             speed_mbs = (size_gb * 1024) / elapsed
             log_success(f"✓ Transferred {local_path.name} to Drive in {elapsed:.0f}s ({speed_mbs:.1f} MB/s)!")
@@ -361,12 +375,62 @@ class InboundDataMuler:
                 log_warn("=" * 65)
             raise
 
+    def _direct_stream_from_url_to_drive(self, url: str, drive_target: Path, min_bytes: int, chunk_size: int = 16 * 1024 * 1024) -> bool:
+        """
+        Directly stream from HuggingFace HTTP to Google Drive with ZERO local SSD usage.
+        Memory buffer only (16 MB chunks). Protects Colab SSD from ever filling up.
+        """
+        import urllib.request
+        log_info(f"Direct streaming {drive_target.name} to Google Drive (Zero local SSD usage)...")
+        drive_target.parent.mkdir(parents=True, exist_ok=True)
+
+        initial_bytes = 0
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        if drive_target.exists():
+            initial_bytes = drive_target.stat().st_size
+            if initial_bytes >= min_bytes:
+                log_success(f"✓ {drive_target.name} is already complete on Google Drive ({initial_bytes / (1024**3):.2f} GB)!")
+                return True
+            if initial_bytes > 0:
+                headers["Range"] = f"bytes={initial_bytes}-"
+                log_info(f"Resuming {drive_target.name} on Drive from byte {initial_bytes} ({initial_bytes / (1024**3):.2f} GB)...")
+
+        mode = "ab" if initial_bytes > 0 else "wb"
+        start_t = time.time()
+        downloaded = initial_bytes
+
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp, open(drive_target, mode) as fdst:
+                total_bytes = int(resp.headers.get("Content-Length", 0)) + initial_bytes
+                total_gb = total_bytes / (1024 ** 3) if total_bytes > 0 else 39.0
+                last_log = time.time()
+                while True:
+                    buf = resp.read(chunk_size)
+                    if not buf:
+                        break
+                    fdst.write(buf)
+                    downloaded += len(buf)
+                    if time.time() - last_log >= 15:
+                        pct = (downloaded / total_bytes) * 100 if total_bytes > 0 else 0
+                        speed = (downloaded - initial_bytes) / (1024 ** 2) / max(time.time() - start_t, 1)
+                        log_info(f"Direct stream: {downloaded / (1024**3):.2f} / {total_gb:.1f} GB ({pct:.1f}%) [{speed:.1f} MB/s]")
+                        last_log = time.time()
+
+            elapsed = max(time.time() - start_t, 1.0)
+            speed_mbs = ((downloaded - initial_bytes) / (1024 ** 2)) / elapsed
+            log_success(f"✓ Direct streamed {drive_target.name} to Drive in {elapsed/60:.1f}m ({speed_mbs:.1f} MB/s)!")
+            return drive_target.exists() and drive_target.stat().st_size >= min_bytes
+        except Exception as e:
+            log_err(f"Direct stream encountered an error: {e}")
+            return False
+
     def _download_part_accelerated(self, url: str, part_name: str, drive_target: Path, min_bytes: int) -> bool:
         """
         Accelerated download:
         1. If already staged on local SSD (complete), skips download and streams to Drive immediately!
         2. Downloads to local NVMe SSD (/content/_staging) via aria2c (16 parallel connections).
-        3. Streams completed file to Google Drive using 64MB chunks.
+        3. Streams completed file to Google Drive using 64MB chunks with real-time hole punching.
         4. Instantly deletes local copy and prunes cache to free SSD space for subsequent parts.
         """
         staging_dir = Path("/content/_staging")
@@ -406,9 +470,9 @@ class InboundDataMuler:
             else:
                 log_warn(f"aria2c returned code {res.returncode}. Staged size: {staged_file.stat().st_size if staged_file.exists() else 0} bytes.")
 
-        # Fallback to direct wget if local SSD space was somehow insufficient or aria2c failed
-        log_info(f"Using direct wget fallback for {part_name}...")
-        return self._wget_download(url, str(drive_target), part_name)
+        # Fallback to direct HTTP stream (Zero local SSD usage) if SSD space was tight
+        log_info(f"Using direct stream fallback for {part_name} (Zero local SSD usage)...")
+        return self._direct_stream_from_url_to_drive(url, drive_target, min_bytes)
 
     def _wget_download(self, url: str, output_path: str, desc: str = ""):
         """Download a file using wget with auto-resume (-c), retry resilience, and direct write."""
