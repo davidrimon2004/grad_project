@@ -245,10 +245,60 @@ class InboundDataMuler:
         log_info("Installing aria2 for multi-threaded parallel download acceleration (16 connections)...")
         try:
             subprocess.run(["apt-get", "update", "-qq"], check=False)
-            subprocess.run(["apt-get", "install", "-y", "-q", "aria2"], check=False)
         except Exception as e:
             log_warn(f"apt-get install aria2 failed: {e}")
         return shutil.which("aria2c") is not None
+
+    def _prune_local_disk_caches(self):
+        """Aggressively prune local caches to maximize SSD space for staging and FUSE buffering."""
+        try:
+            # 1. Clean /tmp
+            for item in Path("/tmp").glob("*"):
+                try:
+                    if item.is_file() or item.is_symlink():
+                        item.unlink()
+                    elif item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
+                except Exception:
+                    pass
+
+            # 2. Clean pip and huggingface temp caches
+            shutil.rmtree("/root/.cache/pip", ignore_errors=True)
+            for p in Path("/root/.cache").glob("**/tmp*"):
+                try:
+                    if p.is_file():
+                        p.unlink()
+                    elif p.is_dir():
+                        shutil.rmtree(p, ignore_errors=True)
+                except Exception:
+                    pass
+
+            # 3. Clean apt cache
+            try:
+                subprocess.run(["apt-get", "clean"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
+            # 4. Force OS buffer sync and garbage collection
+            import gc
+            gc.collect()
+            try:
+                os.sync()
+            except Exception:
+                pass
+        except Exception as e:
+            log_warn(f"Cache pruning warning: {e}")
+
+    def _flush_drive_fuse_cache(self):
+        """Flushes and remounts Google Drive FUSE to release local SSD write cache."""
+        try:
+            from google.colab import drive
+            log_info("Flushing Google Drive FUSE write buffers to release local SSD cache...")
+            drive.flush_and_unmount()
+            drive.mount('/content/drive')
+            log_success("Google Drive remounted cleanly.")
+        except Exception as e:
+            log_warn(f"Drive FUSE flush/remount skipped ({e})")
 
     def _ensure_ssd_staging_space(self, min_gb_needed: float = 41.0) -> Path:
         """Ensure Colab local NVMe SSD has sufficient space to stage a 39GB part."""
@@ -258,11 +308,13 @@ class InboundDataMuler:
             free_gb = shutil.disk_usage(staging_dir).free / (1024 ** 3)
             if free_gb < min_gb_needed:
                 log_info(f"Local SSD free space ({free_gb:.1f} GB) is tight for 39 GB staging. Pruning local caches...")
-                shutil.rmtree("/root/.cache/pip", ignore_errors=True)
-                shutil.rmtree("/tmp", ignore_errors=True)
-                os.makedirs("/tmp", exist_ok=True)
+                self._prune_local_disk_caches()
                 free_gb = shutil.disk_usage(staging_dir).free / (1024 ** 3)
                 log_info(f"Local SSD free space after cache cleanup: {free_gb:.1f} GB")
+                if free_gb < min_gb_needed:
+                    self._flush_drive_fuse_cache()
+                    free_gb = shutil.disk_usage(staging_dir).free / (1024 ** 3)
+                    log_info(f"Local SSD free space after Drive remount: {free_gb:.1f} GB")
         except Exception:
             pass
         return staging_dir
@@ -272,31 +324,63 @@ class InboundDataMuler:
         size_gb = local_path.stat().st_size / (1024 ** 3)
         log_info(f"Transferring {local_path.name} to Google Drive ({size_gb:.2f} GB) using 64MB streaming buffer...")
         drive_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # If an incomplete/old partial exists on Drive, remove it first to:
+        # 1. Avoid FUSE trying to hold/truncate both versions simultaneously (which demands double space)
+        # 2. Reclaim old partial file space on Google Drive
+        if drive_path.exists():
+            old_gb = drive_path.stat().st_size / (1024 ** 3)
+            log_info(f"Removing old partial on Drive ({drive_path.name}, {old_gb:.2f} GB) before transfer...")
+            drive_path.unlink(missing_ok=True)
+
         start_t = time.time()
-        with open(local_path, "rb") as fsrc, open(drive_path, "wb") as fdst:
-            while True:
-                buf = fsrc.read(chunk_size)
-                if not buf:
-                    break
-                fdst.write(buf)
-        elapsed = max(time.time() - start_t, 1.0)
-        speed_mbs = (size_gb * 1024) / elapsed
-        log_success(f"✓ Transferred {local_path.name} to Drive in {elapsed:.0f}s ({speed_mbs:.1f} MB/s)!")
-        # Delete local staged file immediately to free the 39 GB for the next part!
-        local_path.unlink(missing_ok=True)
+        try:
+            with open(local_path, "rb") as fsrc, open(drive_path, "wb") as fdst:
+                while True:
+                    buf = fsrc.read(chunk_size)
+                    if not buf:
+                        break
+                    fdst.write(buf)
+            elapsed = max(time.time() - start_t, 1.0)
+            speed_mbs = (size_gb * 1024) / elapsed
+            log_success(f"✓ Transferred {local_path.name} to Drive in {elapsed:.0f}s ({speed_mbs:.1f} MB/s)!")
+            # Delete local staged file immediately to free the 39 GB for the next part!
+            local_path.unlink(missing_ok=True)
+            self._prune_local_disk_caches()
+            return True
+        except OSError as e:
+            log_err(f"Failed to transfer {local_path.name} to Google Drive: {e}")
+            if e.errno == 28:
+                log_warn("=" * 65)
+                log_warn("[Errno 28] No space left on device during Drive transfer!")
+                log_warn("Action items to resolve:")
+                log_warn("1. If local SSD space is low, Colab Drive FUSE cannot allocate buffer space.")
+                log_warn("   Run 'drive.flush_and_unmount()' then 'drive.mount(\"/content/drive\")' to wipe FUSE cache.")
+                log_warn("2. Empty Google Drive Trash (https://drive.google.com/drive/trash) to reclaim cloud quota.")
+                log_warn("3. Note: Staged file on SSD is PRESERVED and will not be re-downloaded.")
+                log_warn("=" * 65)
+            raise
 
     def _download_part_accelerated(self, url: str, part_name: str, drive_target: Path, min_bytes: int) -> bool:
         """
         Accelerated download:
-        1. Downloads to local NVMe SSD (/content/_staging) via aria2c (16 parallel connections).
-           Saturates link at 80-120 MB/s (~6 minutes per 39 GB part).
-        2. Streams completed file to Google Drive using 64MB chunks (~5 minutes).
-        3. Instantly deletes local copy to free SSD space for subsequent parts.
+        1. If already staged on local SSD (complete), skips download and streams to Drive immediately!
+        2. Downloads to local NVMe SSD (/content/_staging) via aria2c (16 parallel connections).
+        3. Streams completed file to Google Drive using 64MB chunks.
+        4. Instantly deletes local copy and prunes cache to free SSD space for subsequent parts.
         """
-        has_aria2 = self._ensure_aria2()
-        staging_dir = self._ensure_ssd_staging_space(min_gb_needed=41.0)
+        staging_dir = Path("/content/_staging")
+        staging_dir.mkdir(parents=True, exist_ok=True)
         staged_file = staging_dir / part_name
 
+        # PRIORITY CHECK: If file is already fully staged on local SSD, DO NOT re-download!
+        if staged_file.exists() and staged_file.stat().st_size >= min_bytes:
+            log_success(f"✓ {part_name} is ALREADY fully downloaded in local SSD staging ({staged_file.stat().st_size / (1024**3):.2f} GB)!")
+            self._stream_copy_to_drive(staged_file, drive_target)
+            return drive_target.exists() and drive_target.stat().st_size >= min_bytes
+
+        staging_dir = self._ensure_ssd_staging_space(min_gb_needed=41.0)
+        has_aria2 = self._ensure_aria2()
         ssd_free_gb = shutil.disk_usage(staging_dir).free / (1024 ** 3)
         log_info(f"Local SSD staging space available: {ssd_free_gb:.1f} GB")
 
@@ -486,6 +570,9 @@ class InboundDataMuler:
         needed_total_gb = status['total_expected_gb'] - status['total_downloaded_gb']
         log_info(f"Remaining download needed across all incomplete parts: ~{needed_total_gb:.1f} GB")
 
+        # Proactively reclaim Drive space by removing llava_image.zip if images are extracted
+        self.cleanup_image_archive()
+
         # Normalize parts_filter if specified (e.g. ['4', '5'] or ['004', '005'] or ['valley_2.zip.004'])
         allowed_parts = None
         if parts_filter:
@@ -524,6 +611,8 @@ class InboundDataMuler:
                 new_size_gb = part_file.stat().st_size / (1024 ** 3)
                 if part_file.stat().st_size >= min_bytes:
                     log_success(f"✓ {part_name} is now COMPLETE on Google Drive ({new_size_gb:.2f} GB)!")
+                    # Flush Drive FUSE write buffers to keep SSD space clean for next parts
+                    self._flush_drive_fuse_cache()
                 else:
                     log_warn(f"⚠ {part_name} is at {new_size_gb:.2f} GB / ~{expected_gb:.1f} GB.")
 
@@ -630,6 +719,9 @@ class InboundDataMuler:
         if not self.extract_image_archive():
             log_err("Image archive extraction failed.")
             return False
+
+        # Reclaim ~27 GB on Google Drive now that images are verified extracted
+        self.cleanup_image_archive()
 
         # 3. Download & extract videos
         videos_downloaded = self.download_video_archives(parts_filter=parts_filter)
