@@ -507,12 +507,33 @@ class InboundDataMuler:
                 "-k", "1M",
                 "--file-allocation=none",
                 "--continue=true",
-                "--summary-interval=10",
+                "--console-log-level=warn",   # Suppress verbose progress flood
+                "--summary-interval=0",        # Disable built-in summary (we print our own)
                 "-d", str(staging_dir),
                 "-o", part_name,
                 url
             ]
-            res = subprocess.run(cmd, check=False)
+
+            # Launch a heartbeat thread to print clean progress every 30s
+            # (prevents Colab output from freezing due to rapid log lines)
+            import threading
+            _stop_heartbeat = threading.Event()
+            def _heartbeat(path, total_bytes, stop_event):
+                t0 = time.time()
+                while not stop_event.wait(30):
+                    try:
+                        done = path.stat().st_size if path.exists() else 0
+                        pct = (done / total_bytes * 100) if total_bytes > 0 else 0
+                        speed = done / (1024**2) / max(time.time() - t0, 1)
+                        log_info(f"aria2c: {done/(1024**3):.2f} / {total_bytes/(1024**3):.1f} GB ({pct:.1f}%) [{speed:.1f} MB/s]")
+                    except Exception:
+                        pass
+            hb = threading.Thread(target=_heartbeat, args=(staged_file, min_bytes, _stop_heartbeat), daemon=True)
+            hb.start()
+            res = subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _stop_heartbeat.set()
+            hb.join(timeout=2)
+
             if res.returncode == 0 and staged_file.exists() and staged_file.stat().st_size >= min_bytes:
                 log_success(f"✓ {part_name} fully downloaded to local SSD ({staged_file.stat().st_size / (1024**3):.2f} GB)!")
                 self._stream_copy_to_drive(staged_file, drive_target)
