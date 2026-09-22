@@ -113,6 +113,14 @@ class InboundDataMuler:
     # 2. Valley Video archive: valley_2.zip.001 to valley_2.zip.012
     VALLEY_PARTS = [f"valley_2.zip.{i:03d}" for i in range(1, 13)]
 
+    # Expected minimum size in bytes for each part to be considered complete.
+    # Parts 001-011: ~41.9 GB each (39.06 GiB = 41,943,040,000 bytes)
+    # Part 012: ~2.35 GB (2.19 GiB = 2,351,600,000 bytes)
+    VALLEY_PART_MIN_BYTES = {
+        f"valley_2.zip.{i:03d}": int(38.5 * (1024 ** 3)) for i in range(1, 12)
+    }
+    VALLEY_PART_MIN_BYTES["valley_2.zip.012"] = int(2.0 * (1024 ** 3))
+
     def __init__(self, drive_data_dir: str, local_scratch_dir: str):
         self.drive_data_dir = Path(drive_data_dir)
         self.local_scratch_dir = Path(local_scratch_dir)
@@ -144,6 +152,80 @@ class InboundDataMuler:
     MIN_REAL_IMAGE_FILES = 10
     MIN_REAL_VIDEO_FILES = 5
 
+    def check_storage_space(self):
+        """Diagnose and display storage space across Google Drive, Colab SSD, and /tmp."""
+        log_header("Storage Diagnostic & Capacity Check")
+        targets = [
+            ("Google Drive Data Dir", self.drive_data_dir),
+            ("Google Drive Root", Path("/content/drive/MyDrive")),
+            ("Colab Local SSD (/content)", Path("/content")),
+            ("System Temp (/tmp)", Path("/tmp")),
+        ]
+        info = {}
+        seen_paths = set()
+        for label, path in targets:
+            try:
+                resolved = path.resolve() if path.exists() else path
+                if str(resolved) in seen_paths or not path.exists():
+                    continue
+                seen_paths.add(str(resolved))
+                usage = shutil.disk_usage(path)
+                free_gb = usage.free / (1024 ** 3)
+                total_gb = usage.total / (1024 ** 3)
+                used_gb = usage.used / (1024 ** 3)
+                pct = (usage.used / usage.total) * 100 if usage.total > 0 else 0
+                log_info(f"  • {label:28s}: {free_gb:6.1f} GB free / {total_gb:6.1f} GB total ({pct:5.1f}% used) [{path}]")
+                info[label] = {"free_gb": free_gb, "total_gb": total_gb, "used_gb": used_gb}
+            except Exception as e:
+                log_warn(f"  • {label:28s}: could not read disk usage ({e})")
+        return info
+
+    def get_valley_parts_status(self):
+        """Inspect all 12 Valley multi-part archives and return status dictionary."""
+        status = {}
+        total_downloaded = 0
+        total_expected = 0
+        incomplete_parts = []
+        complete_parts = []
+
+        for part_name in self.VALLEY_PARTS:
+            part_path = self.drive_data_dir / part_name
+            min_expected = self.VALLEY_PART_MIN_BYTES[part_name]
+            total_expected += min_expected
+            if part_path.exists():
+                actual_bytes = part_path.stat().st_size
+                total_downloaded += actual_bytes
+                is_complete = actual_bytes >= min_expected
+            else:
+                actual_bytes = 0
+                is_complete = False
+
+            actual_gb = actual_bytes / (1024 ** 3)
+            expected_gb = min_expected / (1024 ** 3)
+            part_info = {
+                "name": part_name,
+                "path": part_path,
+                "actual_gb": actual_gb,
+                "expected_gb": expected_gb,
+                "is_complete": is_complete,
+                "missing_gb": max(0.0, expected_gb - actual_gb),
+            }
+            status[part_name] = part_info
+            if is_complete:
+                complete_parts.append(part_name)
+            else:
+                incomplete_parts.append(part_info)
+
+        return {
+            "parts": status,
+            "total_downloaded_gb": total_downloaded / (1024 ** 3),
+            "total_expected_gb": total_expected / (1024 ** 3),
+            "complete_count": len(complete_parts),
+            "incomplete_count": len(incomplete_parts),
+            "complete_parts": complete_parts,
+            "incomplete_parts": incomplete_parts,
+        }
+
     def verify_drive_dataset(self) -> bool:
         """Check if REAL datasets are already extracted and ready on Google Drive."""
         image_json_ok = self.drive_image_json.is_file() and self.drive_image_json.stat().st_size > 0
@@ -157,19 +239,25 @@ class InboundDataMuler:
         return image_json_ok and video_json_ok and image_dir_ok and video_dir_ok
 
     def _wget_download(self, url: str, output_path: str, desc: str = ""):
-        """Download a file using wget (no double-caching, direct write to destination)."""
+        """Download a file using wget with auto-resume (-c), retry resilience, and direct write."""
         log_info(f"Downloading {desc or url}...")
+        out_p = Path(output_path)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
         cmd = [
             "wget", "-c",  # -c enables resume of partial downloads
             "--progress=bar:force:noscroll",
-            "-O", output_path,
+            "--tries=10",
+            "--retry-connrefused",
+            "--waitretry=5",
+            "--timeout=30",
+            "-O", str(out_p),
             url
         ]
         result = subprocess.run(cmd, check=False)
         if result.returncode != 0:
             log_err(f"wget failed for {desc or url} (exit code {result.returncode})")
             return False
-        log_success(f"Downloaded {desc}")
+        log_success(f"Downloaded/resumed {desc}")
         return True
 
     def download_annotations(self):
@@ -209,15 +297,12 @@ class InboundDataMuler:
 
         if annot_zip.exists() and annot_zip.stat().st_size > 0:
             log_info("Extracting annotations zip...")
-            # Extract to a temp dir first to find the JSONs
             extract_dir = self.drive_data_dir / "_annot_extract"
             extract_dir.mkdir(parents=True, exist_ok=True)
             subprocess.run(["unzip", "-q", "-o", str(annot_zip), "-d", str(extract_dir)], check=True)
 
-            # Find and copy the JSON files we need
             found_any = False
             for json_name in ["llava_image_.json", "valley_.json", "chat.json"]:
-                # Search recursively for the file
                 matches = list(extract_dir.rglob(json_name))
                 if matches:
                     shutil.copy2(matches[0], self.drive_json_folder / json_name)
@@ -226,7 +311,6 @@ class InboundDataMuler:
                 else:
                     log_warn(f"Could not find {json_name} in annotations zip")
 
-            # If we didn't find specific names, look for any JSON files
             if not found_any:
                 log_info("Searching for any annotation JSONs in the zip...")
                 for jf in extract_dir.rglob("*.json"):
@@ -234,12 +318,6 @@ class InboundDataMuler:
                     shutil.copy2(jf, dest)
                     log_info(f"  Extracted: {jf.name} ({jf.stat().st_size / 1024:.0f} KB)")
 
-            # List what we have
-            log_info("Contents of annotations folder:")
-            for f in sorted(self.drive_json_folder.iterdir()):
-                log_info(f"  {f.name} ({f.stat().st_size / (1024*1024):.1f} MB)")
-
-            # Cleanup extraction temp dir
             shutil.rmtree(extract_dir, ignore_errors=True)
             return True
         else:
@@ -254,34 +332,13 @@ class InboundDataMuler:
             log_success(f"Image dataset already extracted on Drive ({self.drive_image_folder})")
             return True
 
-        if image_archive.exists() and image_archive.stat().st_size > 1_000_000:
+        if image_archive.exists() and image_archive.stat().st_size > 25 * (1024 ** 3):
             log_success(f"llava_image.zip already on Drive ({image_archive.stat().st_size / (1024**3):.2f} GB)")
         else:
             url = f"{self.HF_BASE_URL}/llava_image.zip"
             success = self._wget_download(url, str(image_archive), "llava_image.zip (~27 GB)")
             if not success:
                 return False
-
-        return True
-
-    def download_video_archives(self):
-        """Download valley_2.zip.* parts directly to Google Drive using wget."""
-        # Check if already extracted
-        if self.drive_video_folder.is_dir() and sum(1 for _ in self.drive_video_folder.iterdir()) >= self.MIN_REAL_VIDEO_FILES:
-            log_success(f"Video dataset already extracted on Drive ({self.drive_video_folder})")
-            return True
-
-        for part_name in self.VALLEY_PARTS:
-            part_file = self.drive_data_dir / part_name
-            if part_file.exists() and part_file.stat().st_size > 1_000_000:
-                log_info(f"{part_name} already on Drive ({part_file.stat().st_size / (1024**3):.2f} GB)")
-                continue
-
-            url = f"{self.HF_BASE_URL}/{part_name}"
-            size_hint = "~42 GB" if part_name != "valley_2.zip.012" else "~2.3 GB"
-            success = self._wget_download(url, str(part_file), f"{part_name} ({size_hint})")
-            if not success:
-                log_warn(f"Failed to download {part_name}, continuing with remaining parts...")
 
         return True
 
@@ -297,7 +354,6 @@ class InboundDataMuler:
             return False
 
         log_info(f"Extracting llava_image.zip on Google Drive ({image_archive.stat().st_size / (1024**3):.2f} GB)...")
-        log_info("(This extracts directly on Drive — slower than SSD but data persists across sessions)")
         self.drive_image_folder.mkdir(parents=True, exist_ok=True)
         result = subprocess.run(
             ["unzip", "-q", "-o", str(image_archive), "-d", str(self.drive_data_dir)],
@@ -312,44 +368,161 @@ class InboundDataMuler:
         log_success(f"Extracted {num_files} image files to {self.drive_image_folder}")
         return True
 
+    def cleanup_image_archive(self):
+        """Reclaims ~27 GB of Google Drive space by removing llava_image.zip if already extracted."""
+        image_archive = self.drive_data_dir / "llava_image.zip"
+        if not image_archive.exists():
+            log_info("llava_image.zip does not exist on Drive (already cleaned up or not downloaded).")
+            return
+        num_images = sum(1 for _ in self.drive_image_folder.iterdir()) if self.drive_image_folder.is_dir() else 0
+        if num_images >= self.MIN_REAL_IMAGE_FILES:
+            size_gb = image_archive.stat().st_size / (1024 ** 3)
+            image_archive.unlink()
+            log_success(f"Removed llava_image.zip to reclaim {size_gb:.1f} GB of Google Drive space (extracted images intact).")
+        else:
+            log_warn("Cannot remove llava_image.zip because extracted image folder is empty or incomplete.")
+
+    def download_video_archives(self, parts_filter=None):
+        """Download or resume valley_2.zip.* parts directly to Google Drive using wget."""
+        # Check if already extracted
+        if self.drive_video_folder.is_dir() and sum(1 for _ in self.drive_video_folder.iterdir()) >= self.MIN_REAL_VIDEO_FILES:
+            log_success(f"Video dataset already extracted on Drive ({self.drive_video_folder})")
+            return True
+
+        status = self.get_valley_parts_status()
+        if status["incomplete_count"] == 0:
+            log_success(f"All 12 Valley video archives already downloaded and complete ({status['total_downloaded_gb']:.1f} GB)!")
+            return True
+
+        log_info(f"Valley video archives progress: {status['complete_count']}/12 complete ({status['total_downloaded_gb']:.1f} GB downloaded).")
+        needed_total_gb = status['total_expected_gb'] - status['total_downloaded_gb']
+        log_info(f"Remaining download needed across all incomplete parts: ~{needed_total_gb:.1f} GB")
+
+        # Normalize parts_filter if specified (e.g. ['4', '5'] or ['004', '005'] or ['valley_2.zip.004'])
+        allowed_parts = None
+        if parts_filter:
+            allowed_parts = set()
+            for p in parts_filter:
+                p_clean = p.strip()
+                if p_clean.isdigit():
+                    allowed_parts.add(f"valley_2.zip.{int(p_clean):03d}")
+                elif not p_clean.startswith("valley_2.zip."):
+                    allowed_parts.add(f"valley_2.zip.{p_clean}")
+                else:
+                    allowed_parts.add(p_clean)
+            log_info(f"Downloading filtered parts only: {sorted(allowed_parts)}")
+
+        # Check Drive free space
+        try:
+            drive_free_gb = shutil.disk_usage(self.drive_data_dir).free / (1024 ** 3)
+            log_info(f"Google Drive free space: {drive_free_gb:.1f} GB available (need ~{needed_total_gb:.1f} GB for remaining archives)")
+            if drive_free_gb < needed_total_gb:
+                log_warn("=" * 60)
+                log_warn(f"WARNING: Google Drive free space ({drive_free_gb:.1f} GB) is less than needed ({needed_total_gb:.1f} GB)!")
+                log_warn("If Drive fills up, downloads will fail with 'No space left on device'.")
+                log_warn("Consider freeing space or using --cleanup_image_archive to reclaim ~27 GB.")
+                log_warn("=" * 60)
+        except Exception:
+            pass
+
+        for p in status["incomplete_parts"]:
+            part_name = p["name"]
+            if allowed_parts and part_name not in allowed_parts:
+                continue
+
+            part_file = p["path"]
+            actual_gb = p["actual_gb"]
+            expected_gb = p["expected_gb"]
+
+            if actual_gb > 0:
+                log_info(f"↻ Resuming {part_name} from {actual_gb:.2f} GB (target ~{expected_gb:.1f} GB)...")
+            else:
+                log_info(f"↓ Starting download of {part_name} (~{expected_gb:.1f} GB)...")
+
+            url = f"{self.HF_BASE_URL}/{part_name}"
+            success = self._wget_download(url, str(part_file), f"{part_name}")
+            if not success:
+                log_warn(f"Download/resume of {part_name} interrupted or returned non-zero exit code.")
+
+            # Check size after download
+            if part_file.exists():
+                new_size_gb = part_file.stat().st_size / (1024 ** 3)
+                if part_file.stat().st_size >= self.VALLEY_PART_MIN_BYTES[part_name]:
+                    log_success(f"✓ {part_name} is now COMPLETE ({new_size_gb:.2f} GB)!")
+                else:
+                    log_warn(f"⚠ {part_name} is at {new_size_gb:.2f} GB / ~{expected_gb:.1f} GB. It will resume next run.")
+
+        new_status = self.get_valley_parts_status()
+        if new_status["incomplete_count"] == 0:
+            log_success("All 12 Valley video parts are now fully downloaded and ready for extraction!")
+            return True
+        else:
+            log_warn(f"{new_status['incomplete_count']}/12 parts remain incomplete ({new_status['total_downloaded_gb']:.1f} GB / ~{new_status['total_expected_gb']:.1f} GB).")
+            return False
+
     def extract_video_archives(self):
         """Extract valley multi-part zip archives directly on Google Drive."""
         if self.drive_video_folder.is_dir() and sum(1 for _ in self.drive_video_folder.iterdir()) >= self.MIN_REAL_VIDEO_FILES:
             log_success("Video dataset already extracted on Drive.")
             return True
 
-        first_part = self.drive_data_dir / "valley_2.zip.001"
-        if not first_part.exists():
-            log_err("valley_2.zip.001 not found on Drive. Download video archives first.")
+        status = self.get_valley_parts_status()
+        if status["incomplete_count"] > 0:
+            log_err(f"Cannot extract archives: {status['incomplete_count']}/12 part(s) are incomplete or missing!")
+            for p in status["incomplete_parts"]:
+                log_err(f"  • {p['name']}: {p['actual_gb']:.2f} GB / ~{p['expected_gb']:.1f} GB (missing {p['missing_gb']:.2f} GB)")
+            log_err("All 12 parts must be fully downloaded before 7-Zip can unpack the multi-part archive.")
+            log_err("Please run with '--action download' to finish downloading the remaining parts.")
             return False
 
+        # All parts complete! Check Drive capacity for extraction
+        try:
+            drive_free_gb = shutil.disk_usage(self.drive_data_dir).free / (1024 ** 3)
+            log_info(f"Google Drive free space: {drive_free_gb:.1f} GB available (unpacked videos take ~460 GB)")
+            if drive_free_gb < 470:
+                log_warn("=" * 60)
+                log_warn(f"ATTENTION: Drive free space is {drive_free_gb:.1f} GB.")
+                log_warn("Extracting 460 GB of videos while keeping the 432 GB zip files requires ~470 GB free.")
+                log_warn("=" * 60)
+        except Exception:
+            pass
+
+        first_part = self.drive_data_dir / "valley_2.zip.001"
         self.drive_video_folder.mkdir(parents=True, exist_ok=True)
 
         log_info("Extracting multi-part Valley video archives on Google Drive...")
-        log_info("(This may take a while — extracting ~460 GB of videos directly on Drive)")
+        log_info("(All 12 parts verified complete. Extracting ~460 GB of videos directly on Drive)")
 
-        # Use 7z for multi-part zip extraction
+        # Create working directory on Drive so 7-Zip NEVER writes temporary files to Colab /tmp (which has only ~50 GB)
+        drive_work_dir = self.drive_data_dir / "_7z_work"
+        drive_work_dir.mkdir(parents=True, exist_ok=True)
+
         has_7z = shutil.which("7z") or shutil.which("7za")
         if has_7z:
             seven_z = "7z" if shutil.which("7z") else "7za"
-            cmd = [seven_z, "x", str(first_part), f"-o{self.drive_data_dir}", "-y"]
+            # -w switch redirects 7-Zip working files to Google Drive instead of Colab /tmp
+            cmd = [seven_z, "x", str(first_part), f"-o{self.drive_data_dir}", f"-w{drive_work_dir}", "-y"]
+            log_info(f"Running: {' '.join(cmd)}")
             result = subprocess.run(cmd, check=False)
+            shutil.rmtree(drive_work_dir, ignore_errors=True)
         else:
-            # Fallback: combine parts with cat, then unzip
-            log_info("Combining multi-part archives with cat...")
-            combined_zip = self.drive_data_dir / "valley_combined.zip"
-            cat_cmd = f"cat {self.drive_data_dir}/valley_2.zip.* > {combined_zip}"
-            result = subprocess.run(cat_cmd, shell=True, check=False)
-            if result.returncode == 0:
-                result = subprocess.run(
-                    ["unzip", "-q", "-o", str(combined_zip), "-d", str(self.drive_data_dir)],
-                    check=False
-                )
-                combined_zip.unlink(missing_ok=True)
+            log_err("7z / 7za not installed. Please install with: apt-get install -y p7zip-full")
+            return False
 
         if result.returncode != 0:
             log_err(f"Video extraction failed (exit code {result.returncode})")
             return False
+
+        # Handle nested folder naming (e.g. if extracted as 'valley' or 'valley_2')
+        valley_2_dir = self.drive_data_dir / "valley_2"
+        if valley_2_dir.is_dir() and not self.drive_video_folder.is_dir():
+            valley_2_dir.rename(self.drive_video_folder)
+        elif valley_2_dir.is_dir() and self.drive_video_folder.is_dir():
+            for item in valley_2_dir.iterdir():
+                dest = self.drive_video_folder / item.name
+                if not dest.exists():
+                    shutil.move(str(item), str(self.drive_video_folder))
+            shutil.rmtree(valley_2_dir, ignore_errors=True)
 
         self._fixup_nested_directory(self.drive_video_folder, "valley")
         num_files = sum(1 for _ in self.drive_video_folder.rglob("*") if _.is_file())
@@ -366,7 +539,7 @@ class InboundDataMuler:
                 shutil.copy2(drive_src, local_dst)
                 log_info(f"Synced {json_name} to local SSD ({drive_src.stat().st_size / (1024*1024):.1f} MB)")
 
-    def download_and_prepare_all(self):
+    def download_and_prepare_all(self, parts_filter=None):
         """Full pipeline: download archives, extract on Drive, sync annotations."""
         log_header("Step 1: Downloading & Preparing Datasets on Google Drive")
 
@@ -374,24 +547,45 @@ class InboundDataMuler:
             log_success("All datasets already present and extracted on Google Drive!")
             self.sync_annotations_to_local()
             self.print_dataset_summary()
-            return
+            return True
+
+        # 0. Display storage diagnostics
+        self.check_storage_space()
 
         # 1. Download annotations
-        self.download_annotations()
+        if not self.download_annotations():
+            log_err("Annotation download failed.")
+            return False
 
         # 2. Download & extract images
-        self.download_image_archive()
-        self.extract_image_archive()
+        if not self.download_image_archive():
+            log_err("Image archive download failed.")
+            return False
+        if not self.extract_image_archive():
+            log_err("Image archive extraction failed.")
+            return False
 
         # 3. Download & extract videos
-        self.download_video_archives()
-        self.extract_video_archives()
+        videos_downloaded = self.download_video_archives(parts_filter=parts_filter)
+        if not videos_downloaded:
+            log_warn("Video archives are not fully downloaded yet. Extraction postponed.")
+            self.sync_annotations_to_local()
+            self.print_dataset_summary()
+            return False
+
+        videos_extracted = self.extract_video_archives()
+        if not videos_extracted:
+            log_err("Video extraction failed.")
+            self.sync_annotations_to_local()
+            self.print_dataset_summary()
+            return False
 
         # 4. Sync annotation JSONs to local SSD
         self.sync_annotations_to_local()
 
         log_header("Data Preparation Complete!")
         self.print_dataset_summary()
+        return True
 
     def _fixup_nested_directory(self, target_dir: Path, folder_name: str):
         """Fixes nested directory extractions if archives contained root folders."""
@@ -406,6 +600,8 @@ class InboundDataMuler:
 
     def print_dataset_summary(self):
         """Prints counts of images, videos, and annotation samples available."""
+        self.check_storage_space()
+
         # Check Drive paths (where data lives)
         num_images = sum(1 for _ in self.drive_image_folder.rglob("*") if _.is_file()) if self.drive_image_folder.exists() else 0
         num_videos = sum(1 for _ in self.drive_video_folder.rglob("*") if _.is_file()) if self.drive_video_folder.exists() else 0
@@ -413,7 +609,14 @@ class InboundDataMuler:
         log_info(f"Drive Image folder: {self.drive_image_folder} ({num_images} files)")
         log_info(f"Drive Video folder: {self.drive_video_folder} ({num_videos} files)")
         log_info(f"Image annotations: {self.drive_image_json} ({'Found' if self.drive_image_json.exists() else 'Missing'})")
-        log_info(f"Video annotations: {self.drive_video_json} ({'Found' if self.drive_video_json.exists() else 'Missing'}")
+        log_info(f"Video annotations: {self.drive_video_json} ({'Found' if self.drive_video_json.exists() else 'Missing'})")
+
+        parts_status = self.get_valley_parts_status()
+        log_info(f"Valley Video Archives: {parts_status['complete_count']}/12 complete ({parts_status['total_downloaded_gb']:.1f} GB / ~{parts_status['total_expected_gb']:.1f} GB)")
+        if parts_status["incomplete_count"] > 0:
+            log_warn(f"Incomplete parts ({parts_status['incomplete_count']}):")
+            for p in parts_status["incomplete_parts"]:
+                log_warn(f"  • {p['name']}: {p['actual_gb']:.2f} GB / ~{p['expected_gb']:.1f} GB (missing {p['missing_gb']:.2f} GB)")
 
     def create_demo_subset(self, num_samples: int = 100):
         """
@@ -843,6 +1046,10 @@ def parse_args():
                         help="Override gradient accumulation steps (defaults to auto-tuned).")
     parser.add_argument("--auto_resume", action="store_true", default=True,
                         help="Automatically check Google Drive for existing checkpoints to resume from.")
+    parser.add_argument("--parts", nargs="+", type=str, default=None,
+                        help="Filter specific Valley archive parts to download/resume (e.g. --parts 4 5 or --parts 004 005). Defaults to all incomplete parts.")
+    parser.add_argument("--cleanup_image_archive", action="store_true", default=False,
+                        help="Delete llava_image.zip on Drive to reclaim ~27 GB if images are already extracted.")
 
     return parser.parse_args()
 
@@ -867,6 +1074,9 @@ def main():
         sync_interval_sec=20,
         keep_local_ckpts=1
     )
+
+    if args.cleanup_image_archive:
+        inbound_muler.cleanup_image_archive()
 
     if args.action == "status":
         log_header("System & Storage Status")
@@ -898,7 +1108,15 @@ def main():
     if args.action in ["all", "download", "extract"]:
         if args.demo_samples == 0:
             if not inbound_muler.verify_drive_dataset():
-                inbound_muler.download_and_prepare_all()
+                if args.action == "extract":
+                    prep_ok = inbound_muler.extract_video_archives()
+                else:
+                    prep_ok = inbound_muler.download_and_prepare_all(parts_filter=args.parts)
+
+                if not prep_ok and args.action == "all":
+                    log_err("Dataset preparation was not completed (video archives are still downloading or need extraction).")
+                    log_info("Pretraining halted safely. Run with '--action download' to finish downloading video archives.")
+                    return
             else:
                 log_success("Full datasets already present on Google Drive. Skipping download.")
                 inbound_muler.sync_annotations_to_local()
