@@ -787,7 +787,11 @@ class InboundDataMuler:
         if has_7z:
             seven_z = "7z" if shutil.which("7z") else "7za"
             # -w switch redirects 7-Zip working files to Google Drive instead of Colab /tmp
-            cmd = [seven_z, "x", str(first_part), f"-o{self.drive_data_dir}", f"-w{drive_work_dir}", "-y"]
+            # -aos = SKIP files that already exist in output dir (critical for iterative extraction:
+            #         each run extracts ~60-80 GB worth of files before the SSD FUSE write cache
+            #         fills up with errno=28. After flushing Drive from the notebook cell, re-running
+            #         with -aos picks up exactly where we left off without re-extracting done files.)
+            cmd = [seven_z, "x", str(first_part), f"-o{self.drive_data_dir}", f"-w{drive_work_dir}", "-aos", "-y"]
             log_info(f"Running: {' '.join(cmd)}")
             env = os.environ.copy()
             env["TMPDIR"] = str(drive_work_dir)
@@ -797,9 +801,20 @@ class InboundDataMuler:
             log_err("7z / 7za not installed. Please install with: apt-get install -y p7zip-full")
             return False
 
+        # Exit code 2 with errno=28 (no space left) is EXPECTED during iterative extraction.
+        # It means the SSD FUSE write cache filled up — not a real failure.
+        # The caller (notebook cell) should call drive.flush_and_unmount() and re-run this method.
+        if result.returncode == 2:
+            n_extracted = sum(1 for _ in self.drive_video_folder.iterdir()) if self.drive_video_folder.exists() else 0
+            log_warn(f"7-Zip hit SSD space limit (errno=28). Extracted {n_extracted} files so far.")
+            log_warn("Flush Drive from the notebook cell with drive.flush_and_unmount(), then re-run --action extract.")
+            return False
+
         if result.returncode != 0:
             log_err(f"Video extraction failed (exit code {result.returncode})")
             return False
+
+
 
         # Handle nested folder naming (e.g. if extracted as 'valley' or 'valley_2')
         valley_2_dir = self.drive_data_dir / "valley_2"
