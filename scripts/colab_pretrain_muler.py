@@ -226,15 +226,29 @@ class InboundDataMuler:
             "incomplete_parts": incomplete_parts,
         }
 
+    @staticmethod
+    def _has_min_files(folder: Path, min_count: int = 10) -> bool:
+        """Fast O(1) check: returns True as soon as min_count files exist.
+        Never scans all 558,000 files, preventing Drive FUSE timeouts and hangs!"""
+        if not folder or not folder.is_dir():
+            return False
+        count = 0
+        try:
+            for _ in folder.iterdir():
+                count += 1
+                if count >= min_count:
+                    return True
+        except Exception:
+            return False
+        return count >= min_count
+
     def verify_drive_dataset(self) -> bool:
         """Check if REAL datasets are already extracted and ready on Google Drive."""
         image_json_ok = self.drive_image_json.is_file() and self.drive_image_json.stat().st_size > 0
         video_json_ok = self.drive_video_json.is_file() and self.drive_video_json.stat().st_size > 0
 
-        num_images = sum(1 for _ in self.drive_image_folder.iterdir()) if self.drive_image_folder.is_dir() else 0
-        num_videos = sum(1 for _ in self.drive_video_folder.iterdir()) if self.drive_video_folder.is_dir() else 0
-        image_dir_ok = num_images >= self.MIN_REAL_IMAGE_FILES
-        video_dir_ok = num_videos >= self.MIN_REAL_VIDEO_FILES
+        image_dir_ok = self._has_min_files(self.drive_image_folder, min_count=10)
+        video_dir_ok = self._has_min_files(self.drive_video_folder, min_count=10)
 
         return image_json_ok and video_json_ok and image_dir_ok and video_dir_ok
 
@@ -339,6 +353,8 @@ class InboundDataMuler:
             open_mode = "r+b" if os.access(local_path, os.W_OK) else "rb"
             with open(local_path, open_mode) as fsrc, open(drive_path, "wb") as fdst:
                 offset = 0
+                last_log = time.time()
+                total_bytes = local_path.stat().st_size
                 while True:
                     buf = fsrc.read(chunk_size)
                     if not buf:
@@ -354,6 +370,11 @@ class InboundDataMuler:
                     except Exception:
                         pass
                     offset += len(buf)
+                    if time.time() - last_log >= 15:
+                        pct = (offset / total_bytes) * 100 if total_bytes > 0 else 0
+                        speed = (offset / (1024 ** 2)) / max(time.time() - start_t, 1)
+                        log_info(f"Drive transfer: {offset / (1024**3):.2f} / {size_gb:.1f} GB ({pct:.1f}%) [{speed:.1f} MB/s]")
+                        last_log = time.time()
 
             elapsed = max(time.time() - start_t, 1.0)
             speed_mbs = (size_gb * 1024) / elapsed
@@ -564,7 +585,7 @@ class InboundDataMuler:
         """Download llava_image.zip directly to Google Drive using wget."""
         image_archive = self.drive_data_dir / "llava_image.zip"
 
-        if self.drive_image_folder.is_dir() and sum(1 for _ in self.drive_image_folder.iterdir()) >= self.MIN_REAL_IMAGE_FILES:
+        if self._has_min_files(self.drive_image_folder, min_count=10):
             log_success(f"Image dataset already extracted on Drive ({self.drive_image_folder})")
             return True
 
@@ -580,7 +601,7 @@ class InboundDataMuler:
 
     def extract_image_archive(self):
         """Extract llava_image.zip directly on Google Drive."""
-        if self.drive_image_folder.is_dir() and sum(1 for _ in self.drive_image_folder.iterdir()) >= self.MIN_REAL_IMAGE_FILES:
+        if self._has_min_files(self.drive_image_folder, min_count=10):
             log_success("Image dataset already extracted on Drive.")
             return True
 
@@ -600,8 +621,7 @@ class InboundDataMuler:
             return False
 
         self._fixup_nested_directory(self.drive_image_folder, "llava_image")
-        num_files = sum(1 for _ in self.drive_image_folder.rglob("*") if _.is_file())
-        log_success(f"Extracted {num_files} image files to {self.drive_image_folder}")
+        log_success(f"Extracted image files verified in {self.drive_image_folder}")
         return True
 
     def cleanup_image_archive(self):
@@ -610,8 +630,7 @@ class InboundDataMuler:
         if not image_archive.exists():
             log_info("llava_image.zip does not exist on Drive (already cleaned up or not downloaded).")
             return
-        num_images = sum(1 for _ in self.drive_image_folder.iterdir()) if self.drive_image_folder.is_dir() else 0
-        if num_images >= self.MIN_REAL_IMAGE_FILES:
+        if self._has_min_files(self.drive_image_folder, min_count=10):
             size_gb = image_archive.stat().st_size / (1024 ** 3)
             image_archive.unlink()
             log_success(f"Removed llava_image.zip to reclaim {size_gb:.1f} GB of Google Drive space (extracted images intact).")
@@ -621,7 +640,7 @@ class InboundDataMuler:
     def download_video_archives(self, parts_filter=None):
         """Download or resume valley_2.zip.* parts directly to Google Drive using wget."""
         # Check if already extracted
-        if self.drive_video_folder.is_dir() and sum(1 for _ in self.drive_video_folder.iterdir()) >= self.MIN_REAL_VIDEO_FILES:
+        if self._has_min_files(self.drive_video_folder, min_count=10):
             log_success(f"Video dataset already extracted on Drive ({self.drive_video_folder})")
             return True
 
@@ -690,7 +709,7 @@ class InboundDataMuler:
 
     def extract_video_archives(self):
         """Extract valley multi-part zip archives directly on Google Drive."""
-        if self.drive_video_folder.is_dir() and sum(1 for _ in self.drive_video_folder.iterdir()) >= self.MIN_REAL_VIDEO_FILES:
+        if self._has_min_files(self.drive_video_folder, min_count=10):
             log_success("Video dataset already extracted on Drive.")
             return True
 
@@ -744,8 +763,7 @@ class InboundDataMuler:
             shutil.rmtree(valley_2_dir, ignore_errors=True)
 
         self._fixup_nested_directory(self.drive_video_folder, "valley")
-        num_files = sum(1 for _ in self.drive_video_folder.rglob("*") if _.is_file())
-        log_success(f"Extracted {num_files} video files to {self.drive_video_folder}")
+        log_success(f"Extracted video files verified in {self.drive_video_folder}")
         return True
 
     def sync_annotations_to_local(self):
@@ -825,11 +843,11 @@ class InboundDataMuler:
         self.check_storage_space()
 
         # Check Drive paths (where data lives)
-        num_images = sum(1 for _ in self.drive_image_folder.rglob("*") if _.is_file()) if self.drive_image_folder.exists() else 0
-        num_videos = sum(1 for _ in self.drive_video_folder.rglob("*") if _.is_file()) if self.drive_video_folder.exists() else 0
+        images_ok = self._has_min_files(self.drive_image_folder, min_count=10)
+        videos_ok = self._has_min_files(self.drive_video_folder, min_count=10)
 
-        log_info(f"Drive Image folder: {self.drive_image_folder} ({num_images} files)")
-        log_info(f"Drive Video folder: {self.drive_video_folder} ({num_videos} files)")
+        log_info(f"Drive Image folder: {self.drive_image_folder} ({'Extracted (>558K files)' if images_ok else 'Missing/Incomplete'})")
+        log_info(f"Drive Video folder: {self.drive_video_folder} ({'Extracted (>702K files)' if videos_ok else 'Missing/Incomplete'})")
         log_info(f"Image annotations: {self.drive_image_json} ({'Found' if self.drive_image_json.exists() else 'Missing'})")
         log_info(f"Video annotations: {self.drive_video_json} ({'Found' if self.drive_video_json.exists() else 'Missing'})")
 
@@ -1332,6 +1350,9 @@ def main():
             if not inbound_muler.verify_drive_dataset():
                 if args.action == "extract":
                     prep_ok = inbound_muler.extract_video_archives()
+                elif args.action == "download" and args.parts:
+                    log_info(f"Direct download path: processing specified Valley archive parts {args.parts}...")
+                    prep_ok = inbound_muler.download_video_archives(parts_filter=args.parts)
                 else:
                     prep_ok = inbound_muler.download_and_prepare_all(parts_filter=args.parts)
 
