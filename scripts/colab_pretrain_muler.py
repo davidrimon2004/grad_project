@@ -464,6 +464,20 @@ class InboundDataMuler:
             self._stream_copy_to_drive(staged_file, drive_target)
             return drive_target.exists() and drive_target.stat().st_size >= min_bytes
 
+        # RESUME CHECK: If Drive already has a substantial partial (>100 MB), skip aria2c entirely
+        # and use HTTP Range resume to append the remaining bytes. This preserves downloaded work
+        # after Colab disconnects and avoids re-downloading e.g. 38 GB of a 39 GB part!
+        try:
+            drive_partial_bytes = drive_target.stat().st_size if drive_target.exists() else 0
+        except Exception:
+            drive_partial_bytes = 0
+        if 0 < drive_partial_bytes < min_bytes and drive_partial_bytes > 100 * 1024 * 1024:
+            log_info(f"Partial found on Drive for {part_name} ({drive_partial_bytes / (1024**3):.2f} GB). Resuming via HTTP Range...")
+            return self._direct_stream_from_url_to_drive(url, drive_target, min_bytes)
+        if drive_partial_bytes >= min_bytes:
+            log_success(f"✓ {part_name} already complete on Drive ({drive_partial_bytes / (1024**3):.2f} GB)!")
+            return True
+
         staging_dir = self._ensure_ssd_staging_space(min_gb_needed=41.0)
         has_aria2 = self._ensure_aria2()
         ssd_free_gb = shutil.disk_usage(staging_dir).free / (1024 ** 3)
