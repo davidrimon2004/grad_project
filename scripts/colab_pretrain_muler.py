@@ -27,6 +27,9 @@ import subprocess
 import argparse
 import threading
 import signal
+import zipfile
+import struct
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, List, Dict
 
@@ -89,6 +92,131 @@ def mount_google_drive(mount_point: str = "/content/drive") -> bool:
     except Exception as e:
         log_err(f"Failed to mount Google Drive: {e}")
         return False
+
+
+# ==============================================================================
+# Streaming Multi-Part Zip Extractor (Zero Intermediate File Architecture)
+# ==============================================================================
+
+class MultiPartStream:
+    """Emulates a single contiguous, seekable binary stream across multiple split archive parts."""
+    def __init__(self, paths: List[str]):
+        self.paths = [str(p) for p in paths]
+        self.sizes = []
+        for p in self.paths:
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"Missing archive part: {p}")
+            self.sizes.append(os.path.getsize(p))
+        self.starts, t = [], 0
+        for s in self.sizes:
+            self.starts.append(t)
+            t += s
+        self.total = t
+        self._pos = 0
+        self._fhs = {}
+
+    def _fh(self, i: int):
+        if i not in self._fhs:
+            self._fhs[i] = open(self.paths[i], 'rb')
+        return self._fhs[i]
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seekable(self) -> bool:
+        return True
+
+    def seek(self, pos: int, whence: int = 0) -> int:
+        if whence == 0:
+            self._pos = pos
+        elif whence == 1:
+            self._pos += pos
+        elif whence == 2:
+            self._pos = self.total + pos
+        self._pos = max(0, min(self._pos, self.total))
+        return self._pos
+
+    def read(self, n: int = -1) -> bytes:
+        remain = (self.total - self._pos) if n < 0 else min(n, self.total - self._pos)
+        buf = bytearray()
+        while remain > 0:
+            idx = 0
+            for i in range(len(self.starts)):
+                if self.starts[i] <= self._pos:
+                    idx = i
+                else:
+                    break
+            loc = self._pos - self.starts[idx]
+            to_r = min(remain, self.sizes[idx] - loc)
+            fh = self._fh(idx)
+            fh.seek(loc)
+            chunk = fh.read(to_r)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            self._pos += len(chunk)
+            remain -= len(chunk)
+        return bytes(buf)
+
+    def close(self):
+        for fh in list(self._fhs.values()):
+            try:
+                fh.close()
+            except Exception:
+                pass
+        self._fhs.clear()
+
+
+def find_zip_data_offset(stream: MultiPartStream) -> int:
+    """Finds byte offset where payload begins inside the outer zip archive."""
+    stream.seek(0)
+    sig = stream.read(4)
+    if sig != b"PK\x03\x04":
+        raise ValueError(f"Invalid ZIP signature: {sig}")
+    stream.seek(26)
+    fn_len, extra_len = struct.unpack('<HH', stream.read(4))
+    stream.seek(30)
+    fn = stream.read(fn_len).decode('utf-8', errors='ignore')
+    offset = 30 + fn_len + extra_len
+    log_info(f"Inner archive payload: '{fn}', data begins at byte offset {offset}")
+    return offset
+
+
+class StreamSlice:
+    """Presents a bounded sub-slice of a stream as an independent seekable stream."""
+    def __init__(self, base, offset: int, size: int):
+        self.base = base
+        self.offset = offset
+        self.size = size
+        self._pos = 0
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seekable(self) -> bool:
+        return True
+
+    def seek(self, pos: int, whence: int = 0) -> int:
+        if whence == 0:
+            self._pos = pos
+        elif whence == 1:
+            self._pos += pos
+        elif whence == 2:
+            self._pos = self.size + pos
+        self._pos = max(0, min(self._pos, self.size))
+        return self._pos
+
+    def read(self, n: int = -1) -> bytes:
+        remain = (self.size - self._pos) if n < 0 else min(n, self.size - self._pos)
+        if remain <= 0:
+            return b""
+        self.base.seek(self.offset + self._pos)
+        chunk = self.base.read(remain)
+        self._pos += len(chunk)
+        return chunk
+
+    def close(self):
+        pass
 
 
 # ==============================================================================
@@ -757,8 +885,8 @@ class InboundDataMuler:
             log_warn(f"{new_status['incomplete_count']}/12 parts remain incomplete ({new_status['total_downloaded_gb']:.1f} GB / ~{new_status['total_expected_gb']:.1f} GB).")
             return False
 
-    def extract_video_archives(self):
-        """Extract valley multi-part zip archives directly on Google Drive."""
+    def extract_video_archives(self) -> bool:
+        """Extract valley multi-part zip archives directly on Google Drive using Python Streaming."""
         if self._has_min_files(self.drive_video_folder, min_count=10):
             log_success("Video dataset already extracted on Drive.")
             return True
@@ -768,67 +896,102 @@ class InboundDataMuler:
             log_err(f"Cannot extract archives: {status['incomplete_count']}/12 part(s) are incomplete or missing!")
             for p in status["incomplete_parts"]:
                 log_err(f"  • {p['name']}: {p['actual_gb']:.2f} GB / ~{p['expected_gb']:.1f} GB (missing {p['missing_gb']:.2f} GB)")
-            log_err("All 12 parts must be fully downloaded before 7-Zip can unpack the multi-part archive.")
             log_err("Please run with '--action download' to finish downloading the remaining parts.")
             return False
 
-        first_part = self.drive_data_dir / "valley_2.zip.001"
+        parts = [str(self.drive_data_dir / f"valley_2.zip.{i:03d}") for i in range(1, 13)]
         self.drive_video_folder.mkdir(parents=True, exist_ok=True)
+        stage_dir = Path("/content/_vstage") if Path("/content").exists() else self.local_scratch_dir / "_vstage"
+        stage_dir.mkdir(parents=True, exist_ok=True)
 
-        log_info("Extracting multi-part Valley video archives on Google Drive...")
-        log_info("(All 12 parts verified complete. Extracting ~460 GB of videos directly on Drive)")
-        log_info("Redirecting temporary extraction buffers to Google Drive to protect Colab VM disk.")
+        log_info("Extracting multi-part Valley video archives directly to Google Drive via Virtual Stream Slice...")
+        log_info("(Zero 463 GB intermediate file. Staged in local batches to protect VM SSD)")
 
-        # Create working directory on Drive so 7-Zip NEVER writes temporary files to Colab /tmp (which has only ~50 GB)
-        drive_work_dir = self.drive_data_dir / "_7z_work"
-        drive_work_dir.mkdir(parents=True, exist_ok=True)
+        return self._streaming_extract_valley(parts, stage_dir, self.drive_video_folder)
 
-        has_7z = shutil.which("7z") or shutil.which("7za")
-        if has_7z:
-            seven_z = "7z" if shutil.which("7z") else "7za"
-            # -w switch redirects 7-Zip working files to Google Drive instead of Colab /tmp
-            # -aos = SKIP files that already exist in output dir (critical for iterative extraction:
-            #         each run extracts ~60-80 GB worth of files before the SSD FUSE write cache
-            #         fills up with errno=28. After flushing Drive from the notebook cell, re-running
-            #         with -aos picks up exactly where we left off without re-extracting done files.)
-            cmd = [seven_z, "x", str(first_part), f"-o{self.drive_data_dir}", f"-w{drive_work_dir}", "-aos", "-y"]
-            log_info(f"Running: {' '.join(cmd)}")
-            env = os.environ.copy()
-            env["TMPDIR"] = str(drive_work_dir)
-            result = subprocess.run(cmd, env=env, check=False)
-            shutil.rmtree(drive_work_dir, ignore_errors=True)
-        else:
-            log_err("7z / 7za not installed. Please install with: apt-get install -y p7zip-full")
-            return False
+    def _streaming_extract_valley(self, parts: List[str], stage_dir: Path, out_dir: Path) -> bool:
+        valley_zip_size = 463720864722
+        batch_size = 5000
+        ssd_low_gb = 20.0
+        workers = 8
 
-        # Exit code 2 with errno=28 (no space left) is EXPECTED during iterative extraction.
-        # It means the SSD FUSE write cache filled up — not a real failure.
-        # The caller (notebook cell) should call drive.flush_and_unmount() and re-run this method.
-        if result.returncode == 2:
-            n_extracted = sum(1 for _ in self.drive_video_folder.iterdir()) if self.drive_video_folder.exists() else 0
-            log_warn(f"7-Zip hit SSD space limit (errno=28). Extracted {n_extracted} files so far.")
-            log_warn("Flush Drive from the notebook cell with drive.flush_and_unmount(), then re-run --action extract.")
-            return False
+        def open_inner():
+            outer = MultiPartStream(parts)
+            off = find_zip_data_offset(outer)
+            inner = zipfile.ZipFile(StreamSlice(outer, off, valley_zip_size))
+            return outer, inner
 
-        if result.returncode != 0:
-            log_err(f"Video extraction failed (exit code {result.returncode})")
-            return False
-
-
-
-        # Handle nested folder naming (e.g. if extracted as 'valley' or 'valley_2')
-        valley_2_dir = self.drive_data_dir / "valley_2"
-        if valley_2_dir.is_dir() and not self.drive_video_folder.is_dir():
-            valley_2_dir.rename(self.drive_video_folder)
-        elif valley_2_dir.is_dir() and self.drive_video_folder.is_dir():
-            for item in valley_2_dir.iterdir():
-                dest = self.drive_video_folder / item.name
+        def flush_staged():
+            files = [f for f in stage_dir.rglob("*") if f.is_file()]
+            if not files:
+                return
+            def _move(f):
+                dest = out_dir / f.name
                 if not dest.exists():
-                    shutil.move(str(item), str(self.drive_video_folder))
-            shutil.rmtree(valley_2_dir, ignore_errors=True)
+                    shutil.move(str(f), str(dest))
+                else:
+                    f.unlink()
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(_move, files))
 
-        self._fixup_nested_directory(self.drive_video_folder, "valley")
-        log_success(f"Extracted video files verified in {self.drive_video_folder}")
+        def do_drive_flush():
+            log_info("⏳ Flushing Drive FUSE cache to servers...")
+            try:
+                from google.colab import drive
+                drive.flush_and_unmount()
+                time.sleep(10)
+                drive.mount('/content/drive', force_remount=True)
+                time.sleep(15)
+            except Exception as e:
+                log_warn(f"Drive remount note: {e}")
+            free = shutil.disk_usage('/content').free / (1024**3) if os.path.exists('/content') else 100.0
+            log_success(f"Flush done. SSD free: {free:.1f} GB")
+
+        outer, inner = open_inner()
+        all_files = [f for f in inner.namelist() if not f.endswith('/')]
+        log_info(f"Total video files in archive: {len(all_files):,}")
+
+        done = {f.name for f in out_dir.iterdir()} if out_dir.exists() else set()
+        todo = [f for f in all_files if Path(f).name not in done]
+        log_info(f"Already done on Drive: {len(done):,} | Remaining: {len(todo):,}")
+
+        if not todo:
+            log_success("All videos already extracted on Google Drive!")
+            inner.close()
+            outer.close()
+            return True
+
+        t0 = time.time()
+        for i, fname in enumerate(todo):
+            inner.extract(fname, stage_dir)
+            need_flush_log = (i % batch_size == 0 and i > 0)
+            free_gb = shutil.disk_usage('/content').free / (1024**3) if os.path.exists('/content') else 100.0
+            need_drive_flush = free_gb < ssd_low_gb
+
+            if need_flush_log or need_drive_flush:
+                flush_staged()
+                elapsed = max(time.time() - t0, 1.0)
+                rate = (i + 1) / elapsed
+                eta_h = (len(todo) - i - 1) / rate / 3600
+                pct = (len(done) + i + 1) / len(all_files) * 100
+                log_info(f"[{len(done)+i+1:,}/{len(all_files):,}] {pct:.1f}% | {rate:.1f} f/s | ETA {eta_h:.1f}h | SSD {free_gb:.1f}GB free")
+
+            if need_drive_flush:
+                inner.close()
+                outer.close()
+                flush_staged()
+                if os.path.exists('/content/drive'):
+                    do_drive_flush()
+                outer, inner = open_inner()
+                t0 = time.time()
+
+        flush_staged()
+        if os.path.exists('/content/drive'):
+            do_drive_flush()
+        inner.close()
+        outer.close()
+        total_extracted = len(list(out_dir.iterdir()))
+        log_success(f"Extraction complete! {total_extracted:,} video files on Drive.")
         return True
 
     def sync_annotations_to_local(self):
