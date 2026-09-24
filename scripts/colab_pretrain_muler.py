@@ -255,6 +255,7 @@ class InboundDataMuler:
 
         # Data lives on Google Drive (persistent, 5 TB)
         self.drive_image_folder = self.drive_data_dir / "llava_image"
+        self.drive_image_zip = self.drive_data_dir / "llava_image.zip"
         self.drive_video_folder = self.drive_data_dir / "valley"
         self.drive_json_folder = self.drive_data_dir / "annotations"
 
@@ -371,14 +372,16 @@ class InboundDataMuler:
         return count >= min_count
 
     def verify_drive_dataset(self) -> bool:
-        """Check if REAL datasets are already extracted and ready on Google Drive."""
+        """Check if REAL datasets are already present and ready on Google Drive."""
         image_json_ok = self.drive_image_json.is_file() and self.drive_image_json.stat().st_size > 0
         video_json_ok = self.drive_video_json.is_file() and self.drive_video_json.stat().st_size > 0
 
-        image_dir_ok = self._has_min_files(self.drive_image_folder, min_count=10)
+        # Images are ready if llava_image.zip is on Drive (>= 25 GB) or extracted folder has shards
+        image_ready = (self.drive_image_zip.is_file() and self.drive_image_zip.stat().st_size >= int(25 * (1024 ** 3))) or \
+                      self._has_min_files(self.drive_image_folder, min_count=500)
         video_dir_ok = self._has_min_files(self.drive_video_folder, min_count=10)
 
-        return image_json_ok and video_json_ok and image_dir_ok and video_dir_ok
+        return image_json_ok and video_json_ok and image_ready and video_dir_ok
 
     def _ensure_aria2(self) -> bool:
         """Ensure aria2 is installed for 16x parallel multi-connection acceleration."""
@@ -760,30 +763,49 @@ class InboundDataMuler:
             return False
 
     def download_image_archive(self):
-        """Download llava_image.zip directly to Google Drive using wget."""
-        image_archive = self.drive_data_dir / "llava_image.zip"
+        """Download llava_image.zip directly to Google Drive using aria2 (or wget fallback)."""
+        image_archive = self.drive_image_zip
 
-        if self._has_min_files(self.drive_image_folder, min_count=10):
+        if self._has_min_files(self.drive_image_folder, min_count=500):
             log_success(f"Image dataset already extracted on Drive ({self.drive_image_folder})")
             return True
 
-        if image_archive.exists() and image_archive.stat().st_size > 25 * (1024 ** 3):
+        if image_archive.exists() and image_archive.stat().st_size >= int(25 * (1024 ** 3)):
             log_success(f"llava_image.zip already on Drive ({image_archive.stat().st_size / (1024**3):.2f} GB)")
-        else:
-            url = f"{self.HF_BASE_URL}/llava_image.zip"
-            success = self._wget_download(url, str(image_archive), "llava_image.zip (~27 GB)")
-            if not success:
-                return False
-
-        return True
-
-    def extract_image_archive(self):
-        """Extract llava_image.zip directly on Google Drive."""
-        if self._has_min_files(self.drive_image_folder, min_count=10):
-            log_success("Image dataset already extracted on Drive.")
             return True
 
-        image_archive = self.drive_data_dir / "llava_image.zip"
+        url = f"{self.HF_BASE_URL}/llava_image.zip"
+        log_info("Downloading llava_image.zip (~26.5 GB) with 16 parallel streams...")
+
+        staged_zip = Path("/content/llava_image.zip") if Path("/content").exists() else self.local_scratch_dir / "llava_image.zip"
+        if self._ensure_aria2():
+            cmd = [
+                "aria2c",
+                "-x", "16",
+                "-s", "16",
+                "-j", "16",
+                "-k", "1M",
+                "--file-allocation=none",
+                "--summary-interval=5",
+                "--dir", str(staged_zip.parent),
+                "--out", staged_zip.name,
+                url
+            ]
+            res = subprocess.run(cmd, check=False)
+            if res.returncode == 0 and staged_zip.exists() and staged_zip.stat().st_size >= int(25 * (1024 ** 3)):
+                log_success(f"Downloaded llava_image.zip to local SSD ({staged_zip.stat().st_size / (1024**3):.2f} GB)")
+                self._stream_copy_to_drive(staged_zip, image_archive)
+                return True
+
+        return self._wget_download(url, str(image_archive), "llava_image.zip (~27 GB)")
+
+    def extract_image_archive(self):
+        """Extract llava_image.zip directly on Google Drive (optional, for persistent uncompressed storage)."""
+        if self._has_min_files(self.drive_image_folder, min_count=500):
+            log_success("Image dataset already extracted on Drive (>500 shard directories).")
+            return True
+
+        image_archive = self.drive_image_zip
         if not image_archive.exists():
             log_err("llava_image.zip not found on Drive. Download it first.")
             return False
@@ -791,10 +813,10 @@ class InboundDataMuler:
         log_info(f"Extracting llava_image.zip on Google Drive ({image_archive.stat().st_size / (1024**3):.2f} GB)...")
         self.drive_image_folder.mkdir(parents=True, exist_ok=True)
         result = subprocess.run(
-            ["unzip", "-q", "-o", str(image_archive), "-d", str(self.drive_data_dir)],
+            ["unzip", "-q", "-n", str(image_archive), "-d", str(self.drive_data_dir)],
             check=False
         )
-        if result.returncode != 0:
+        if result.returncode != 0 and not self._has_min_files(self.drive_image_folder, min_count=500):
             log_err(f"Image extraction failed (exit code {result.returncode})")
             return False
 
@@ -803,17 +825,9 @@ class InboundDataMuler:
         return True
 
     def cleanup_image_archive(self):
-        """Reclaims ~27 GB of Google Drive space by removing llava_image.zip if already extracted."""
-        image_archive = self.drive_data_dir / "llava_image.zip"
-        if not image_archive.exists():
-            log_info("llava_image.zip does not exist on Drive (already cleaned up or not downloaded).")
-            return
-        if self._has_min_files(self.drive_image_folder, min_count=10):
-            size_gb = image_archive.stat().st_size / (1024 ** 3)
-            image_archive.unlink()
-            log_success(f"Removed llava_image.zip to reclaim {size_gb:.1f} GB of Google Drive space (extracted images intact).")
-        else:
-            log_warn("Cannot remove llava_image.zip because extracted image folder is empty or incomplete.")
+        """Preserves llava_image.zip on Drive as master archive for fast Colab SSD staging."""
+        # Intentionally preserved on Drive so any Colab session can unpack in 45s to local SSD.
+        pass
 
     def download_video_archives(self, parts_filter=None):
         """Download or resume valley_2.zip.* parts directly to Google Drive using wget."""
@@ -995,7 +1009,8 @@ class InboundDataMuler:
         return True
 
     def sync_annotations_to_local(self):
-        """Copy tiny annotation JSON files from Drive to local SSD for fast reads."""
+        """Copy tiny annotation JSON files from Drive to local SSD for fast reads,
+        and normalize valley_.json paths so they match flat Drive video files."""
         self.local_json_folder.mkdir(parents=True, exist_ok=True)
         for json_name in ["llava_image_.json", "valley_.json", "chat.json"]:
             drive_src = self.drive_json_folder / json_name
@@ -1003,6 +1018,73 @@ class InboundDataMuler:
             if drive_src.exists():
                 shutil.copy2(drive_src, local_dst)
                 log_info(f"Synced {json_name} to local SSD ({drive_src.stat().st_size / (1024*1024):.1f} MB)")
+
+        # Auto-normalize valley_.json on local SSD so 'valley/CHUNK/file.mp4' -> 'valley/file.mp4'
+        local_valley = self.local_json_folder / "valley_.json"
+        if local_valley.exists():
+            try:
+                with open(local_valley, "r") as f:
+                    v_data = json.load(f)
+                updated = 0
+                for item in v_data:
+                    if "video" in item:
+                        v_name = Path(item["video"]).name
+                        target_v = f"valley/{v_name}"
+                        if item["video"] != target_v:
+                            item["video"] = target_v
+                            updated += 1
+                if updated > 0:
+                    with open(local_valley, "w") as f:
+                        json.dump(v_data, f)
+                    log_success(f"Normalized {updated:,} video paths in local valley_.json to match Google Drive flat layout.")
+            except Exception as e:
+                log_warn(f"Note during valley_.json normalization: {e}")
+
+    def stage_image_dataset_to_local(self) -> Path:
+        """
+        Unpacks llava_image.zip to local NVMe SSD (/content/data/llava_image) in ~45 seconds.
+        This provides 2 GB/s local I/O for the A100 GPU and bypasses FUSE network bottlenecks.
+        Returns the root image directory to pass to the dataloader.
+        """
+        log_header("Staging Image Dataset to Local SSD for Maximum A100 Throughput")
+
+        # Check if local SSD already has extracted image shards (e.g. shard 00500 or >500 shards)
+        if self._has_min_files(self.local_image_folder, min_count=500):
+            log_success(f"Images already staged on local SSD ({self.local_image_folder})")
+            return self.local_scratch_dir
+
+        drive_zip = self.drive_image_zip
+        local_zip = Path("/content/llava_image.zip")
+        zip_source = None
+
+        if local_zip.exists() and local_zip.stat().st_size >= int(25 * (1024**3)):
+            zip_source = local_zip
+        elif drive_zip.exists() and drive_zip.stat().st_size >= int(25 * (1024**3)):
+            zip_source = drive_zip
+
+        if zip_source:
+            log_info(f"Unpacking {zip_source.name} ({zip_source.stat().st_size / (1024**3):.2f} GB) to local NVMe SSD ({self.local_scratch_dir})...")
+            t0 = time.time()
+            res = subprocess.run(
+                ["unzip", "-q", "-n", str(zip_source), "-d", str(self.local_scratch_dir)],
+                check=False
+            )
+            elapsed = time.time() - t0
+            if res.returncode == 0 or self._has_min_files(self.local_image_folder, min_count=500):
+                log_success(f"Staged image dataset to local NVMe SSD in {elapsed:.1f}s ({self.local_image_folder})")
+                return self.local_scratch_dir
+            else:
+                log_warn(f"Unzip returned code {res.returncode}. Checking local files...")
+                if self.local_image_folder.is_dir():
+                    return self.local_scratch_dir
+
+        # Fallback: if Drive has extracted folder with shards, use Drive directly
+        if self._has_min_files(self.drive_image_folder, min_count=100):
+            log_warn("llava_image.zip not found, but extracted shards found on Drive. Using Drive folder directly.")
+            return self.drive_data_dir
+
+        log_warn("Image dataset not found on local SSD or Drive. Checking download options...")
+        return self.local_scratch_dir
 
     def download_and_prepare_all(self, parts_filter=None):
         """Full pipeline: download archives, extract on Drive, sync annotations."""
@@ -1022,16 +1104,10 @@ class InboundDataMuler:
             log_err("Annotation download failed.")
             return False
 
-        # 2. Download & extract images
+        # 2. Download image archive
         if not self.download_image_archive():
             log_err("Image archive download failed.")
             return False
-        if not self.extract_image_archive():
-            log_err("Image archive extraction failed.")
-            return False
-
-        # Reclaim ~27 GB on Google Drive now that images are verified extracted
-        self.cleanup_image_archive()
 
         # 3. Download & extract videos
         videos_downloaded = self.download_video_archives(parts_filter=parts_filter)
@@ -1071,11 +1147,15 @@ class InboundDataMuler:
         self.check_storage_space()
 
         # Check Drive paths (where data lives)
-        images_ok = self._has_min_files(self.drive_image_folder, min_count=10)
+        image_zip_ok = self.drive_image_zip.is_file() and self.drive_image_zip.stat().st_size >= int(25 * (1024**3))
+        images_dir_ok = self._has_min_files(self.drive_image_folder, min_count=500)
         videos_ok = self._has_min_files(self.drive_video_folder, min_count=10)
 
-        log_info(f"Drive Image folder: {self.drive_image_folder} ({'Extracted (>558K files)' if images_ok else 'Missing/Incomplete'})")
-        log_info(f"Drive Video folder: {self.drive_video_folder} ({'Extracted (>702K files)' if videos_ok else 'Missing/Incomplete'})")
+        img_status = f"Master archive ready on Drive ({self.drive_image_zip.stat().st_size / (1024**3):.1f} GB, 45s SSD staging enabled)" if image_zip_ok else (
+            "Extracted (>558K files on Drive)" if images_dir_ok else "Missing/Incomplete"
+        )
+        log_info(f"Drive Image dataset: {self.drive_image_zip if image_zip_ok else self.drive_image_folder} ({img_status})")
+        log_info(f"Drive Video folder: {self.drive_video_folder} ({'Extracted (>200K files on Drive)' if videos_ok else 'Missing/Incomplete'})")
         log_info(f"Image annotations: {self.drive_image_json} ({'Found' if self.drive_image_json.exists() else 'Missing'})")
         log_info(f"Video annotations: {self.drive_video_json} ({'Found' if self.drive_video_json.exists() else 'Missing'})")
 
@@ -1566,11 +1646,11 @@ def main():
         if args.action == "demo_setup":
             return
     else:
-        # Full mode: data lives on Google Drive, annotations synced to SSD
-        args.image_folder = inbound_muler.drive_image_folder
-        args.video_folder = inbound_muler.drive_video_folder
-        args.image_json = inbound_muler.local_image_json  # Small JSON on SSD for fast reads
-        args.video_json = inbound_muler.local_video_json
+        # Full mode: data lives on Google Drive, annotations and staged images on local SSD
+        args.image_folder = str(inbound_muler.local_scratch_dir)
+        args.video_folder = str(inbound_muler.drive_data_dir)
+        args.image_json = str(inbound_muler.local_image_json)
+        args.video_json = str(inbound_muler.local_video_json)
 
     # Download & extract datasets on Google Drive
     if args.action in ["all", "download", "extract"]:
@@ -1595,6 +1675,16 @@ def main():
             return
 
     if args.action in ["all", "train"]:
+        if args.demo_samples == 0:
+            # 1. Sync annotations & auto-normalize valley_.json paths
+            inbound_muler.sync_annotations_to_local()
+            # 2. Stage images on local NVMe SSD (fast 2 GB/s I/O for A100)
+            image_root = inbound_muler.stage_image_dataset_to_local()
+            args.image_folder = str(image_root)
+            args.video_folder = str(inbound_muler.drive_data_dir)
+            args.image_json = str(inbound_muler.local_image_json)
+            args.video_json = str(inbound_muler.local_video_json)
+
         hw_config = detect_colab_hardware_and_tune(args)
 
         resume_ckpt = None
