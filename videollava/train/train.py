@@ -875,6 +875,10 @@ class DataCollatorForSupervisedDataset(object):
         #         batch['images'] = images
         else:
             raise ValueError(f'pretrain, {instances}')
+        if "images" in batch:
+            batch["images"] = [image.to(dtype=torch.bfloat16) if image.dtype == torch.float32 else image for image in batch["images"]]
+        if "videos" in batch:
+            batch["videos"] = [video.to(dtype=torch.bfloat16) if video.dtype == torch.float32 else video for video in batch["videos"]]
         return batch
 
 
