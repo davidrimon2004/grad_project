@@ -230,7 +230,7 @@ class InboundFineTuneMuler:
                 log_warn(f"  • {label:28s}: unable to read disk usage ({e})")
 
     def _prune_caches(self):
-        """Prune Colab SSD caches to prevent running out of local disk space."""
+        """Prune Colab SSD temp caches to maximize SSD free space."""
         for item in Path("/tmp").glob("*"):
             try:
                 if item.is_file() or item.is_symlink():
@@ -239,23 +239,10 @@ class InboundFineTuneMuler:
                     shutil.rmtree(item, ignore_errors=True)
             except Exception:
                 pass
-
         shutil.rmtree("/root/.cache/pip", ignore_errors=True)
 
-        drivefs_cache = Path("/root/.config/Google/DriveFS")
-        if drivefs_cache.exists():
-            shutil.rmtree(str(drivefs_cache), ignore_errors=True)
-
     def _flush_drive_fuse(self):
-        try:
-            from google.colab import drive
-            log_info("Flushing Google Drive FUSE write buffers...")
-            drive.flush_and_unmount()
-            drive.mount('/content/drive')
-            _ensure_mydrive_symlink('/content/drive')
-            log_success("Google Drive remounted cleanly.")
-        except Exception:
-            pass
+        pass
 
     def _ensure_aria2(self) -> bool:
         if shutil.which("aria2c"):
@@ -267,18 +254,66 @@ class InboundFineTuneMuler:
             pass
         return shutil.which("aria2c") is not None
 
+    def _direct_stream_from_url_to_drive(self, url: str, drive_target: Path, min_bytes: int, chunk_size: int = 16 * 1024 * 1024) -> bool:
+        """
+        Directly stream from HuggingFace HTTP to Google Drive with ZERO local SSD usage.
+        Memory buffer only (16 MB chunks). Protects Colab SSD from ever filling up.
+        """
+        import urllib.request
+        drive_target = get_actual_drive_path(drive_target)
+        os.makedirs(str(drive_target.parent), exist_ok=True)
+        log_info(f"Direct streaming {drive_target.name} to Google Drive (Zero local SSD usage)...")
+
+        initial_bytes = 0
+        if drive_target.exists():
+            initial_bytes = drive_target.stat().st_size
+            if initial_bytes >= min_bytes:
+                log_success(f"✓ {drive_target.name} is already complete on Google Drive ({initial_bytes / (1024**3):.2f} GB)!")
+                return True
+            if initial_bytes > 0:
+                log_info(f"Resuming {drive_target.name} on Drive from byte {initial_bytes:,} ({initial_bytes / (1024**3):.2f} GB)...")
+
+        headers = {"User-Agent": "Mozilla/5.0"}
+        if initial_bytes > 0:
+            headers["Range"] = f"bytes={initial_bytes}-"
+
+        req = urllib.request.Request(url, headers=headers)
+        mode = "ab" if initial_bytes > 0 else "wb"
+        start_t = time.time()
+        downloaded = initial_bytes
+
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp, open(drive_target, mode) as fdst:
+                content_len = int(resp.headers.get("Content-Length", 0))
+                total_bytes = content_len + initial_bytes if content_len > 0 else int(39 * (1024**3))
+                total_gb = total_bytes / (1024 ** 3)
+                last_log = time.time()
+                while True:
+                    buf = resp.read(chunk_size)
+                    if not buf:
+                        break
+                    fdst.write(buf)
+                    downloaded += len(buf)
+                    if time.time() - last_log >= 15:
+                        pct = (downloaded / total_bytes * 100) if total_bytes > 0 else 0
+                        speed = (downloaded - initial_bytes) / (1024 ** 2) / max(time.time() - start_t, 1)
+                        log_info(f"Direct stream: {downloaded / (1024**3):.2f} / {total_gb:.1f} GB ({pct:.1f}%) [{speed:.1f} MB/s]")
+                        last_log = time.time()
+
+            elapsed = max(time.time() - start_t, 1.0)
+            speed_mbs = ((downloaded - initial_bytes) / (1024 ** 2)) / elapsed
+            log_success(f"✓ Direct streamed {drive_target.name} to Drive in {elapsed/60:.1f}m ({speed_mbs:.1f} MB/s)!")
+            return drive_target.exists() and drive_target.stat().st_size >= min_bytes
+        except Exception as e:
+            log_err(f"Direct stream error for {drive_target.name}: {e}")
+            return False
+
     def _stream_copy_to_drive(self, local_path: Path, drive_path: Path, chunk_size: int = 64 * 1024 * 1024):
         size_gb = local_path.stat().st_size / (1024 ** 3)
         log_info(f"Transferring {local_path.name} to Google Drive ({size_gb:.2f} GB)...")
 
         drive_path = get_actual_drive_path(drive_path)
         os.makedirs(str(drive_path.parent), exist_ok=True)
-
-        if not drive_path.parent.is_dir():
-            log_warn(f"Drive path {drive_path.parent} not visible. Re-mounting Drive...")
-            mount_google_drive(force=True)
-            drive_path = get_actual_drive_path(drive_path)
-            os.makedirs(str(drive_path.parent), exist_ok=True)
 
         if drive_path.exists():
             drive_path.unlink(missing_ok=True)
@@ -287,7 +322,6 @@ class InboundFineTuneMuler:
         start_t = time.time()
         open_mode = "r+b" if os.access(local_path, os.W_OK) else "rb"
 
-        # Open destination with retries in case Drive FUSE was temporarily lagging
         fdst = None
         for attempt in range(1, 4):
             try:
@@ -297,9 +331,6 @@ class InboundFineTuneMuler:
             except (FileNotFoundError, OSError) as e:
                 log_warn(f"Attempt {attempt}/3 to open {drive_path} failed: {e}")
                 if attempt < 3:
-                    mount_google_drive(force=True)
-                    drive_path = get_actual_drive_path(drive_path)
-                    os.makedirs(str(drive_path.parent), exist_ok=True)
                     time.sleep(2)
                 else:
                     raise
@@ -329,7 +360,6 @@ class InboundFineTuneMuler:
             if fdst:
                 fdst.close()
 
-        # Verify Drive target size matches before unlinking staged SSD copy
         if drive_path.exists() and drive_path.stat().st_size >= int(size_gb * 0.99 * (1024**3)):
             local_path.unlink(missing_ok=True)
             self._prune_caches()
@@ -340,24 +370,47 @@ class InboundFineTuneMuler:
             return True
 
     def _download_part(self, url: str, part_name: str, drive_target: Path, min_bytes: int) -> bool:
+        drive_target = get_actual_drive_path(drive_target)
+
+        # 1. PRIORITY: Check if already complete on Google Drive
         if drive_target.exists() and drive_target.stat().st_size >= min_bytes:
             log_success(f"✓ {part_name} is already complete on Google Drive ({drive_target.stat().st_size / (1024**3):.2f} GB)!")
+            staged = Path("/content/_staging") / part_name
+            staged.unlink(missing_ok=True)
             return True
 
+        # 2. RESUME CHECK: If Drive already has a substantial partial (>50 MB),
+        # resume directly on Drive with HTTP Range. Zero local SSD usage!
+        try:
+            drive_size = drive_target.stat().st_size if drive_target.exists() else 0
+        except Exception:
+            drive_size = 0
+
+        if drive_size > 50 * 1024 * 1024:
+            log_info(f"Existing partial found on Drive for {part_name} ({drive_size / (1024**3):.2f} GB). Resuming directly on Drive...")
+            # Delete local staged copy to immediately reclaim SSD space!
+            staged = Path("/content/_staging") / part_name
+            staged.unlink(missing_ok=True)
+            self._prune_caches()
+            return self._direct_stream_from_url_to_drive(url, drive_target, min_bytes)
+
+        # 3. Check staging directory on SSD
         staging_dir = Path("/content/_staging")
         staging_dir.mkdir(parents=True, exist_ok=True)
         staged_file = staging_dir / part_name
 
-        if staged_file.exists() and staged_file.stat().st_size >= min_bytes:
-            log_success(f"✓ {part_name} already in local SSD staging. Copying to Drive...")
-            return self._stream_copy_to_drive(staged_file, drive_target)
-
-        # Check local SSD free space
         self._prune_caches()
         free_ssd = shutil.disk_usage(staging_dir).free / (1024 ** 3)
-        has_aria2 = self._ensure_aria2()
+        log_info(f"Local SSD free space: {free_ssd:.1f} GB")
 
-        if has_aria2 and free_ssd >= 42.0:
+        # If SSD free space is tight (< 42 GB), use Direct Stream (Zero local SSD usage)
+        if free_ssd < 42.0:
+            log_info(f"SSD space ({free_ssd:.1f} GB) is tight for 39 GB staging. Direct streaming {part_name} to Drive (Zero SSD usage)...")
+            return self._direct_stream_from_url_to_drive(url, drive_target, min_bytes)
+
+        # 4. If SSD has >= 42 GB free, use accelerated aria2c staging
+        has_aria2 = self._ensure_aria2()
+        if has_aria2:
             log_info(f"🚀 Downloading {part_name} via aria2c (16 parallel connections on SSD)...")
             cmd = [
                 "aria2c",
@@ -374,38 +427,18 @@ class InboundFineTuneMuler:
             res = subprocess.run(cmd, check=False)
             if res.returncode == 0 and staged_file.exists() and staged_file.stat().st_size >= min_bytes:
                 log_success(f"✓ Downloaded {part_name} to SSD ({staged_file.stat().st_size / (1024**3):.2f} GB)")
-                self._stream_copy_to_drive(staged_file, drive_target)
-                self._flush_drive_fuse()
-                return True
+                try:
+                    self._stream_copy_to_drive(staged_file, drive_target)
+                    return True
+                except OSError as e:
+                    if e.errno == 28:
+                        log_warn(f"[Errno 28] Local SSD full during copy. Switching to Direct Stream for {part_name}...")
+                        staged_file.unlink(missing_ok=True)
+                        return self._direct_stream_from_url_to_drive(url, drive_target, min_bytes)
+                    raise
 
-        # Fallback: direct HTTP streaming with range resume
-        import urllib.request
-        log_info(f"Direct streaming {part_name} to Google Drive (Zero local SSD usage)...")
-        initial_bytes = drive_target.stat().st_size if drive_target.exists() else 0
-        headers = {"User-Agent": "Mozilla/5.0"}
-        if initial_bytes > 0:
-            headers["Range"] = f"bytes={initial_bytes}-"
-            log_info(f"Resuming {part_name} on Drive from byte {initial_bytes} ({initial_bytes / (1024**3):.2f} GB)...")
-
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=120) as resp, open(drive_target, "ab" if initial_bytes > 0 else "wb") as fdst:
-            total_bytes = int(resp.headers.get("Content-Length", 0)) + initial_bytes
-            downloaded = initial_bytes
-            start_t = time.time()
-            last_log = start_t
-            while True:
-                buf = resp.read(16 * 1024 * 1024)
-                if not buf:
-                    break
-                fdst.write(buf)
-                downloaded += len(buf)
-                if time.time() - last_log >= 15:
-                    pct = (downloaded / total_bytes * 100) if total_bytes > 0 else 0
-                    speed = (downloaded - initial_bytes) / (1024 ** 2) / max(time.time() - start_t, 1)
-                    log_info(f"Direct stream: {downloaded / (1024**3):.2f} / {total_bytes / (1024**3):.1f} GB ({pct:.1f}%) [{speed:.1f} MB/s]")
-                    last_log = time.time()
-
-        return drive_target.exists() and drive_target.stat().st_size >= min_bytes
+        # Fallback: direct streaming
+        return self._direct_stream_from_url_to_drive(url, drive_target, min_bytes)
 
     def download_annotations(self) -> bool:
         log_header("1. Downloading Fine-Tuning Annotation JSONs")
