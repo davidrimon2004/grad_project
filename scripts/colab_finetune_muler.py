@@ -86,24 +86,74 @@ def is_colab_environment() -> bool:
         return "COLAB_GPU" in os.environ or "COLAB_RELEASE_TAG" in os.environ or (os.name != "nt" and os.path.exists("/content"))
 
 
-def mount_google_drive(mount_point: str = "/content/drive") -> bool:
+def mount_google_drive(mount_point: str = "/content/drive", force: bool = False) -> bool:
     if not is_colab_environment():
         log_info("Not running in Google Colab. Using local directory paths.")
         return True
 
-    if os.path.ismount(mount_point) or os.path.exists(os.path.join(mount_point, "MyDrive")):
+    # Check if actually mounted in /proc/mounts
+    is_mounted = False
+    try:
+        with open("/proc/mounts", "r") as f:
+            for line in f:
+                if mount_point in line:
+                    is_mounted = True
+                    break
+    except Exception:
+        is_mounted = os.path.ismount(mount_point)
+
+    has_drive_folder = os.path.exists(os.path.join(mount_point, "MyDrive")) or os.path.exists(os.path.join(mount_point, "My Drive"))
+
+    if is_mounted and has_drive_folder and not force:
+        _ensure_mydrive_symlink(mount_point)
         log_success(f"Google Drive already mounted at {mount_point}")
         return True
 
     try:
         log_info(f"Mounting Google Drive to {mount_point}...")
         from google.colab import drive
+        if force:
+            try:
+                drive.flush_and_unmount()
+            except Exception:
+                pass
         drive.mount(mount_point)
+        _ensure_mydrive_symlink(mount_point)
         log_success(f"Google Drive successfully mounted at {mount_point}")
         return True
     except Exception as e:
         log_err(f"Failed to mount Google Drive: {e}")
         return False
+
+
+def _ensure_mydrive_symlink(mount_point: str = "/content/drive"):
+    """Ensure /content/drive/MyDrive exists as a symlink to /content/drive/My Drive if needed."""
+    my_drive_spaced = os.path.join(mount_point, "My Drive")
+    my_drive_nospace = os.path.join(mount_point, "MyDrive")
+    try:
+        if os.path.exists(my_drive_spaced) and not os.path.exists(my_drive_nospace):
+            os.symlink(my_drive_spaced, my_drive_nospace)
+            log_info(f"Created symlink: {my_drive_nospace} -> {my_drive_spaced}")
+    except Exception:
+        pass
+
+
+def get_actual_drive_path(path: Path) -> Path:
+    """Resolve Google Drive paths robustly across 'MyDrive' vs 'My Drive'."""
+    p_str = str(path)
+    if os.path.exists(p_str):
+        return Path(p_str)
+
+    if "MyDrive" in p_str:
+        alt = p_str.replace("MyDrive", "My Drive")
+        if os.path.exists(alt) or os.path.exists(os.path.dirname(alt)):
+            return Path(alt)
+    elif "My Drive" in p_str:
+        alt = p_str.replace("My Drive", "MyDrive")
+        if os.path.exists(alt) or os.path.exists(os.path.dirname(alt)):
+            return Path(alt)
+
+    return Path(p_str)
 
 
 # ==============================================================================
@@ -134,7 +184,7 @@ class InboundFineTuneMuler:
     VIDEO_PART_MIN_BYTES["videochatgpt_tune_2.zip.005"] = int(3.5 * (1024 ** 3))
 
     def __init__(self, drive_root: str, local_scratch_dir: str = "/content/data"):
-        self.drive_root = Path(drive_root)
+        self.drive_root = get_actual_drive_path(Path(drive_root))
         self.drive_data_dir = self.drive_root / "datasets"
         self.local_scratch_dir = Path(local_scratch_dir)
 
@@ -152,10 +202,10 @@ class InboundFineTuneMuler:
         self.local_ft_json_dir = self.local_scratch_dir / "ft_json"
 
         # Create base dirs
-        self.drive_data_dir.mkdir(parents=True, exist_ok=True)
-        self.drive_ft_json_dir.mkdir(parents=True, exist_ok=True)
-        self.local_scratch_dir.mkdir(parents=True, exist_ok=True)
-        self.local_ft_json_dir.mkdir(parents=True, exist_ok=True)
+        os.makedirs(str(self.drive_data_dir), exist_ok=True)
+        os.makedirs(str(self.drive_ft_json_dir), exist_ok=True)
+        os.makedirs(str(self.local_scratch_dir), exist_ok=True)
+        os.makedirs(str(self.local_ft_json_dir), exist_ok=True)
 
     def check_storage(self):
         log_header("Storage Diagnostic & Capacity Check")
@@ -175,7 +225,7 @@ class InboundFineTuneMuler:
                 free_gb = usage.free / (1024 ** 3)
                 total_gb = usage.total / (1024 ** 3)
                 pct = (usage.used / usage.total) * 100 if usage.total > 0 else 0
-                log_info(f"  • {label:28s}: {free_gb:6.1f} GB free / {total_gb:6.1f} GB total ({pct:5.1f}% used)")
+                log_info(f"  • {label:28s}: {free_gb:6.1f} GB free / {total_gb:6.1f} GB total ({pct:5.1f}% used) [{path}]")
             except Exception as e:
                 log_warn(f"  • {label:28s}: unable to read disk usage ({e})")
 
@@ -202,6 +252,7 @@ class InboundFineTuneMuler:
             log_info("Flushing Google Drive FUSE write buffers...")
             drive.flush_and_unmount()
             drive.mount('/content/drive')
+            _ensure_mydrive_symlink('/content/drive')
             log_success("Google Drive remounted cleanly.")
         except Exception:
             pass
@@ -219,37 +270,74 @@ class InboundFineTuneMuler:
     def _stream_copy_to_drive(self, local_path: Path, drive_path: Path, chunk_size: int = 64 * 1024 * 1024):
         size_gb = local_path.stat().st_size / (1024 ** 3)
         log_info(f"Transferring {local_path.name} to Google Drive ({size_gb:.2f} GB)...")
-        drive_path.parent.mkdir(parents=True, exist_ok=True)
+
+        drive_path = get_actual_drive_path(drive_path)
+        os.makedirs(str(drive_path.parent), exist_ok=True)
+
+        if not drive_path.parent.is_dir():
+            log_warn(f"Drive path {drive_path.parent} not visible. Re-mounting Drive...")
+            mount_google_drive(force=True)
+            drive_path = get_actual_drive_path(drive_path)
+            os.makedirs(str(drive_path.parent), exist_ok=True)
+
         if drive_path.exists():
             drive_path.unlink(missing_ok=True)
+            time.sleep(0.5)
 
         start_t = time.time()
         open_mode = "r+b" if os.access(local_path, os.W_OK) else "rb"
-        with open(local_path, open_mode) as fsrc, open(drive_path, "wb") as fdst:
-            offset = 0
-            last_log = time.time()
-            total_bytes = local_path.stat().st_size
-            while True:
-                buf = fsrc.read(chunk_size)
-                if not buf:
-                    break
-                fdst.write(buf)
-                try:
-                    if open_mode == "r+b" and hasattr(os, "fallocate"):
-                        os.fallocate(fsrc.fileno(), 0x03, offset, len(buf))
-                except Exception:
-                    pass
-                offset += len(buf)
-                if time.time() - last_log >= 15:
-                    pct = (offset / total_bytes) * 100 if total_bytes > 0 else 0
-                    speed = (offset / (1024 ** 2)) / max(time.time() - start_t, 1)
-                    log_info(f"Drive transfer: {offset / (1024**3):.2f} / {size_gb:.1f} GB ({pct:.1f}%) [{speed:.1f} MB/s]")
-                    last_log = time.time()
 
-        local_path.unlink(missing_ok=True)
-        self._prune_caches()
-        log_success(f"✓ Transferred {drive_path.name} to Drive!")
-        return True
+        # Open destination with retries in case Drive FUSE was temporarily lagging
+        fdst = None
+        for attempt in range(1, 4):
+            try:
+                os.makedirs(str(drive_path.parent), exist_ok=True)
+                fdst = open(drive_path, "wb")
+                break
+            except (FileNotFoundError, OSError) as e:
+                log_warn(f"Attempt {attempt}/3 to open {drive_path} failed: {e}")
+                if attempt < 3:
+                    mount_google_drive(force=True)
+                    drive_path = get_actual_drive_path(drive_path)
+                    os.makedirs(str(drive_path.parent), exist_ok=True)
+                    time.sleep(2)
+                else:
+                    raise
+
+        try:
+            with open(local_path, open_mode) as fsrc:
+                offset = 0
+                last_log = time.time()
+                total_bytes = local_path.stat().st_size
+                while True:
+                    buf = fsrc.read(chunk_size)
+                    if not buf:
+                        break
+                    fdst.write(buf)
+                    try:
+                        if open_mode == "r+b" and hasattr(os, "fallocate"):
+                            os.fallocate(fsrc.fileno(), 0x03, offset, len(buf))
+                    except Exception:
+                        pass
+                    offset += len(buf)
+                    if time.time() - last_log >= 15:
+                        pct = (offset / total_bytes) * 100 if total_bytes > 0 else 0
+                        speed = (offset / (1024 ** 2)) / max(time.time() - start_t, 1)
+                        log_info(f"Drive transfer: {offset / (1024**3):.2f} / {size_gb:.1f} GB ({pct:.1f}%) [{speed:.1f} MB/s]")
+                        last_log = time.time()
+        finally:
+            if fdst:
+                fdst.close()
+
+        # Verify Drive target size matches before unlinking staged SSD copy
+        if drive_path.exists() and drive_path.stat().st_size >= int(size_gb * 0.99 * (1024**3)):
+            local_path.unlink(missing_ok=True)
+            self._prune_caches()
+            log_success(f"✓ Transferred {drive_path.name} to Drive!")
+            return True
+        else:
+            log_warn(f"Drive file size verification pending. Preserving {local_path.name} on SSD.")
+            return True
 
     def _download_part(self, url: str, part_name: str, drive_target: Path, min_bytes: int) -> bool:
         if drive_target.exists() and drive_target.stat().st_size >= min_bytes:
