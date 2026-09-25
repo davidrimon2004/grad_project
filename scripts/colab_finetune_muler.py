@@ -42,6 +42,7 @@ import argparse
 import threading
 import signal
 import zipfile
+import struct
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, List, Dict
@@ -276,6 +277,145 @@ def get_actual_drive_path(path: Path) -> Path:
 
 
 # ==============================================================================
+# Streaming Multi-Part Zip Extractor (Zero Intermediate File Architecture)
+# ==============================================================================
+
+class MultiPartStream:
+    """Emulates a single contiguous, seekable binary stream across multiple split archive parts."""
+    def __init__(self, paths: List[str]):
+        self.paths = [str(p) for p in paths]
+        self.sizes = []
+        for p in self.paths:
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"Missing archive part: {p}")
+            self.sizes.append(os.path.getsize(p))
+        self.starts, t = [], 0
+        for s in self.sizes:
+            self.starts.append(t)
+            t += s
+        self.total = t
+        self._pos = 0
+        self._fhs = {}
+
+    def _fh(self, i: int):
+        if i not in self._fhs:
+            self._fhs[i] = open(self.paths[i], 'rb')
+        return self._fhs[i]
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seekable(self) -> bool:
+        return True
+
+    def seek(self, pos: int, whence: int = 0) -> int:
+        if whence == 0:
+            self._pos = pos
+        elif whence == 1:
+            self._pos += pos
+        elif whence == 2:
+            self._pos = self.total + pos
+        self._pos = max(0, min(self._pos, self.total))
+        return self._pos
+
+    def read(self, n: int = -1) -> bytes:
+        remain = (self.total - self._pos) if n < 0 else min(n, self.total - self._pos)
+        buf = bytearray()
+        while remain > 0:
+            idx = 0
+            for i in range(len(self.starts)):
+                if self.starts[i] <= self._pos:
+                    idx = i
+                else:
+                    break
+            loc = self._pos - self.starts[idx]
+            to_r = min(remain, self.sizes[idx] - loc)
+            fh = self._fh(idx)
+            fh.seek(loc)
+            chunk = fh.read(to_r)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            self._pos += len(chunk)
+            remain -= len(chunk)
+        return bytes(buf)
+
+    def close(self):
+        for fh in list(self._fhs.values()):
+            try:
+                fh.close()
+            except Exception:
+                pass
+        self._fhs.clear()
+
+
+def find_zip_data_offset_and_size(stream: MultiPartStream) -> tuple[int, int, str]:
+    """Finds byte offset, uncompressed payload size, and filename of the inner archive."""
+    stream.seek(0)
+    sig = stream.read(4)
+    if sig != b"PK\x03\x04":
+        raise ValueError(f"Invalid ZIP signature: {sig}")
+    stream.seek(18)
+    comp_size_32, uncomp_size_32 = struct.unpack('<II', stream.read(8))
+    stream.seek(26)
+    fn_len, extra_len = struct.unpack('<HH', stream.read(4))
+    stream.seek(30)
+    fn = stream.read(fn_len).decode('utf-8', errors='ignore')
+    extra = stream.read(extra_len)
+    offset = 30 + fn_len + extra_len
+
+    uncomp_size = uncomp_size_32
+    idx = 0
+    while idx + 4 <= len(extra):
+        tag, sz = struct.unpack('<HH', extra[idx:idx+4])
+        idx += 4
+        if tag == 1 and sz >= 16:
+            uncomp_size, _ = struct.unpack('<QQ', extra[idx:idx+16])
+            break
+        idx += sz
+
+    log_info(f"Inner archive payload: '{fn}' (offset: {offset}, size: {uncomp_size / (1024**3):.2f} GB)")
+    return offset, uncomp_size, fn
+
+
+class StreamSlice:
+    """Presents a bounded sub-slice of a stream as an independent seekable stream."""
+    def __init__(self, base, offset: int, size: int):
+        self.base = base
+        self.offset = offset
+        self.size = size
+        self._pos = 0
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seekable(self) -> bool:
+        return True
+
+    def seek(self, pos: int, whence: int = 0) -> int:
+        if whence == 0:
+            self._pos = pos
+        elif whence == 1:
+            self._pos += pos
+        elif whence == 2:
+            self._pos = self.size + pos
+        self._pos = max(0, min(self._pos, self.size))
+        return self._pos
+
+    def read(self, n: int = -1) -> bytes:
+        remain = (self.size - self._pos) if n < 0 else min(n, self.size - self._pos)
+        if remain <= 0:
+            return b""
+        self.base.seek(self.offset + self._pos)
+        chunk = self.base.read(remain)
+        self._pos += len(chunk)
+        return chunk
+
+    def close(self):
+        pass
+
+
+# ==============================================================================
 # Inbound Fine-Tuning Data Muler (HuggingFace/GDrive -> Google Drive)
 # ==============================================================================
 
@@ -448,7 +588,7 @@ class InboundFineTuneMuler:
             log_warn(f"Drive file size verification pending. Preserving {local_path.name} on SSD.")
             return True
 
-    def _direct_stream_from_url_to_drive(self, url: str, drive_target: Path, min_bytes: int) -> bool:
+    def _direct_stream_from_url_to_drive(self, url: str, drive_target: Path, min_bytes: int, max_retries: int = 15) -> bool:
         drive_target = self.drive_data_dir / drive_target.name
         os.makedirs(str(drive_target.parent), exist_ok=True)
 
@@ -456,70 +596,73 @@ class InboundFineTuneMuler:
             raise RuntimeError(f"Google Drive is not mounted! Refusing to stream {drive_target.name} to local SSD.")
 
         import urllib.request
-        log_info(f"Direct streaming {drive_target.name} to Google Drive (Zero local SSD staging)...")
-        headers = {"User-Agent": "Mozilla/5.0"}
-        req = urllib.request.Request(url, headers=headers)
 
-        # Retry loop to account for Google Drive FUSE inode update latency
-        fdst = None
-        for attempt in range(1, 6):
+        for attempt in range(1, max_retries + 1):
+            drive_target = self.drive_data_dir / drive_target.name
+            curr_bytes = drive_target.stat().st_size if drive_target.exists() else 0
+            if curr_bytes >= min_bytes:
+                log_success(f"✓ {drive_target.name} is already complete on Google Drive ({curr_bytes / (1024**3):.2f} GB)!")
+                return True
+
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            if curr_bytes > 0:
+                headers["Range"] = f"bytes={curr_bytes}-"
+                log_info(f"Resuming {drive_target.name} on Drive from byte {curr_bytes:,} ({curr_bytes / (1024**3):.2f} GB) [Attempt {attempt}/{max_retries}]...")
+            else:
+                log_info(f"Direct streaming {drive_target.name} to Google Drive (Zero local SSD staging) [Attempt {attempt}/{max_retries}]...")
+
+            mode = "ab" if curr_bytes > 0 else "wb"
+            fdst = None
             try:
-                drive_target = self.drive_data_dir / drive_target.name
-                os.makedirs(str(drive_target.parent), exist_ok=True)
-                fdst = open(drive_target, "wb")
-                break
-            except (FileNotFoundError, OSError) as e:
-                log_warn(f"Attempt {attempt}/5 to open {drive_target} on Drive failed: {e}")
-                if attempt < 5:
-                    time.sleep(2)
-                else:
-                    log_err(f"Could not open {drive_target} after 5 attempts.")
-                    return False
+                fdst = open(drive_target, mode)
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    content_len = resp.headers.get("Content-Length")
+                    total_bytes = (int(content_len) + curr_bytes) if content_len else min_bytes
+                    start_t = time.time()
+                    last_log = start_t
+                    chunk_size = 16 * 1024 * 1024
+                    downloaded_this_run = 0
+                    while True:
+                        buf = resp.read(chunk_size)
+                        if not buf:
+                            break
+                        fdst.write(buf)
+                        downloaded_this_run += len(buf)
+                        total_downloaded = curr_bytes + downloaded_this_run
+                        if time.time() - last_log >= 15:
+                            pct = (total_downloaded / total_bytes * 100) if total_bytes > 0 else 0
+                            speed = (downloaded_this_run / (1024 ** 2)) / max(time.time() - start_t, 1)
+                            log_info(f"Direct stream: {total_downloaded / (1024**3):.2f} / {total_bytes / (1024**3):.1f} GB ({pct:.1f}%) [{speed:.1f} MB/s]")
+                            last_log = time.time()
 
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                total_bytes = int(resp.headers.get("Content-Length", 0))
-                downloaded = 0
-                start_t = time.time()
-                last_log = start_t
-                chunk_size = 16 * 1024 * 1024
-                while True:
-                    buf = resp.read(chunk_size)
-                    if not buf:
-                        break
-                    fdst.write(buf)
-                    downloaded += len(buf)
-                    if time.time() - last_log >= 15:
-                        pct = (downloaded / total_bytes * 100) if total_bytes > 0 else 0
-                        speed = (downloaded / (1024 ** 2)) / max(time.time() - start_t, 1)
-                        log_info(f"Direct stream: {downloaded / (1024**3):.2f} / {total_bytes / (1024**3):.1f} GB ({pct:.1f}%) [{speed:.1f} MB/s]")
-                        last_log = time.time()
+                    fdst.flush()
+                    try:
+                        os.fsync(fdst.fileno())
+                    except Exception:
+                        pass
+            except Exception as e:
+                log_warn(f"Direct stream interrupted for {drive_target.name}: {e}. Retrying in 5s (attempt {attempt}/{max_retries})...")
+                time.sleep(5)
+            finally:
+                if fdst and not fdst.closed:
+                    try:
+                        fdst.close()
+                    except Exception:
+                        pass
 
-            fdst.flush()
-            try:
-                os.fsync(fdst.fileno())
-            except Exception:
-                pass
-        except Exception as e:
-            log_err(f"Direct stream error for {drive_target.name}: {e}")
-            return False
-        finally:
-            if fdst and not fdst.closed:
-                fdst.close()
+            self._prune_caches()
+            self._flush_drive_fuse()
 
-        elapsed = max(time.time() - start_t, 1.0)
-        speed_mbs = (downloaded / (1024 ** 2)) / elapsed
-        self._prune_caches()
-        self._flush_drive_fuse()
-        drive_target = self.drive_data_dir / drive_target.name
+            if drive_target.exists() and drive_target.stat().st_size >= min_bytes:
+                log_success(f"✓ Direct stream complete for {drive_target.name} ({drive_target.stat().st_size / (1024**3):.2f} GB)!")
+                return True
 
-        if drive_target.exists() and drive_target.stat().st_size >= min_bytes:
-            log_success(f"✓ Direct streamed {drive_target.name} to Drive in {elapsed/60:.1f}m ({speed_mbs:.1f} MB/s)!")
+        curr_size = drive_target.stat().st_size if drive_target.exists() else 0
+        if curr_size >= min_bytes:
             return True
-        else:
-            curr_size = drive_target.stat().st_size if drive_target.exists() else 0
-            log_err(f"Direct stream finished but size mismatch for {drive_target.name}: {curr_size} < {min_bytes}")
-            return False
+        log_err(f"Direct stream finished after {max_retries} attempts but size mismatch for {drive_target.name}: {curr_size} < {min_bytes}")
+        return False
 
     def _download_part(self, url: str, part_name: str, drive_target: Path, min_bytes: int) -> bool:
         drive_target = self.drive_data_dir / part_name
@@ -649,97 +792,218 @@ class InboundFineTuneMuler:
 
         return all_ok
 
+    def _streaming_extract(
+        self,
+        parts: List[str],
+        stage_dir: Path,
+        target_dataset_dir: Path,
+        dataset_name: str,
+        batch_size: int = 2500,
+        ssd_low_gb: float = 20.0,
+        workers: int = 8
+    ) -> bool:
+        """
+        Extracts multi-part zip archives directly to Google Drive via Virtual Streaming Architecture.
+        Emulates a continuous stream across split parts and mounts the inner archive with zipfile.
+        Extracts files to local fast NVMe SSD in small batches, then moves them to Google Drive in parallel.
+        Bypasses 7-Zip entirely and eliminates 72GB-172GB intermediate .zip files (Zero SSD exhaustion).
+        """
+        for p in parts:
+            if not os.path.exists(p):
+                log_err(f"Cannot extract {dataset_name}: missing archive part '{Path(p).name}'. Run with '--action download' first.")
+                return False
+
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        target_dataset_dir.mkdir(parents=True, exist_ok=True)
+
+        def open_inner():
+            for attempt in range(8):
+                try:
+                    if not os.path.exists(parts[0]):
+                        try:
+                            from google.colab import drive
+                            drive.mount('/content/drive', force_remount=True)
+                            time.sleep(10)
+                            _ensure_mydrive_symlink('/content/drive')
+                        except Exception:
+                            pass
+                    outer_stream = MultiPartStream(parts)
+                    off, sz, _ = find_zip_data_offset_and_size(outer_stream)
+                    inner_zip = zipfile.ZipFile(StreamSlice(outer_stream, off, sz))
+                    return outer_stream, inner_zip
+                except Exception as e:
+                    log_warn(f"Drive not ready ({e}), retrying in 20s... (attempt {attempt+1}/8)")
+                    time.sleep(20)
+            raise RuntimeError(f"Failed to open {dataset_name} zip archive after 8 attempts.")
+
+        def flush_staged():
+            files = [f for f in stage_dir.rglob("*") if f.is_file()]
+            if not files:
+                return
+
+            def _move(f: Path):
+                rel = f.relative_to(stage_dir)
+                rel_str = str(rel).replace("\\", "/")
+                if rel_str.startswith(f"{dataset_name}/"):
+                    dest = self.drive_data_dir / rel
+                else:
+                    dest = target_dataset_dir / rel
+
+                if not dest.exists():
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(f), str(dest))
+                else:
+                    f.unlink(missing_ok=True)
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(_move, files))
+
+        def do_drive_flush():
+            log_info("⏳ Flushing Drive FUSE write cache to cloud servers (do NOT interrupt)...")
+            try:
+                os.sync()
+                subprocess.run(["sync"], check=False)
+            except Exception:
+                pass
+            try:
+                from google.colab import drive
+                drive.flush_and_unmount()
+                time.sleep(10)
+                drive.mount('/content/drive', force_remount=True)
+                time.sleep(15)
+                _ensure_mydrive_symlink('/content/drive')
+            except Exception as e:
+                log_warn(f"  Drive remount note: {e}")
+            free = shutil.disk_usage('/content').free / (1024 ** 3) if os.path.exists('/content') else 100.0
+            log_success(f"  ✅ Flush done. SSD: {free:.1f} GB free")
+
+        # Flush any files remaining from previous interrupted run
+        flush_staged()
+
+        outer, inner = open_inner()
+        all_files = [f for f in inner.namelist() if not f.endswith('/')]
+        log_info(f"Total files in archive '{dataset_name}': {len(all_files):,}")
+
+        # Check existing files on Drive to resume seamlessly if interrupted
+        todo = []
+        if not target_dataset_dir.exists() or not any(target_dataset_dir.iterdir()):
+            todo = all_files
+        else:
+            log_info("Scanning existing files on Drive to resume...")
+            existing_rel = set()
+            for root, _, fs in os.walk(target_dataset_dir):
+                r_p = Path(root)
+                for f in fs:
+                    existing_rel.add(str((r_p / f).relative_to(self.drive_data_dir)).replace("\\", "/"))
+            todo = [
+                f for f in all_files
+                if (f if f.startswith(f"{dataset_name}/") else f"{dataset_name}/{f}") not in existing_rel
+            ]
+
+        done_count = len(all_files) - len(todo)
+        log_info(f"Already done on Drive: {done_count:,} | Remaining: {len(todo):,}")
+
+        if not todo:
+            log_success(f"✓ All files for {dataset_name} are already extracted on Google Drive!")
+            inner.close()
+            outer.close()
+            return True
+
+        t0 = time.time()
+        for i, fname in enumerate(todo):
+            inner.extract(fname, stage_dir)
+
+            need_flush_batch = (i > 0 and i % batch_size == 0)
+            free_gb = shutil.disk_usage('/content').free / (1024 ** 3) if os.path.exists('/content') else 100.0
+            need_drive_flush = free_gb < ssd_low_gb
+
+            if need_flush_batch or need_drive_flush:
+                flush_staged()
+                elapsed = max(time.time() - t0, 1.0)
+                rate = (i + 1) / elapsed
+                eta_h = (len(todo) - i - 1) / rate / 3600
+                pct = (done_count + i + 1) / len(all_files) * 100
+                current_free = shutil.disk_usage('/content').free / (1024 ** 3) if os.path.exists('/content') else 100.0
+                log_info(f"[{done_count+i+1:,}/{len(all_files):,}] {pct:.1f}% | {rate:.1f} f/s | ETA {eta_h:.1f}h | SSD {current_free:.1f}GB free")
+
+            if need_drive_flush:
+                inner.close()
+                outer.close()
+                flush_staged()
+                if os.path.exists('/content/drive'):
+                    do_drive_flush()
+                outer, inner = open_inner()
+                t0 = time.time()
+
+        flush_staged()
+        if os.path.exists('/content/drive'):
+            do_drive_flush()
+        inner.close()
+        outer.close()
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        log_success(f"✓ Streaming extraction complete for {dataset_name}!")
+        return True
+
     def extract_datasets_on_drive(self, clean_zips: bool = False) -> bool:
         log_header("Extracting Fine-Tuning Datasets on Google Drive")
-        try:
-            subprocess.run(["apt-get", "install", "-y", "-qq", "p7zip-full"], check=False)
-        except Exception:
-            pass
 
-        seven_zip = shutil.which("7z") or shutil.which("7za")
-        if not seven_zip:
-            log_err("7-Zip (p7zip-full) is required for extracting split archives directly on Drive.")
-            return False
+        # Proactively clean up any incomplete intermediate archives left from previous failed 7-Zip attempts
+        for intermediate in ["llava_image_tune.zip", "videochatgpt_tune.zip"]:
+            bad_zip = self.drive_data_dir / intermediate
+            if bad_zip.exists():
+                log_info(f"Removing intermediate 7-Zip archive {intermediate} ({bad_zip.stat().st_size / (1024**3):.1f} GB) to reclaim Drive storage...")
+                bad_zip.unlink(missing_ok=True)
 
         # 1. Extract Image Tuning Dataset
         self.drive_image_folder.mkdir(parents=True, exist_ok=True)
-        img_subdirs = ["coco", "gqa", "ocr_vqa", "textvqa", "vg"]
-        img_extracted = any((self.drive_image_folder / d).is_dir() for d in img_subdirs)
+        img_parts = [str(self.drive_data_dir / p) for p in self.IMAGE_TUNE_PARTS]
+        img_stage = Path("/content/_stage_img") if Path("/content").exists() else self.local_scratch_dir / "_stage_img"
+        log_info("Extracting Image Tuning dataset via Virtual Streaming Architecture (Zero intermediate .zip)...")
+        ok = self._streaming_extract(
+            parts=img_parts,
+            stage_dir=img_stage,
+            target_dataset_dir=self.drive_image_folder,
+            dataset_name="llava_image_tune",
+            batch_size=2500,
+            ssd_low_gb=20.0,
+            workers=8
+        )
+        if not ok:
+            log_err("Failed to extract image tuning dataset.")
+            return False
 
-        if img_extracted:
-            log_success(f"✓ Image tuning dataset is already extracted in {self.drive_image_folder}!")
-        else:
-            img_part1 = self.drive_data_dir / self.IMAGE_TUNE_PARTS[0]
-            inner_img_zip = self.drive_data_dir / "llava_image_tune.zip"
-            if inner_img_zip.exists() and inner_img_zip.stat().st_size < 65_000_000_000:
-                log_warn(f"Removing incomplete inner archive {inner_img_zip.name} ({inner_img_zip.stat().st_size / (1024**3):.1f} GB)...")
-                inner_img_zip.unlink(missing_ok=True)
-
-            if not inner_img_zip.exists() and img_part1.exists():
-                log_info("Stage 1/2: Unpacking outer split archive (llava_image_tune_2.zip.*) via 7-Zip...")
-                cmd = [seven_zip, "x", str(img_part1), f"-o{self.drive_data_dir}", "-y"]
-                res = subprocess.run(cmd, check=False)
-                if res.returncode != 0:
-                    log_err(f"Failed to unpack {img_part1.name}. Please ensure all parts are complete.")
-                    return False
-                log_success(f"Outer split unpacked: {inner_img_zip.name}")
-
-            if inner_img_zip.exists():
-                log_info(f"Stage 2/2: Extracting inner archive ({inner_img_zip.name}) into {self.drive_image_folder}...")
-                cmd = [seven_zip, "x", str(inner_img_zip), f"-o{self.drive_image_folder}", "-y"]
-                res = subprocess.run(cmd, check=False)
-                if res.returncode == 0:
-                    log_success(f"✓ Extracted image tuning data into {self.drive_image_folder}")
-                    inner_img_zip.unlink(missing_ok=True)
-                    log_info(f"Cleaned up intermediate {inner_img_zip.name}")
-                else:
-                    log_err(f"Failed to extract inner archive {inner_img_zip.name}")
-                    return False
-
-            if clean_zips:
-                for p in self.IMAGE_TUNE_PARTS:
-                    (self.drive_data_dir / p).unlink(missing_ok=True)
-                log_info("Cleaned up Image Tuning split archives.")
+        if clean_zips:
+            for p in self.IMAGE_TUNE_PARTS:
+                (self.drive_data_dir / p).unlink(missing_ok=True)
+            log_info("Cleaned up Image Tuning split archives.")
 
         # 2. Extract Video Tuning Dataset
         self.drive_video_folder.mkdir(parents=True, exist_ok=True)
-        vid_subdirs = ["Activity_Videos", "Activitynet_Zero_Shot_QA"]
-        vid_extracted = any((self.drive_video_folder / d).is_dir() for d in vid_subdirs)
+        vid_parts = [str(self.drive_data_dir / p) for p in self.VIDEO_TUNE_PARTS]
+        missing_vid = [p for p in vid_parts if not os.path.exists(p)]
+        if missing_vid:
+            log_warn(f"Video tuning parts not yet complete ({len(missing_vid)} missing). Run with '--action download' to finish downloading.")
+            return False
 
-        if vid_extracted:
-            log_success(f"✓ Video tuning dataset is already extracted in {self.drive_video_folder}!")
-        else:
-            vid_part1 = self.drive_data_dir / self.VIDEO_TUNE_PARTS[0]
-            inner_vid_zip = self.drive_data_dir / "videochatgpt_tune.zip"
-            if inner_vid_zip.exists() and inner_vid_zip.stat().st_size < 150_000_000_000:
-                log_warn(f"Removing incomplete inner archive {inner_vid_zip.name} ({inner_vid_zip.stat().st_size / (1024**3):.1f} GB)...")
-                inner_vid_zip.unlink(missing_ok=True)
+        vid_stage = Path("/content/_stage_vid") if Path("/content").exists() else self.local_scratch_dir / "_stage_vid"
+        log_info("Extracting Video Tuning dataset via Virtual Streaming Architecture (Zero intermediate .zip)...")
+        ok = self._streaming_extract(
+            parts=vid_parts,
+            stage_dir=vid_stage,
+            target_dataset_dir=self.drive_video_folder,
+            dataset_name="videochatgpt_tune",
+            batch_size=500,
+            ssd_low_gb=20.0,
+            workers=8
+        )
+        if not ok:
+            log_err("Failed to extract video tuning dataset.")
+            return False
 
-            if not inner_vid_zip.exists() and vid_part1.exists():
-                log_info("Stage 1/2: Unpacking outer split archive (videochatgpt_tune_2.zip.*) via 7-Zip...")
-                cmd = [seven_zip, "x", str(vid_part1), f"-o{self.drive_data_dir}", "-y"]
-                res = subprocess.run(cmd, check=False)
-                if res.returncode != 0:
-                    log_err(f"Failed to unpack {vid_part1.name}. Please ensure all parts are complete.")
-                    return False
-                log_success(f"Outer split unpacked: {inner_vid_zip.name}")
-
-            if inner_vid_zip.exists():
-                log_info(f"Stage 2/2: Extracting inner archive ({inner_vid_zip.name}) into {self.drive_video_folder}...")
-                cmd = [seven_zip, "x", str(inner_vid_zip), f"-o{self.drive_video_folder}", "-y"]
-                res = subprocess.run(cmd, check=False)
-                if res.returncode == 0:
-                    log_success(f"✓ Extracted video tuning data into {self.drive_video_folder}")
-                    inner_vid_zip.unlink(missing_ok=True)
-                    log_info(f"Cleaned up intermediate {inner_vid_zip.name}")
-                else:
-                    log_err(f"Failed to extract inner archive {inner_vid_zip.name}")
-                    return False
-
-            if clean_zips:
-                for p in self.VIDEO_TUNE_PARTS:
-                    (self.drive_data_dir / p).unlink(missing_ok=True)
-                log_info("Cleaned up Video Tuning split archives.")
+        if clean_zips:
+            for p in self.VIDEO_TUNE_PARTS:
+                (self.drive_data_dir / p).unlink(missing_ok=True)
+            log_info("Cleaned up Video Tuning split archives.")
 
         return True
 
