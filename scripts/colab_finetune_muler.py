@@ -127,33 +127,54 @@ def mount_google_drive(mount_point: str = "/content/drive", force: bool = False)
 
 
 def _ensure_mydrive_symlink(mount_point: str = "/content/drive"):
-    """Ensure /content/drive/MyDrive exists as a symlink to /content/drive/My Drive if needed."""
+    """Ensure both /content/drive/MyDrive and /content/drive/My Drive point to the valid Google Drive root."""
     my_drive_spaced = os.path.join(mount_point, "My Drive")
     my_drive_nospace = os.path.join(mount_point, "MyDrive")
     try:
         if os.path.exists(my_drive_spaced) and not os.path.exists(my_drive_nospace):
-            os.symlink(my_drive_spaced, my_drive_nospace)
-            log_info(f"Created symlink: {my_drive_nospace} -> {my_drive_spaced}")
+            try:
+                os.symlink(my_drive_spaced, my_drive_nospace)
+                log_info(f"Created symlink: {my_drive_nospace} -> {my_drive_spaced}")
+            except Exception:
+                pass
+        elif os.path.exists(my_drive_nospace) and not os.path.exists(my_drive_spaced):
+            try:
+                os.symlink(my_drive_nospace, my_drive_spaced)
+                log_info(f"Created symlink: {my_drive_spaced} -> {my_drive_nospace}")
+            except Exception:
+                pass
     except Exception:
         pass
 
 
 def get_actual_drive_path(path: Path) -> Path:
-    """Resolve Google Drive paths robustly across 'MyDrive' vs 'My Drive'."""
-    p_str = str(path)
-    if os.path.exists(p_str):
-        return Path(p_str)
-
+    """Resolve Google Drive paths robustly across 'MyDrive' vs 'My Drive' and symlinks."""
+    p = Path(path)
+    candidates = [p]
+    p_str = str(p)
     if "MyDrive" in p_str:
-        alt = p_str.replace("MyDrive", "My Drive")
-        if os.path.exists(alt) or os.path.exists(os.path.dirname(alt)):
-            return Path(alt)
+        candidates.append(Path(p_str.replace("MyDrive", "My Drive")))
     elif "My Drive" in p_str:
-        alt = p_str.replace("My Drive", "MyDrive")
-        if os.path.exists(alt) or os.path.exists(os.path.dirname(alt)):
-            return Path(alt)
+        candidates.append(Path(p_str.replace("My Drive", "MyDrive")))
 
-    return Path(p_str)
+    # 1. First priority: any candidate where the path itself exists
+    for c in candidates:
+        try:
+            if c.exists():
+                return c.resolve() if c.is_symlink() else c
+        except Exception:
+            pass
+
+    # 2. Second priority: any candidate where the parent directory exists
+    for c in candidates:
+        try:
+            if c.parent.exists():
+                resolved_parent = c.parent.resolve() if c.parent.is_symlink() else c.parent
+                return resolved_parent / c.name
+        except Exception:
+            pass
+
+    return p
 
 
 # ==============================================================================
@@ -184,7 +205,21 @@ class InboundFineTuneMuler:
     VIDEO_PART_MIN_BYTES["videochatgpt_tune_2.zip.005"] = 4_000_000_000  # Full: 4,103,350,672 bytes (3.82 GB)
 
     def __init__(self, drive_root: str, local_scratch_dir: str = "/content/data"):
-        self.drive_root = get_actual_drive_path(Path(drive_root))
+        raw_root = Path(drive_root)
+        candidates = [raw_root]
+        r_str = str(raw_root)
+        if "MyDrive" in r_str:
+            candidates.append(Path(r_str.replace("MyDrive", "My Drive")))
+        elif "My Drive" in r_str:
+            candidates.append(Path(r_str.replace("My Drive", "MyDrive")))
+
+        selected_root = get_actual_drive_path(raw_root)
+        for c in candidates:
+            if (c / "datasets").exists():
+                selected_root = c.resolve() if c.is_symlink() else c
+                break
+
+        self.drive_root = selected_root
         self.drive_data_dir = self.drive_root / "datasets"
         self.local_scratch_dir = Path(local_scratch_dir)
 
@@ -217,11 +252,17 @@ class InboundFineTuneMuler:
         seen = set()
         for label, path in targets:
             try:
-                resolved = path.resolve() if path.exists() else path
-                if str(resolved) in seen or not path.exists():
+                check_path = path
+                if not check_path.exists() and check_path.parent.exists():
+                    check_path = check_path.parent
+                if not check_path.exists() and "Google Drive" in label:
+                    check_path = Path("/content/drive")
+
+                resolved = check_path.resolve() if check_path.exists() else check_path
+                if str(resolved) in seen:
                     continue
                 seen.add(str(resolved))
-                usage = shutil.disk_usage(path)
+                usage = shutil.disk_usage(str(resolved if resolved.exists() else check_path))
                 free_gb = usage.free / (1024 ** 3)
                 total_gb = usage.total / (1024 ** 3)
                 pct = (usage.used / usage.total) * 100 if usage.total > 0 else 0
@@ -338,15 +379,31 @@ class InboundFineTuneMuler:
         # We always stream cleanly from byte 0 in 'wb' mode.
         if drive_target.exists():
             drive_target.unlink(missing_ok=True)
-            time.sleep(0.5)
+            time.sleep(1.0)
 
         import urllib.request
         log_info(f"Direct streaming {drive_target.name} to Google Drive (Zero local SSD staging)...")
         headers = {"User-Agent": "Mozilla/5.0"}
         req = urllib.request.Request(url, headers=headers)
 
+        # Retry loop to account for Google Drive FUSE inode update latency
+        fdst = None
+        for attempt in range(1, 6):
+            try:
+                drive_target = get_actual_drive_path(drive_target)
+                os.makedirs(str(drive_target.parent), exist_ok=True)
+                fdst = open(drive_target, "wb")
+                break
+            except (FileNotFoundError, OSError) as e:
+                log_warn(f"Attempt {attempt}/5 to open {drive_target} on Drive failed: {e}")
+                if attempt < 5:
+                    time.sleep(2)
+                else:
+                    log_err(f"Could not open {drive_target} after 5 attempts.")
+                    return False
+
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp, open(drive_target, "wb") as fdst:
+            with urllib.request.urlopen(req, timeout=120) as resp:
                 total_bytes = int(resp.headers.get("Content-Length", 0))
                 downloaded = 0
                 start_t = time.time()
@@ -364,21 +421,30 @@ class InboundFineTuneMuler:
                         log_info(f"Direct stream: {downloaded / (1024**3):.2f} / {total_bytes / (1024**3):.1f} GB ({pct:.1f}%) [{speed:.1f} MB/s]")
                         last_log = time.time()
 
-            elapsed = max(time.time() - start_t, 1.0)
-            speed_mbs = (downloaded / (1024 ** 2)) / elapsed
-            self._prune_caches()
-            self._flush_drive_fuse()
-            drive_target = get_actual_drive_path(drive_target)
-
-            if drive_target.exists() and drive_target.stat().st_size >= min_bytes:
-                log_success(f"✓ Direct streamed {drive_target.name} to Drive in {elapsed/60:.1f}m ({speed_mbs:.1f} MB/s)!")
-                return True
-            else:
-                curr_size = drive_target.stat().st_size if drive_target.exists() else 0
-                log_err(f"Direct stream finished but size mismatch for {drive_target.name}: {curr_size} < {min_bytes}")
-                return False
+            fdst.flush()
+            try:
+                os.fsync(fdst.fileno())
+            except Exception:
+                pass
         except Exception as e:
             log_err(f"Direct stream error for {drive_target.name}: {e}")
+            return False
+        finally:
+            if fdst and not fdst.closed:
+                fdst.close()
+
+        elapsed = max(time.time() - start_t, 1.0)
+        speed_mbs = (downloaded / (1024 ** 2)) / elapsed
+        self._prune_caches()
+        self._flush_drive_fuse()
+        drive_target = get_actual_drive_path(drive_target)
+
+        if drive_target.exists() and drive_target.stat().st_size >= min_bytes:
+            log_success(f"✓ Direct streamed {drive_target.name} to Drive in {elapsed/60:.1f}m ({speed_mbs:.1f} MB/s)!")
+            return True
+        else:
+            curr_size = drive_target.stat().st_size if drive_target.exists() else 0
+            log_err(f"Direct stream finished but size mismatch for {drive_target.name}: {curr_size} < {min_bytes}")
             return False
 
     def _download_part(self, url: str, part_name: str, drive_target: Path, min_bytes: int) -> bool:
@@ -523,6 +589,10 @@ class InboundFineTuneMuler:
         else:
             img_part1 = self.drive_data_dir / self.IMAGE_TUNE_PARTS[0]
             inner_img_zip = self.drive_data_dir / "llava_image_tune.zip"
+            if inner_img_zip.exists() and inner_img_zip.stat().st_size < 65_000_000_000:
+                log_warn(f"Removing incomplete inner archive {inner_img_zip.name} ({inner_img_zip.stat().st_size / (1024**3):.1f} GB)...")
+                inner_img_zip.unlink(missing_ok=True)
+
             if not inner_img_zip.exists() and img_part1.exists():
                 log_info("Stage 1/2: Unpacking outer split archive (llava_image_tune_2.zip.*) via 7-Zip...")
                 cmd = [seven_zip, "x", str(img_part1), f"-o{self.drive_data_dir}", "-y"]
@@ -559,6 +629,10 @@ class InboundFineTuneMuler:
         else:
             vid_part1 = self.drive_data_dir / self.VIDEO_TUNE_PARTS[0]
             inner_vid_zip = self.drive_data_dir / "videochatgpt_tune.zip"
+            if inner_vid_zip.exists() and inner_vid_zip.stat().st_size < 150_000_000_000:
+                log_warn(f"Removing incomplete inner archive {inner_vid_zip.name} ({inner_vid_zip.stat().st_size / (1024**3):.1f} GB)...")
+                inner_vid_zip.unlink(missing_ok=True)
+
             if not inner_vid_zip.exists() and vid_part1.exists():
                 log_info("Stage 1/2: Unpacking outer split archive (videochatgpt_tune_2.zip.*) via 7-Zip...")
                 cmd = [seven_zip, "x", str(vid_part1), f"-o{self.drive_data_dir}", "-y"]
@@ -681,7 +755,7 @@ def main():
 
         # Launch Training
         local_ckpt_dir = Path("/content/checkpoints/videollava-7b-finetune")
-        drive_ckpt_dir = Path(args.drive_root) / "checkpoints/videollava-7b-finetune"
+        drive_ckpt_dir = muler.drive_root / "checkpoints/videollava-7b-finetune"
         outbound = OutboundCheckpointMuler(local_ckpt_dir, drive_ckpt_dir)
         outbound.start()
 
