@@ -642,7 +642,6 @@ class InboundFineTuneMuler:
                             from google.colab import drive
                             drive.mount('/content/drive', force_remount=True)
                             time.sleep(10)
-                            _ensure_mydrive_symlink('/content/drive')
                         except Exception:
                             pass
                     outer_stream = MultiPartStream(parts)
@@ -667,10 +666,17 @@ class InboundFineTuneMuler:
                 else:
                     dest = target_dataset_dir / rel
 
-                if not dest.exists():
+                try:
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(f), str(dest))
-                else:
+                except Exception:
+                    pass
+
+                try:
+                    if not dest.exists():
+                        shutil.move(str(f), str(dest))
+                    else:
+                        f.unlink(missing_ok=True)
+                except Exception:
                     f.unlink(missing_ok=True)
 
             with ThreadPoolExecutor(max_workers=workers) as pool:
