@@ -96,7 +96,8 @@ def mount_google_drive(mount_point: str = "/content/drive", force: bool = False)
     try:
         with open("/proc/mounts", "r") as f:
             for line in f:
-                if mount_point in line:
+                parts = line.split()
+                if len(parts) >= 2 and (parts[1] == mount_point or parts[1].startswith(mount_point + "/")):
                     is_mounted = True
                     break
     except Exception:
@@ -104,25 +105,24 @@ def mount_google_drive(mount_point: str = "/content/drive", force: bool = False)
 
     has_drive_folder = os.path.exists(os.path.join(mount_point, "MyDrive")) or os.path.exists(os.path.join(mount_point, "My Drive"))
 
-    if is_mounted and has_drive_folder and not force:
+    if is_mounted and has_drive_folder:
         _ensure_mydrive_symlink(mount_point)
-        log_success(f"Google Drive already mounted at {mount_point}")
+        log_success(f"Google Drive verified and active at {mount_point}")
         return True
 
+    # In Colab non-interactive subshells, drive.mount fails ('NoneType' object has no attribute 'kernel').
+    # We attempt drive.mount only once if not yet mounted, without flushing or unmounting.
     try:
-        log_info(f"Mounting Google Drive to {mount_point}...")
+        log_info(f"Connecting to Google Drive at {mount_point}...")
         from google.colab import drive
-        if force:
-            try:
-                drive.flush_and_unmount()
-            except Exception:
-                pass
         drive.mount(mount_point)
         _ensure_mydrive_symlink(mount_point)
-        log_success(f"Google Drive successfully mounted at {mount_point}")
+        log_success(f"Google Drive mounted at {mount_point}")
         return True
     except Exception as e:
-        log_err(f"Failed to mount Google Drive: {e}")
+        log_err(f"Google Drive is not mounted ({e}).")
+        log_err("Please mount Google Drive directly in a Colab notebook cell:")
+        log_err("  from google.colab import drive; drive.mount('/content/drive')")
         return False
 
 
@@ -248,12 +248,9 @@ class InboundFineTuneMuler:
 
     def _flush_drive_fuse(self):
         try:
-            from google.colab import drive
-            log_info("Flushing Google Drive FUSE write buffers...")
-            drive.flush_and_unmount()
-            drive.mount('/content/drive')
-            _ensure_mydrive_symlink('/content/drive')
-            log_success("Google Drive remounted cleanly.")
+            log_info("Flushing filesystem write buffers to cloud...")
+            os.sync()
+            subprocess.run(["sync"], check=False)
         except Exception:
             pass
 
@@ -274,11 +271,8 @@ class InboundFineTuneMuler:
         drive_path = get_actual_drive_path(drive_path)
         os.makedirs(str(drive_path.parent), exist_ok=True)
 
-        if not drive_path.parent.is_dir():
-            log_warn(f"Drive path {drive_path.parent} not visible. Re-mounting Drive...")
-            mount_google_drive(force=True)
-            drive_path = get_actual_drive_path(drive_path)
-            os.makedirs(str(drive_path.parent), exist_ok=True)
+        if not mount_google_drive():
+            raise RuntimeError(f"Google Drive is not mounted! Refusing to write {drive_path.name} to local SSD.")
 
         if drive_path.exists():
             drive_path.unlink(missing_ok=True)
@@ -294,7 +288,8 @@ class InboundFineTuneMuler:
             except (FileNotFoundError, OSError) as e:
                 log_warn(f"Attempt {attempt}/3 to open {drive_path} failed: {e}")
                 if attempt < 3:
-                    mount_google_drive(force=True)
+                    if not mount_google_drive():
+                        raise RuntimeError(f"Google Drive is not mounted! Refusing to write {drive_path.name} to local SSD.")
                     drive_path = get_actual_drive_path(drive_path)
                     os.makedirs(str(drive_path.parent), exist_ok=True)
                     time.sleep(2)
@@ -336,6 +331,9 @@ class InboundFineTuneMuler:
         drive_target = get_actual_drive_path(drive_target)
         os.makedirs(str(drive_target.parent), exist_ok=True)
 
+        if not mount_google_drive():
+            raise RuntimeError(f"Google Drive is not mounted! Refusing to stream {drive_target.name} to local SSD.")
+
         # On Google Drive FUSE, append ('ab') mode is unsupported and causes data corruption.
         # We always stream cleanly from byte 0 in 'wb' mode.
         if drive_target.exists():
@@ -343,7 +341,7 @@ class InboundFineTuneMuler:
             time.sleep(0.5)
 
         import urllib.request
-        log_info(f"Direct streaming {drive_target.name} to Google Drive (Zero local SSD usage)...")
+        log_info(f"Direct streaming {drive_target.name} to Google Drive (Zero local SSD staging)...")
         headers = {"User-Agent": "Mozilla/5.0"}
         req = urllib.request.Request(url, headers=headers)
 
@@ -401,7 +399,14 @@ class InboundFineTuneMuler:
             drive_target.unlink(missing_ok=True)
             time.sleep(1)
 
-        # 3. Check staging directory on SSD
+        # 3. For large archives (>= 20 GB), aria2 staging + Drive copy requires ~2x file size on SSD.
+        # Direct Streaming streams at ~70-87 MB/s directly into Google Drive with ZERO SSD staging footprint.
+        # Use Direct Stream for all large files to prevent Errno 28 completely.
+        if min_bytes >= 20_000_000_000:
+            log_info(f"Large archive ({part_name}, ~{min_bytes/(1024**3):.1f} GB): using Direct Stream to Google Drive (Zero SSD staging)...")
+            return self._direct_stream_from_url_to_drive(url, drive_target, min_bytes)
+
+        # 4. For smaller files, check staging or use aria2c if available
         staging_dir = Path("/content/_staging")
         staging_dir.mkdir(parents=True, exist_ok=True)
         staged_file = staging_dir / part_name
@@ -412,16 +417,8 @@ class InboundFineTuneMuler:
 
         self._prune_caches()
         free_ssd = shutil.disk_usage(staging_dir).free / (1024 ** 3)
-        log_info(f"Local SSD free space: {free_ssd:.1f} GB")
-
-        # If SSD free space is tight (< 45 GB), use Direct Stream (Zero local SSD usage)
-        if free_ssd < 45.0:
-            log_info(f"SSD space ({free_ssd:.1f} GB) is tight for staging. Direct streaming {part_name} to Drive (Zero SSD usage)...")
-            return self._direct_stream_from_url_to_drive(url, drive_target, min_bytes)
-
-        # 4. If SSD has >= 45 GB free, use accelerated aria2c staging
         has_aria2 = self._ensure_aria2()
-        if has_aria2:
+        if has_aria2 and free_ssd >= 25.0:
             log_info(f"🚀 Downloading {part_name} via aria2c (16 parallel connections on SSD)...")
             cmd = [
                 "aria2c",
@@ -657,7 +654,9 @@ def main():
     parser.add_argument("--clean_zips", action="store_true", help="Delete downloaded split zip files after extraction")
 
     args = parser.parse_args()
-    mount_google_drive()
+    if not mount_google_drive():
+        log_err("Aborting: Google Drive must be mounted before running this pipeline.")
+        sys.exit(1)
 
     muler = InboundFineTuneMuler(args.drive_root, args.local_scratch_dir)
 
