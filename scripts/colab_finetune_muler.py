@@ -366,10 +366,6 @@ class InboundFineTuneMuler:
 
         shutil.rmtree("/root/.cache/pip", ignore_errors=True)
 
-        drivefs_cache = Path("/root/.config/Google/DriveFS")
-        if drivefs_cache.exists():
-            shutil.rmtree(str(drivefs_cache), ignore_errors=True)
-
     def _flush_drive_fuse(self):
         try:
             log_info("Flushing filesystem write buffers to cloud...")
@@ -458,12 +454,6 @@ class InboundFineTuneMuler:
 
         if not mount_google_drive():
             raise RuntimeError(f"Google Drive is not mounted! Refusing to stream {drive_target.name} to local SSD.")
-
-        # On Google Drive FUSE, append ('ab') mode is unsupported and causes data corruption.
-        # We always stream cleanly from byte 0 in 'wb' mode.
-        if drive_target.exists():
-            drive_target.unlink(missing_ok=True)
-            time.sleep(1.0)
 
         import urllib.request
         log_info(f"Direct streaming {drive_target.name} to Google Drive (Zero local SSD staging)...")
