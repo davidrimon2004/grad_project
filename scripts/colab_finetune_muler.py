@@ -87,177 +87,24 @@ def is_colab_environment() -> bool:
         return "COLAB_GPU" in os.environ or "COLAB_RELEASE_TAG" in os.environ or (os.name != "nt" and os.path.exists("/content"))
 
 
-def mount_google_drive(mount_point: str = "/content/drive", force: bool = False) -> bool:
+def mount_google_drive(mount_point: str = "/content/drive") -> bool:
     if not is_colab_environment():
         log_info("Not running in Google Colab. Using local directory paths.")
         return True
 
-    # Check if actually mounted in /proc/mounts
-    is_mounted = False
-    try:
-        with open("/proc/mounts", "r") as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) >= 2 and (parts[1] == mount_point or parts[1].startswith(mount_point + "/")):
-                    is_mounted = True
-                    break
-    except Exception:
-        is_mounted = os.path.ismount(mount_point)
-
-    has_drive_folder = os.path.exists(os.path.join(mount_point, "MyDrive")) or os.path.exists(os.path.join(mount_point, "My Drive"))
-
-    if is_mounted and has_drive_folder:
-        _ensure_mydrive_symlink(mount_point)
+    if os.path.exists(os.path.join(mount_point, "MyDrive")) or os.path.exists(os.path.join(mount_point, "My Drive")):
         log_success(f"Google Drive verified and active at {mount_point}")
         return True
 
-    # In Colab non-interactive subshells, drive.mount fails ('NoneType' object has no attribute 'kernel').
-    # We attempt drive.mount only once if not yet mounted, without flushing or unmounting.
     try:
-        log_info(f"Connecting to Google Drive at {mount_point}...")
+        log_info(f"Mounting Google Drive to {mount_point}...")
         from google.colab import drive
         drive.mount(mount_point)
-        _ensure_mydrive_symlink(mount_point)
-        log_success(f"Google Drive mounted at {mount_point}")
+        log_success(f"Google Drive successfully mounted at {mount_point}")
         return True
     except Exception as e:
-        log_err(f"Google Drive is not mounted ({e}).")
-        log_err("Please mount Google Drive directly in a Colab notebook cell:")
-        log_err("  from google.colab import drive; drive.mount('/content/drive')")
+        log_err(f"Failed to mount Google Drive: {e}")
         return False
-
-
-def _ensure_mydrive_symlink(mount_point: str = "/content/drive"):
-    """Ensure both /content/drive/MyDrive and /content/drive/My Drive point to the valid Google Drive root."""
-    my_drive_spaced = os.path.join(mount_point, "My Drive")
-    my_drive_nospace = os.path.join(mount_point, "MyDrive")
-    try:
-        if os.path.exists(my_drive_spaced) and not os.path.exists(my_drive_nospace):
-            try:
-                os.symlink(my_drive_spaced, my_drive_nospace)
-                log_info(f"Created symlink: {my_drive_nospace} -> {my_drive_spaced}")
-            except Exception:
-                pass
-        elif os.path.exists(my_drive_nospace) and not os.path.exists(my_drive_spaced):
-            try:
-                os.symlink(my_drive_nospace, my_drive_spaced)
-                log_info(f"Created symlink: {my_drive_spaced} -> {my_drive_nospace}")
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
-def _test_writable_directory(folder: Path) -> bool:
-    """Test if a directory exists or can be created and written to."""
-    try:
-        os.makedirs(str(folder), exist_ok=True)
-        probe = folder / ".drive_write_probe"
-        with open(probe, "wb") as f:
-            f.write(b"probe")
-        probe.unlink(missing_ok=True)
-        return True
-    except Exception:
-        return False
-
-
-def find_and_verify_drive_datasets(drive_root_input: str) -> tuple[Path, Path]:
-    """
-    Locates and verifies the true, writable Google Drive datasets directory.
-    Checks the direct standard path first (instantaneous, 0ms) before doing any fallback discovery.
-    """
-    known_markers = [
-        "videochatgpt_tune_2.zip.001",
-        "videochatgpt_tune_2.zip.002",
-        "videochatgpt_tune_2.zip.003",
-        "videochatgpt_tune_2.zip.005",
-        "llava_image_tune_2.zip.001",
-        "annotations.zip",
-    ]
-
-    # 1. Primary candidate from user input (e.g. /content/drive/MyDrive/Video-LLaVA/datasets)
-    p_in = Path(drive_root_input)
-    primary_cands = [p_in / "datasets"]
-    p_str = str(p_in)
-    if "MyDrive" in p_str:
-        primary_cands.append(Path(p_str.replace("MyDrive", "My Drive")) / "datasets")
-    elif "My Drive" in p_str:
-        primary_cands.append(Path(p_str.replace("My Drive", "MyDrive")) / "datasets")
-    for root_prefix in ["/content/drive/MyDrive", "/content/drive/My Drive"]:
-        c = Path(root_prefix) / "Video-LLaVA" / "datasets"
-        if c not in primary_cands:
-            primary_cands.append(c)
-
-    # Check primary candidates FIRST (instantaneous, no glob overhead)
-    for cand in primary_cands:
-        try:
-            if cand.exists() and any((cand / marker).exists() for marker in known_markers) and _test_writable_directory(cand):
-                log_success(f"✓ Found active and writable Google Drive datasets directory: {cand}")
-                return cand.parent, cand
-        except Exception:
-            pass
-
-    # 2. Only if direct paths fail, do fallback discovery
-    log_info("Scanning for datasets folder on Google Drive...")
-    candidates = list(primary_cands)
-    if os.path.exists("/content/drive"):
-        try:
-            for found in glob.glob("/content/drive/*/Video-LLaVA/datasets"):
-                p_found = Path(found)
-                if p_found not in candidates:
-                    candidates.append(p_found)
-        except Exception:
-            pass
-
-    for cand in candidates:
-        try:
-            if cand.exists() and any((cand / marker).exists() for marker in known_markers) and _test_writable_directory(cand):
-                log_success(f"✓ Found active and writable Google Drive datasets directory: {cand}")
-                return cand.parent, cand
-        except Exception:
-            pass
-
-    for cand in candidates:
-        try:
-            if cand.exists() and _test_writable_directory(cand):
-                log_success(f"Using writable Google Drive datasets directory: {cand}")
-                return cand.parent, cand
-        except Exception:
-            pass
-
-    fallback_dir = Path(drive_root_input) / "datasets"
-    log_warn(f"Drive probe fallback to input directory: {fallback_dir}")
-    return Path(drive_root_input), fallback_dir
-
-
-def get_actual_drive_path(path: Path) -> Path:
-    """Resolve Google Drive paths robustly across 'MyDrive' vs 'My Drive' and symlinks."""
-    p = Path(path)
-    candidates = [p]
-    p_str = str(p)
-    if "MyDrive" in p_str:
-        candidates.append(Path(p_str.replace("MyDrive", "My Drive")))
-    elif "My Drive" in p_str:
-        candidates.append(Path(p_str.replace("My Drive", "MyDrive")))
-
-    # 1. First priority: any candidate where the path itself exists
-    for c in candidates:
-        try:
-            if c.exists():
-                return c.resolve() if c.is_symlink() else c
-        except Exception:
-            pass
-
-    # 2. Second priority: any candidate where the parent directory exists
-    for c in candidates:
-        try:
-            if c.parent.exists():
-                resolved_parent = c.parent.resolve() if c.parent.is_symlink() else c.parent
-                return resolved_parent / c.name
-        except Exception:
-            pass
-
-    return p
 
 
 # ==============================================================================
@@ -426,8 +273,11 @@ class InboundFineTuneMuler:
     }
     VIDEO_PART_MIN_BYTES["videochatgpt_tune_2.zip.005"] = 4_000_000_000  # Full: 4,103,350,672 bytes (3.82 GB)
 
-    def __init__(self, drive_root: str, local_scratch_dir: str = "/content/data"):
-        self.drive_root, self.drive_data_dir = find_and_verify_drive_datasets(drive_root)
+    def __init__(self, drive_root: str = "/content/drive/MyDrive/Video-LLaVA", local_scratch_dir: str = "/content/data"):
+        self.drive_root = Path(drive_root)
+        if not (self.drive_root / "datasets").exists() and Path("/content/drive/My Drive/Video-LLaVA/datasets").exists():
+            self.drive_root = Path("/content/drive/My Drive/Video-LLaVA")
+        self.drive_data_dir = self.drive_root / "datasets"
         self.local_scratch_dir = Path(local_scratch_dir)
 
         # Drive Dataset Paths
@@ -453,23 +303,18 @@ class InboundFineTuneMuler:
         log_header("Storage Diagnostic & Capacity Check")
         targets = [
             ("Google Drive Data Dir", self.drive_data_dir),
+            ("Google Drive Root", self.drive_root),
             ("Colab Local SSD (/content)", Path("/content")),
             ("System Temp (/tmp)", Path("/tmp")),
         ]
-        seen = set()
+        seen_paths = set()
         for label, path in targets:
             try:
-                check_path = path
-                if not check_path.exists() and check_path.parent.exists():
-                    check_path = check_path.parent
-                if not check_path.exists() and "Google Drive" in label:
-                    check_path = Path("/content/drive")
-
-                resolved = check_path.resolve() if check_path.exists() else check_path
-                if str(resolved) in seen:
+                p_str = str(path)
+                if p_str in seen_paths or not path.exists():
                     continue
-                seen.add(str(resolved))
-                usage = shutil.disk_usage(str(resolved if resolved.exists() else check_path))
+                seen_paths.add(p_str)
+                usage = shutil.disk_usage(path)
                 free_gb = usage.free / (1024 ** 3)
                 total_gb = usage.total / (1024 ** 3)
                 pct = (usage.used / usage.total) * 100 if usage.total > 0 else 0
@@ -513,30 +358,20 @@ class InboundFineTuneMuler:
         log_info(f"Transferring {local_path.name} to Google Drive ({size_gb:.2f} GB)...")
 
         drive_path = self.drive_data_dir / drive_path.name
-        os.makedirs(str(drive_path.parent), exist_ok=True)
+        drive_path.parent.mkdir(parents=True, exist_ok=True)
 
         if not mount_google_drive():
             raise RuntimeError(f"Google Drive is not mounted! Refusing to write {drive_path.name} to local SSD.")
-
-        if drive_path.exists():
-            drive_path.unlink(missing_ok=True)
-            time.sleep(0.5)
 
         start_t = time.time()
         fdst = None
         for attempt in range(1, 4):
             try:
-                drive_path = self.drive_data_dir / drive_path.name
-                os.makedirs(str(drive_path.parent), exist_ok=True)
                 fdst = open(drive_path, "wb")
                 break
             except (FileNotFoundError, OSError) as e:
                 log_warn(f"Attempt {attempt}/3 to open {drive_path} failed: {e}")
                 if attempt < 3:
-                    if not mount_google_drive():
-                        raise RuntimeError(f"Google Drive is not mounted! Refusing to write {drive_path.name} to local SSD.")
-                    drive_path = self.drive_data_dir / drive_path.name
-                    os.makedirs(str(drive_path.parent), exist_ok=True)
                     time.sleep(2)
                 else:
                     raise
@@ -663,19 +498,12 @@ class InboundFineTuneMuler:
     def _download_part(self, url: str, part_name: str, drive_target: Path, min_bytes: int) -> bool:
         drive_target = self.drive_data_dir / part_name
 
-        # Check both primary target in verified datasets folder and any alternative path variant
-        target_candidates = [drive_target]
-        alt = get_actual_drive_path(drive_target)
-        if alt not in target_candidates:
-            target_candidates.append(alt)
-
         # 1. PRIORITY: Check if already complete on Google Drive
-        for tc in target_candidates:
-            if tc.exists() and tc.stat().st_size >= min_bytes:
-                log_success(f"✓ {part_name} is already complete on Google Drive ({tc.stat().st_size / (1024**3):.2f} GB)!")
-                staged = Path("/content/_staging") / part_name
-                staged.unlink(missing_ok=True)
-                return True
+        if drive_target.exists() and drive_target.stat().st_size >= min_bytes:
+            log_success(f"✓ {part_name} is already complete on Google Drive ({drive_target.stat().st_size / (1024**3):.2f} GB)!")
+            staged = Path("/content/_staging") / part_name
+            staged.unlink(missing_ok=True)
+            return True
 
         # 2. Check if already downloaded in local SSD staging
         staging_dir = Path("/content/_staging")
@@ -686,7 +514,15 @@ class InboundFineTuneMuler:
             log_success(f"✓ {part_name} already in local SSD staging ({staged_file.stat().st_size / (1024**3):.2f} GB). Transferring to Drive...")
             return self._stream_copy_to_drive(staged_file, drive_target)
 
-        # 3. Download via aria2c to local SSD with 16 parallel connections
+        # 3. Clean up any incomplete partial file on Drive (e.g. aborted upload)
+        if drive_target.exists() and drive_target.stat().st_size < min_bytes:
+            log_info(f"Removing incomplete partial ({drive_target.stat().st_size / (1024**2):.1f} MB) for {part_name} on Drive...")
+            try:
+                drive_target.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        # 4. Download via aria2c to local SSD with 16 parallel connections
         self._prune_caches()
         free_ssd = shutil.disk_usage(staging_dir).free / (1024 ** 3)
         has_aria2 = self._ensure_aria2()
@@ -710,7 +546,7 @@ class InboundFineTuneMuler:
                 log_success(f"✓ Downloaded {part_name} to SSD ({staged_file.stat().st_size / (1024**3):.2f} GB)")
                 return self._stream_copy_to_drive(staged_file, drive_target)
 
-        # 4. Fallback: direct streaming
+        # 5. Fallback: direct streaming
         log_info(f"Using direct stream fallback for {part_name} (Zero local SSD usage)...")
         return self._direct_stream_from_url_to_drive(url, drive_target, min_bytes)
 
@@ -853,7 +689,6 @@ class InboundFineTuneMuler:
                 time.sleep(10)
                 drive.mount('/content/drive', force_remount=True)
                 time.sleep(15)
-                _ensure_mydrive_symlink('/content/drive')
             except Exception as e:
                 log_warn(f"  Drive remount note: {e}")
             free = shutil.disk_usage('/content').free / (1024 ** 3) if os.path.exists('/content') else 100.0
@@ -868,7 +703,14 @@ class InboundFineTuneMuler:
 
         # Check existing files on Drive to resume seamlessly if interrupted
         todo = []
-        if not target_dataset_dir.exists() or not any(target_dataset_dir.iterdir()):
+        is_empty = True
+        if target_dataset_dir.exists():
+            try:
+                is_empty = next(target_dataset_dir.iterdir(), None) is None
+            except Exception:
+                is_empty = False
+
+        if not target_dataset_dir.exists() or is_empty:
             todo = all_files
         else:
             log_info("Scanning existing files on Drive to resume...")
