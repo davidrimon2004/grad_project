@@ -147,6 +147,104 @@ def _ensure_mydrive_symlink(mount_point: str = "/content/drive"):
         pass
 
 
+def _test_writable_directory(folder: Path) -> bool:
+    """Test if a directory exists or can be created and written to."""
+    try:
+        os.makedirs(str(folder), exist_ok=True)
+        probe = folder / ".drive_write_probe"
+        with open(probe, "wb") as f:
+            f.write(b"probe")
+        probe.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def find_and_verify_drive_datasets(drive_root_input: str) -> tuple[Path, Path]:
+    """
+    Locates and verifies the true, writable Google Drive datasets directory.
+    Discovers whether the Colab environment uses 'My Drive' (space) or 'MyDrive' (no space),
+    verifying existence of known dataset files and confirming write access with a probe.
+    """
+    candidates: List[Path] = []
+
+    # 1. From user input drive_root
+    p_in = Path(drive_root_input)
+    candidates.append(p_in / "datasets")
+    p_str = str(p_in)
+    if "MyDrive" in p_str:
+        candidates.append(Path(p_str.replace("MyDrive", "My Drive")) / "datasets")
+    elif "My Drive" in p_str:
+        candidates.append(Path(p_str.replace("My Drive", "MyDrive")) / "datasets")
+
+    # 2. Well-known standard Colab Google Drive locations
+    for root_prefix in ["/content/drive/My Drive", "/content/drive/MyDrive"]:
+        c = Path(root_prefix) / "Video-LLaVA" / "datasets"
+        if c not in candidates:
+            candidates.append(c)
+
+    # 3. Dynamic glob discovery under /content/drive
+    if os.path.exists("/content/drive"):
+        for found in glob.glob("/content/drive/*/Video-LLaVA/datasets"):
+            p_found = Path(found)
+            if p_found not in candidates:
+                candidates.append(p_found)
+        for found in glob.glob("/content/drive/*/*/datasets"):
+            p_found = Path(found)
+            if p_found not in candidates and "Video-LLaVA" in str(p_found):
+                candidates.append(p_found)
+
+    known_markers = [
+        "videochatgpt_tune_2.zip.001",
+        "videochatgpt_tune_2.zip.002",
+        "videochatgpt_tune_2.zip.003",
+        "videochatgpt_tune_2.zip.005",
+        "llava_image_tune_2.zip.001",
+        "annotations.zip",
+    ]
+
+    # Priority 1: Candidate containing known dataset archives that is also writable
+    for cand in candidates:
+        try:
+            has_marker = any((cand / marker).exists() for marker in known_markers)
+            if has_marker and _test_writable_directory(cand):
+                log_success(f"✓ Found active and writable Google Drive datasets directory: {cand}")
+                return cand.parent, cand
+        except Exception:
+            pass
+
+    # Priority 2: Candidate containing known dataset archives
+    for cand in candidates:
+        try:
+            if any((cand / marker).exists() for marker in known_markers):
+                log_info(f"Using Drive datasets directory with existing archives: {cand}")
+                return cand.parent, cand
+        except Exception:
+            pass
+
+    # Priority 3: Any candidate that exists and is writable
+    for cand in candidates:
+        try:
+            if cand.exists() and _test_writable_directory(cand):
+                log_success(f"Using writable Google Drive datasets directory: {cand}")
+                return cand.parent, cand
+        except Exception:
+            pass
+
+    # Priority 4: Any candidate whose parent exists and can be made writable
+    for cand in candidates:
+        try:
+            if cand.parent.exists() and _test_writable_directory(cand):
+                log_success(f"Created writable Google Drive datasets directory: {cand}")
+                return cand.parent, cand
+        except Exception:
+            pass
+
+    fallback_dir = Path(drive_root_input) / "datasets"
+    log_warn(f"Drive probe fallback to input directory: {fallback_dir}")
+    return Path(drive_root_input), fallback_dir
+
+
 def get_actual_drive_path(path: Path) -> Path:
     """Resolve Google Drive paths robustly across 'MyDrive' vs 'My Drive' and symlinks."""
     p = Path(path)
@@ -205,22 +303,7 @@ class InboundFineTuneMuler:
     VIDEO_PART_MIN_BYTES["videochatgpt_tune_2.zip.005"] = 4_000_000_000  # Full: 4,103,350,672 bytes (3.82 GB)
 
     def __init__(self, drive_root: str, local_scratch_dir: str = "/content/data"):
-        raw_root = Path(drive_root)
-        candidates = [raw_root]
-        r_str = str(raw_root)
-        if "MyDrive" in r_str:
-            candidates.append(Path(r_str.replace("MyDrive", "My Drive")))
-        elif "My Drive" in r_str:
-            candidates.append(Path(r_str.replace("My Drive", "MyDrive")))
-
-        selected_root = get_actual_drive_path(raw_root)
-        for c in candidates:
-            if (c / "datasets").exists():
-                selected_root = c.resolve() if c.is_symlink() else c
-                break
-
-        self.drive_root = selected_root
-        self.drive_data_dir = self.drive_root / "datasets"
+        self.drive_root, self.drive_data_dir = find_and_verify_drive_datasets(drive_root)
         self.local_scratch_dir = Path(local_scratch_dir)
 
         # Drive Dataset Paths
@@ -309,7 +392,7 @@ class InboundFineTuneMuler:
         size_gb = local_path.stat().st_size / (1024 ** 3)
         log_info(f"Transferring {local_path.name} to Google Drive ({size_gb:.2f} GB)...")
 
-        drive_path = get_actual_drive_path(drive_path)
+        drive_path = self.drive_data_dir / drive_path.name
         os.makedirs(str(drive_path.parent), exist_ok=True)
 
         if not mount_google_drive():
@@ -323,6 +406,7 @@ class InboundFineTuneMuler:
         fdst = None
         for attempt in range(1, 4):
             try:
+                drive_path = self.drive_data_dir / drive_path.name
                 os.makedirs(str(drive_path.parent), exist_ok=True)
                 fdst = open(drive_path, "wb")
                 break
@@ -331,7 +415,7 @@ class InboundFineTuneMuler:
                 if attempt < 3:
                     if not mount_google_drive():
                         raise RuntimeError(f"Google Drive is not mounted! Refusing to write {drive_path.name} to local SSD.")
-                    drive_path = get_actual_drive_path(drive_path)
+                    drive_path = self.drive_data_dir / drive_path.name
                     os.makedirs(str(drive_path.parent), exist_ok=True)
                     time.sleep(2)
                 else:
@@ -369,7 +453,7 @@ class InboundFineTuneMuler:
             return True
 
     def _direct_stream_from_url_to_drive(self, url: str, drive_target: Path, min_bytes: int) -> bool:
-        drive_target = get_actual_drive_path(drive_target)
+        drive_target = self.drive_data_dir / drive_target.name
         os.makedirs(str(drive_target.parent), exist_ok=True)
 
         if not mount_google_drive():
@@ -390,7 +474,7 @@ class InboundFineTuneMuler:
         fdst = None
         for attempt in range(1, 6):
             try:
-                drive_target = get_actual_drive_path(drive_target)
+                drive_target = self.drive_data_dir / drive_target.name
                 os.makedirs(str(drive_target.parent), exist_ok=True)
                 fdst = open(drive_target, "wb")
                 break
@@ -437,7 +521,7 @@ class InboundFineTuneMuler:
         speed_mbs = (downloaded / (1024 ** 2)) / elapsed
         self._prune_caches()
         self._flush_drive_fuse()
-        drive_target = get_actual_drive_path(drive_target)
+        drive_target = self.drive_data_dir / drive_target.name
 
         if drive_target.exists() and drive_target.stat().st_size >= min_bytes:
             log_success(f"✓ Direct streamed {drive_target.name} to Drive in {elapsed/60:.1f}m ({speed_mbs:.1f} MB/s)!")
@@ -448,22 +532,30 @@ class InboundFineTuneMuler:
             return False
 
     def _download_part(self, url: str, part_name: str, drive_target: Path, min_bytes: int) -> bool:
-        drive_target = get_actual_drive_path(drive_target)
+        drive_target = self.drive_data_dir / part_name
+
+        # Check both primary target in verified datasets folder and any alternative path variant
+        target_candidates = [drive_target]
+        alt = get_actual_drive_path(drive_target)
+        if alt not in target_candidates:
+            target_candidates.append(alt)
 
         # 1. PRIORITY: Check if already complete on Google Drive
-        if drive_target.exists() and drive_target.stat().st_size >= min_bytes:
-            log_success(f"✓ {part_name} is already complete on Google Drive ({drive_target.stat().st_size / (1024**3):.2f} GB)!")
-            staged = Path("/content/_staging") / part_name
-            staged.unlink(missing_ok=True)
-            return True
+        for tc in target_candidates:
+            if tc.exists() and tc.stat().st_size >= min_bytes:
+                log_success(f"✓ {part_name} is already complete on Google Drive ({tc.stat().st_size / (1024**3):.2f} GB)!")
+                staged = Path("/content/_staging") / part_name
+                staged.unlink(missing_ok=True)
+                return True
 
         # 2. Check if a corrupted/truncated partial exists on Drive
-        if drive_target.exists() and drive_target.stat().st_size < min_bytes:
-            curr_gb = drive_target.stat().st_size / (1024 ** 3)
-            expected_gb = min_bytes / (1024 ** 3)
-            log_warn(f"Drive copy of {part_name} is incomplete ({curr_gb:.2f} GB < {expected_gb:.2f} GB). Removing corrupted/partial file...")
-            drive_target.unlink(missing_ok=True)
-            time.sleep(1)
+        for tc in target_candidates:
+            if tc.exists() and tc.stat().st_size < min_bytes:
+                curr_gb = tc.stat().st_size / (1024 ** 3)
+                expected_gb = min_bytes / (1024 ** 3)
+                log_warn(f"Drive copy of {part_name} is incomplete ({curr_gb:.2f} GB < {expected_gb:.2f} GB). Removing corrupted/partial file...")
+                tc.unlink(missing_ok=True)
+                time.sleep(1)
 
         # 3. For large archives (>= 20 GB), aria2 staging + Drive copy requires ~2x file size on SSD.
         # Direct Streaming streams at ~70-87 MB/s directly into Google Drive with ZERO SSD staging footprint.
