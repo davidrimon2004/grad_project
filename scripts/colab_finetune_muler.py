@@ -164,37 +164,8 @@ def _test_writable_directory(folder: Path) -> bool:
 def find_and_verify_drive_datasets(drive_root_input: str) -> tuple[Path, Path]:
     """
     Locates and verifies the true, writable Google Drive datasets directory.
-    Discovers whether the Colab environment uses 'My Drive' (space) or 'MyDrive' (no space),
-    verifying existence of known dataset files and confirming write access with a probe.
+    Checks the direct standard path first (instantaneous, 0ms) before doing any fallback discovery.
     """
-    candidates: List[Path] = []
-
-    # 1. From user input drive_root
-    p_in = Path(drive_root_input)
-    candidates.append(p_in / "datasets")
-    p_str = str(p_in)
-    if "MyDrive" in p_str:
-        candidates.append(Path(p_str.replace("MyDrive", "My Drive")) / "datasets")
-    elif "My Drive" in p_str:
-        candidates.append(Path(p_str.replace("My Drive", "MyDrive")) / "datasets")
-
-    # 2. Well-known standard Colab Google Drive locations
-    for root_prefix in ["/content/drive/My Drive", "/content/drive/MyDrive"]:
-        c = Path(root_prefix) / "Video-LLaVA" / "datasets"
-        if c not in candidates:
-            candidates.append(c)
-
-    # 3. Dynamic glob discovery under /content/drive
-    if os.path.exists("/content/drive"):
-        for found in glob.glob("/content/drive/*/Video-LLaVA/datasets"):
-            p_found = Path(found)
-            if p_found not in candidates:
-                candidates.append(p_found)
-        for found in glob.glob("/content/drive/*/*/datasets"):
-            p_found = Path(found)
-            if p_found not in candidates and "Video-LLaVA" in str(p_found):
-                candidates.append(p_found)
-
     known_markers = [
         "videochatgpt_tune_2.zip.001",
         "videochatgpt_tune_2.zip.002",
@@ -204,39 +175,52 @@ def find_and_verify_drive_datasets(drive_root_input: str) -> tuple[Path, Path]:
         "annotations.zip",
     ]
 
-    # Priority 1: Candidate containing known dataset archives that is also writable
-    for cand in candidates:
+    # 1. Primary candidate from user input (e.g. /content/drive/MyDrive/Video-LLaVA/datasets)
+    p_in = Path(drive_root_input)
+    primary_cands = [p_in / "datasets"]
+    p_str = str(p_in)
+    if "MyDrive" in p_str:
+        primary_cands.append(Path(p_str.replace("MyDrive", "My Drive")) / "datasets")
+    elif "My Drive" in p_str:
+        primary_cands.append(Path(p_str.replace("My Drive", "MyDrive")) / "datasets")
+    for root_prefix in ["/content/drive/MyDrive", "/content/drive/My Drive"]:
+        c = Path(root_prefix) / "Video-LLaVA" / "datasets"
+        if c not in primary_cands:
+            primary_cands.append(c)
+
+    # Check primary candidates FIRST (instantaneous, no glob overhead)
+    for cand in primary_cands:
         try:
-            has_marker = any((cand / marker).exists() for marker in known_markers)
-            if has_marker and _test_writable_directory(cand):
+            if cand.exists() and any((cand / marker).exists() for marker in known_markers) and _test_writable_directory(cand):
                 log_success(f"✓ Found active and writable Google Drive datasets directory: {cand}")
                 return cand.parent, cand
         except Exception:
             pass
 
-    # Priority 2: Candidate containing known dataset archives
+    # 2. Only if direct paths fail, do fallback discovery
+    log_info("Scanning for datasets folder on Google Drive...")
+    candidates = list(primary_cands)
+    if os.path.exists("/content/drive"):
+        try:
+            for found in glob.glob("/content/drive/*/Video-LLaVA/datasets"):
+                p_found = Path(found)
+                if p_found not in candidates:
+                    candidates.append(p_found)
+        except Exception:
+            pass
+
     for cand in candidates:
         try:
-            if any((cand / marker).exists() for marker in known_markers):
-                log_info(f"Using Drive datasets directory with existing archives: {cand}")
+            if cand.exists() and any((cand / marker).exists() for marker in known_markers) and _test_writable_directory(cand):
+                log_success(f"✓ Found active and writable Google Drive datasets directory: {cand}")
                 return cand.parent, cand
         except Exception:
             pass
 
-    # Priority 3: Any candidate that exists and is writable
     for cand in candidates:
         try:
             if cand.exists() and _test_writable_directory(cand):
                 log_success(f"Using writable Google Drive datasets directory: {cand}")
-                return cand.parent, cand
-        except Exception:
-            pass
-
-    # Priority 4: Any candidate whose parent exists and can be made writable
-    for cand in candidates:
-        try:
-            if cand.parent.exists() and _test_writable_directory(cand):
-                log_success(f"Created writable Google Drive datasets directory: {cand}")
                 return cand.parent, cand
         except Exception:
             pass
