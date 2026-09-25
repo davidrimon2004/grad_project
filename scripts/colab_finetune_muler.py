@@ -558,7 +558,8 @@ class InboundFineTuneMuler:
                     raise
 
         try:
-            with open(local_path, "rb") as fsrc:
+            open_mode = "r+b" if os.access(local_path, os.W_OK) else "rb"
+            with open(local_path, open_mode) as fsrc:
                 offset = 0
                 last_log = time.time()
                 total_bytes = local_path.stat().st_size
@@ -567,12 +568,23 @@ class InboundFineTuneMuler:
                     if not buf:
                         break
                     fdst.write(buf)
+                    try:
+                        if open_mode == "r+b" and hasattr(os, "fallocate"):
+                            os.fallocate(fsrc.fileno(), 0x03, offset, len(buf))
+                    except Exception:
+                        pass
                     offset += len(buf)
                     if time.time() - last_log >= 15:
                         pct = (offset / total_bytes) * 100 if total_bytes > 0 else 0
                         speed = (offset / (1024 ** 2)) / max(time.time() - start_t, 1)
                         log_info(f"Drive transfer: {offset / (1024**3):.2f} / {size_gb:.1f} GB ({pct:.1f}%) [{speed:.1f} MB/s]")
                         last_log = time.time()
+
+            fdst.flush()
+            try:
+                os.fsync(fdst.fileno())
+            except Exception:
+                pass
         finally:
             if fdst:
                 fdst.close()
@@ -681,23 +693,7 @@ class InboundFineTuneMuler:
                 staged.unlink(missing_ok=True)
                 return True
 
-        # 2. Check if a corrupted/truncated partial exists on Drive
-        for tc in target_candidates:
-            if tc.exists() and tc.stat().st_size < min_bytes:
-                curr_gb = tc.stat().st_size / (1024 ** 3)
-                expected_gb = min_bytes / (1024 ** 3)
-                log_warn(f"Drive copy of {part_name} is incomplete ({curr_gb:.2f} GB < {expected_gb:.2f} GB). Removing corrupted/partial file...")
-                tc.unlink(missing_ok=True)
-                time.sleep(1)
-
-        # 3. For large archives (>= 20 GB), aria2 staging + Drive copy requires ~2x file size on SSD.
-        # Direct Streaming streams at ~70-87 MB/s directly into Google Drive with ZERO SSD staging footprint.
-        # Use Direct Stream for all large files to prevent Errno 28 completely.
-        if min_bytes >= 20_000_000_000:
-            log_info(f"Large archive ({part_name}, ~{min_bytes/(1024**3):.1f} GB): using Direct Stream to Google Drive (Zero SSD staging)...")
-            return self._direct_stream_from_url_to_drive(url, drive_target, min_bytes)
-
-        # 4. For smaller files, check staging or use aria2c if available
+        # 2. Check if already downloaded in local SSD staging
         staging_dir = Path("/content/_staging")
         staging_dir.mkdir(parents=True, exist_ok=True)
         staged_file = staging_dir / part_name
@@ -706,15 +702,17 @@ class InboundFineTuneMuler:
             log_success(f"✓ {part_name} already in local SSD staging ({staged_file.stat().st_size / (1024**3):.2f} GB). Transferring to Drive...")
             return self._stream_copy_to_drive(staged_file, drive_target)
 
+        # 3. Download via aria2c to local SSD with 16 parallel connections
         self._prune_caches()
         free_ssd = shutil.disk_usage(staging_dir).free / (1024 ** 3)
         has_aria2 = self._ensure_aria2()
-        if has_aria2 and free_ssd >= 25.0:
-            log_info(f"🚀 Downloading {part_name} via aria2c (16 parallel connections on SSD)...")
+        if has_aria2 and free_ssd >= 35.0:
+            log_info(f"🚀 Downloading {part_name} via aria2c to local SSD (16 parallel streams, {free_ssd:.1f} GB free)...")
             cmd = [
                 "aria2c",
                 "-x", "16",
                 "-s", "16",
+                "-j", "16",
                 "-k", "1M",
                 "--file-allocation=none",
                 "--continue=true",
@@ -726,17 +724,10 @@ class InboundFineTuneMuler:
             res = subprocess.run(cmd, check=False)
             if res.returncode == 0 and staged_file.exists() and staged_file.stat().st_size >= min_bytes:
                 log_success(f"✓ Downloaded {part_name} to SSD ({staged_file.stat().st_size / (1024**3):.2f} GB)")
-                try:
-                    return self._stream_copy_to_drive(staged_file, drive_target)
-                except OSError as e:
-                    if e.errno == 28:
-                        log_warn(f"[Errno 28] Local SSD full during copy. Deleting staging and switching to Direct Stream for {part_name}...")
-                        staged_file.unlink(missing_ok=True)
-                        self._prune_caches()
-                        return self._direct_stream_from_url_to_drive(url, drive_target, min_bytes)
-                    raise
+                return self._stream_copy_to_drive(staged_file, drive_target)
 
-        # Fallback: direct streaming
+        # 4. Fallback: direct streaming
+        log_info(f"Using direct stream fallback for {part_name} (Zero local SSD usage)...")
         return self._direct_stream_from_url_to_drive(url, drive_target, min_bytes)
 
     def download_annotations(self) -> bool:
@@ -769,6 +760,13 @@ class InboundFineTuneMuler:
         return False
 
     def download_all_datasets(self) -> bool:
+        # Clean up any zero-byte leftover archives from previous failed attempts
+        for intermediate in ["llava_image_tune.zip", "videochatgpt_tune.zip"]:
+            bad = self.drive_data_dir / intermediate
+            if bad.exists() and bad.stat().st_size < 100_000_000:
+                log_info(f"Cleaning up 0-byte/corrupted intermediate archive: {intermediate}")
+                bad.unlink(missing_ok=True)
+
         all_ok = True
         log_header("2. Downloading Image Tuning Archives (~67.4 GB)")
         for part in self.IMAGE_TUNE_PARTS:
