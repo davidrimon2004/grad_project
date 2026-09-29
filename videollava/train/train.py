@@ -751,25 +751,29 @@ class LazySupervisedDataset(Dataset):
             vid_h5_path  = cdir / f"{prefix}_videos.h5"
             txt_h5_path  = cdir / f"{prefix}_text.h5"
 
-            if img_idx_path.exists() and img_h5_path.exists():
-                idx = json.loads(img_idx_path.read_text())
-                if idx and self._embed_image_h5_name is None:
-                    self._embed_image_index   = idx
-                    self._embed_image_h5_name = str(img_h5_path)
-                    rank0_print(
-                        f"[EmbedCache] Image cache: {img_h5_path.name}  "
-                        f"({len(idx):,} entries)"
-                    )
+            if img_idx_path.exists():
+                has_img_h5 = img_h5_path.exists() or any(cdir.glob(f"{prefix}_images_shard_*.h5"))
+                if has_img_h5:
+                    idx = json.loads(img_idx_path.read_text())
+                    if idx and self._embed_image_h5_name is None:
+                        self._embed_image_index   = idx
+                        self._embed_image_h5_name = str(img_h5_path)
+                        rank0_print(
+                            f"[EmbedCache] Image cache: {img_idx_path.stem}  "
+                            f"({len(idx):,} entries)"
+                        )
 
-            if vid_idx_path.exists() and vid_h5_path.exists():
-                idx = json.loads(vid_idx_path.read_text())
-                if idx and self._embed_video_h5_name is None:
-                    self._embed_video_index   = idx
-                    self._embed_video_h5_name = str(vid_h5_path)
-                    rank0_print(
-                        f"[EmbedCache] Video cache: {vid_h5_path.name}  "
-                        f"({len(idx):,} entries)"
-                    )
+            if vid_idx_path.exists():
+                has_vid_h5 = vid_h5_path.exists() or any(cdir.glob(f"{prefix}_videos_shard_*.h5"))
+                if has_vid_h5:
+                    idx = json.loads(vid_idx_path.read_text())
+                    if idx and self._embed_video_h5_name is None:
+                        self._embed_video_index   = idx
+                        self._embed_video_h5_name = str(vid_h5_path)
+                        rank0_print(
+                            f"[EmbedCache] Video cache: {vid_idx_path.stem}  "
+                            f"({len(idx):,} entries)"
+                        )
 
             if txt_idx_path.exists() and txt_h5_path.exists():
                 idx = json.loads(txt_idx_path.read_text())
@@ -787,10 +791,17 @@ class LazySupervisedDataset(Dataset):
             return None
         try:
             import h5py
-            h5_path = self._embed_image_h5_name
+            entry = self._embed_image_index[rel_path]
+            if isinstance(entry, dict):
+                shard_name = entry.get("shard", "")
+                h5_path = str(pathlib.Path(self._embed_image_h5_name).parent / shard_name)
+                row = entry.get("idx", 0)
+            else:
+                h5_path = self._embed_image_h5_name
+                row = entry
+
             if h5_path not in self._h5_handles:
                 self._h5_handles[h5_path] = h5py.File(h5_path, "r", swmr=True)
-            row = self._embed_image_index[rel_path]
             feat_np = self._h5_handles[h5_path]["features"][row]  # [N, D] np.float16
             return torch.from_numpy(feat_np.astype("float32"))    # [N, D] fp32
         except Exception as exc:
@@ -803,10 +814,17 @@ class LazySupervisedDataset(Dataset):
             return None
         try:
             import h5py
-            h5_path = self._embed_video_h5_name
+            entry = self._embed_video_index[rel_path]
+            if isinstance(entry, dict):
+                shard_name = entry.get("shard", "")
+                h5_path = str(pathlib.Path(self._embed_video_h5_name).parent / shard_name)
+                row = entry.get("idx", 0)
+            else:
+                h5_path = self._embed_video_h5_name
+                row = entry
+
             if h5_path not in self._h5_handles:
                 self._h5_handles[h5_path] = h5py.File(h5_path, "r", swmr=True)
-            row = self._embed_video_index[rel_path]
             feat_np = self._h5_handles[h5_path]["features"][row]  # [T, N, D]
             return torch.from_numpy(feat_np.astype("float32"))    # [T, N, D] fp32
         except Exception as exc:

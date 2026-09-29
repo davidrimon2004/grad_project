@@ -146,9 +146,16 @@ def _open_or_create_hdf5(path: Path, n_samples: int, feat_shape: Tuple[int, ...]
 # HDF5 helpers: Textual
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _open_or_create_text_hdf5(path: Path, vocab_weight: np.ndarray, hidden_size: int):
+def _open_or_create_text_hdf5(
+    path: Path,
+    vocab_weight: np.ndarray,
+    hidden_size: int,
+    save_raw_embeds: bool = False,
+):
     """
-    Opens an existing text HDF5 file or creates an extensible one.
+    Opens an existing text HDF5 file or creates a compact/extensible one.
+    When save_raw_embeds=False (default), stores pre-tokenized token_ids and labels
+    (~500 MB total for 1.26M samples) without the redundant 1 TB float16 expansion.
     Returns (h5_file, dset_embeds, dset_tokens, dset_labels, dset_offsets, written_samples, total_tokens).
     """
     try:
@@ -159,7 +166,7 @@ def _open_or_create_text_hdf5(path: Path, vocab_weight: np.ndarray, hidden_size:
 
     if path.exists():
         h5 = h5py.File(str(path), "a")
-        dset_embeds = h5["text_embeddings"]
+        dset_embeds = h5["text_embeddings"] if "text_embeddings" in h5 else None
         dset_tokens = h5["token_ids"]
         dset_labels = h5["labels"]
         dset_offsets = h5["offsets"]
@@ -171,7 +178,7 @@ def _open_or_create_text_hdf5(path: Path, vocab_weight: np.ndarray, hidden_size:
     path.parent.mkdir(parents=True, exist_ok=True)
     h5 = h5py.File(str(path), "w")
 
-    # Store full vocabulary embedding table once for easy offline lookup
+    # Store full vocabulary embedding table once for reference (260 MB)
     h5.create_dataset(
         "vocab_embeddings",
         data=vocab_weight.astype(np.float16),
@@ -179,21 +186,23 @@ def _open_or_create_text_hdf5(path: Path, vocab_weight: np.ndarray, hidden_size:
         compression="lzf",
     )
 
-    # Extensible datasets
-    dset_embeds = h5.create_dataset(
-        "text_embeddings",
-        shape=(0, hidden_size),
-        maxshape=(None, hidden_size),
-        dtype=np.float16,
-        chunks=(2048, hidden_size),
-        compression="lzf",
-    )
+    dset_embeds = None
+    if save_raw_embeds:
+        dset_embeds = h5.create_dataset(
+            "text_embeddings",
+            shape=(0, hidden_size),
+            maxshape=(None, hidden_size),
+            dtype=np.float16,
+            chunks=(2048, hidden_size),
+            compression="lzf",
+        )
+
     dset_tokens = h5.create_dataset(
         "token_ids",
         shape=(0,),
         maxshape=(None,),
         dtype=np.int32,
-        chunks=(8192,),
+        chunks=(16384,),
         compression="lzf",
     )
     dset_labels = h5.create_dataset(
@@ -201,7 +210,7 @@ def _open_or_create_text_hdf5(path: Path, vocab_weight: np.ndarray, hidden_size:
         shape=(0,),
         maxshape=(None,),
         dtype=np.int32,
-        chunks=(8192,),
+        chunks=(16384,),
         compression="lzf",
     )
     dset_offsets = h5.create_dataset(
@@ -209,14 +218,15 @@ def _open_or_create_text_hdf5(path: Path, vocab_weight: np.ndarray, hidden_size:
         shape=(1,),
         maxshape=(None,),
         dtype=np.int64,
-        chunks=(4096,),
+        chunks=(8192,),
     )
     dset_offsets[0] = 0
 
     h5.attrs["written_samples"] = 0
     h5.attrs["total_tokens"] = 0
     h5.attrs["hidden_size"] = hidden_size
-    log(f"  Created extensible {path.name}: hidden_size={hidden_size}")
+    mode_str = "with 4096-dim float16 embeddings" if save_raw_embeds else "compact mode (pre-tokenized token_ids + labels ~500 MB)"
+    log(f"  Created {path.name}: {mode_str}")
     return h5, dset_embeds, dset_tokens, dset_labels, dset_offsets, 0, 0
 
 
@@ -500,14 +510,18 @@ def embed_images(
     projector: Optional[torch.nn.Module] = None,
     staging_dir: Optional[Path] = None,
     sync_interval_mins: float = 15.0,
+    images_per_shard: int = 2000,
+    enable_sharding: bool = True,
 ):
     """
     Encodes images through LanguageBind (and optional mm_projector) to HDF5.
+    When enable_sharding=True (default), writes into 5 GB shards (default 2,000 images/shard)
+    so Google Drive uploads and clears each shard from Colab SSD cache without overflow.
     """
     from PIL import Image as PILImage
 
     n_total = len(file_list)
-    log_header(f"Embedding {n_total:,} images  ->  {h5_path.name}")
+    log_header(f"Embedding {n_total:,} images  ->  {h5_path.parent}")
 
     # Probe feature shape
     probe_path = None
@@ -530,81 +544,144 @@ def embed_images(
     log(f"  Feature shape per image: {feat_shape} (projected={projector is not None})")
     del probe_feat, probe_tensor
 
-    work_h5, work_index, target_h5, target_index = _prepare_staged_paths(
-        h5_path, index_path, staging_dir
-    )
-    h5, dset, written = _open_or_create_hdf5(work_h5, n_total, feat_shape)
+    index: Dict[str, Any] = {}
+    if index_path.exists():
+        try:
+            index = json.loads(index_path.read_text())
+        except Exception as exc:
+            log_warn(f"Failed to load existing index {index_path}: {exc}")
 
-    index: Dict[str, int] = {}
-    if work_index.exists():
-        index = json.loads(work_index.read_text())
+    # Resume check: filter files already processed
+    pending_files = [f for f in file_list if f not in index]
+    already_done = n_total - len(pending_files)
+    if already_done > 0:
+        log_ok(f"Resuming: {already_done:,} / {n_total:,} images already cached in index.")
+    if not pending_files:
+        log_ok(f"All {n_total:,} images are already embedded!")
+        return
 
     t0 = time.time()
-    last_sync = time.time()
-    sync_interval_sec = max(60.0, sync_interval_mins * 60.0)
+    h5 = None
 
-    try:
-        for batch_start in range(written, n_total, batch_size):
-            batch_files = file_list[batch_start: batch_start + batch_size]
-            tensors: List[torch.Tensor] = []
-            valid_files: List[str] = []
+    if enable_sharding:
+        current_shard_idx = len(index) // images_per_shard
+        shard_filename = f"{h5_path.stem}_shard_{current_shard_idx:04d}.h5"
+        shard_path = h5_path.parent / shard_filename
+        h5, dset, written_in_shard = _open_or_create_hdf5(shard_path, images_per_shard, feat_shape)
+        if written_in_shard >= images_per_shard:
+            h5.close()
+            current_shard_idx += 1
+            shard_filename = f"{h5_path.stem}_shard_{current_shard_idx:04d}.h5"
+            shard_path = h5_path.parent / shard_filename
+            h5, dset, written_in_shard = _open_or_create_hdf5(shard_path, images_per_shard, feat_shape)
 
-            for rel_path in batch_files:
-                full = image_folder / rel_path
+        try:
+            for batch_start in range(0, len(pending_files), batch_size):
+                batch_files = pending_files[batch_start : batch_start + batch_size]
+                tensors: List[torch.Tensor] = []
+                valid_files: List[str] = []
+
+                for rel_path in batch_files:
+                    full = image_folder / rel_path
+                    try:
+                        img = PILImage.open(str(full)).convert("RGB")
+                        pv = processor.preprocess(img, return_tensors="pt")["pixel_values"][0]
+                        tensors.append(pv)
+                    except Exception as exc:
+                        log_warn(f"  Skipping {rel_path}: {exc}")
+                        tensors.append(torch.zeros((3, 224, 224), dtype=dtype))
+                    valid_files.append(rel_path)
+
+                batch_tensor = torch.stack(tensors).to(device=device, dtype=dtype)
+                with torch.no_grad():
+                    feats = tower(batch_tensor)
+                    if projector is not None:
+                        feats = projector(feats.to(next(projector.parameters()).dtype))
+
+                feats_np = feats.cpu().to(torch.float16).numpy().astype(np.float16)
+
+                for k, rel_path in enumerate(valid_files):
+                    if written_in_shard >= images_per_shard:
+                        h5.attrs["written"] = written_in_shard
+                        h5.flush()
+                        h5.close()
+                        log_ok(f"  [Shard {current_shard_idx:04d}] Full ({written_in_shard:,} images) -> {shard_filename}")
+                        index_path.write_text(json.dumps(index, separators=(",", ":")))
+
+                        current_shard_idx += 1
+                        shard_filename = f"{h5_path.stem}_shard_{current_shard_idx:04d}.h5"
+                        shard_path = h5_path.parent / shard_filename
+                        h5, dset, written_in_shard = _open_or_create_hdf5(shard_path, images_per_shard, feat_shape)
+
+                    dset[written_in_shard] = feats_np[k]
+                    index[rel_path] = {"shard": shard_filename, "idx": written_in_shard}
+                    written_in_shard += 1
+
+                h5.attrs["written"] = written_in_shard
+
+                if (batch_start // batch_size) % 50 == 49:
+                    h5.flush()
+                    index_path.write_text(json.dumps(index, separators=(",", ":")))
+
+                elapsed = time.time() - t0
+                cur_total = len(index)
+                pct = cur_total / n_total * 100
+                rate = (cur_total - already_done) / elapsed if elapsed > 1 else 0
+                eta_s = (n_total - cur_total) / rate if rate > 0 else float("inf")
+                print(
+                    f"\r  [{cur_total:>7,}/{n_total:,}] {pct:5.1f}% | "
+                    f"{rate:6.0f} img/s | shard {current_shard_idx:04d} ({written_in_shard}/{images_per_shard}) | ETA {eta_s/3600:.1f}h",
+                    end="", flush=True,
+                )
+        finally:
+            if h5 is not None:
                 try:
-                    img = PILImage.open(str(full)).convert("RGB")
-                    pv = processor.preprocess(img, return_tensors="pt")["pixel_values"][0]
-                    tensors.append(pv)
-                except Exception as exc:
-                    log_warn(f"  Skipping {rel_path}: {exc}")
-                    tensors.append(torch.zeros((3, 224, 224), dtype=dtype))
-                valid_files.append(rel_path)
-
-            batch_tensor = torch.stack(tensors).to(device=device, dtype=dtype)
-            with torch.no_grad():
-                feats = tower(batch_tensor)  # [B, N, D]
-                if projector is not None:
-                    feats = projector(feats.to(next(projector.parameters()).dtype))
-
-            feats_np = feats.cpu().to(torch.float16).numpy().astype(np.float16)
-            end_row = batch_start + len(valid_files)
-            dset[batch_start:end_row] = feats_np
-
-            for k, rel_path in enumerate(valid_files):
-                index[rel_path] = batch_start + k
-
-            written = end_row
-            h5.attrs["written"] = written
-
-            # Flush periodically to local disk
-            if (batch_start // batch_size) % 100 == 99:
-                h5.flush()
-                work_index.write_text(json.dumps(index, separators=(",", ":")))
-                if target_h5 is not None and (time.time() - last_sync >= sync_interval_sec):
-                    _sync_staged_files(work_h5, work_index, target_h5, target_index)
-                    last_sync = time.time()
-
-            elapsed = time.time() - t0
-            pct = written / n_total * 100
-            rate = written / elapsed if elapsed > 1 else 0
-            eta_s = (n_total - written) / rate if rate > 0 else float("inf")
-            print(
-                f"\r  [{written:>7,}/{n_total:,}] {pct:5.1f}% | "
-                f"{rate:6.0f} img/s | ETA {eta_s/3600:.1f}h",
-                end="", flush=True,
-            )
-    finally:
-        h5.flush()
-        h5.close()
-        work_index.write_text(json.dumps(index, separators=(",", ":")))
-        if target_h5 is not None:
-            _sync_staged_files(work_h5, work_index, target_h5, target_index)
-        print()
+                    h5.attrs["written"] = written_in_shard
+                    h5.flush()
+                    h5.close()
+                except Exception:
+                    pass
+            index_path.write_text(json.dumps(index, separators=(",", ":")))
+            print()
+    else:
+        # Legacy single-file mode
+        work_h5, work_index, target_h5, target_index = _prepare_staged_paths(
+            h5_path, index_path, staging_dir
+        )
+        h5, dset, written = _open_or_create_hdf5(work_h5, n_total, feat_shape)
+        try:
+            for batch_start in range(written, n_total, batch_size):
+                batch_files = file_list[batch_start : batch_start + batch_size]
+                tensors = []
+                valid_files = []
+                for rel_path in batch_files:
+                    full = image_folder / rel_path
+                    try:
+                        img = PILImage.open(str(full)).convert("RGB")
+                        tensors.append(processor.preprocess(img, return_tensors="pt")["pixel_values"][0])
+                    except Exception:
+                        tensors.append(torch.zeros((3, 224, 224), dtype=dtype))
+                    valid_files.append(rel_path)
+                batch_tensor = torch.stack(tensors).to(device=device, dtype=dtype)
+                with torch.no_grad():
+                    feats = tower(batch_tensor)
+                    if projector is not None:
+                        feats = projector(feats.to(next(projector.parameters()).dtype))
+                feats_np = feats.cpu().to(torch.float16).numpy().astype(np.float16)
+                end_row = batch_start + len(valid_files)
+                dset[batch_start:end_row] = feats_np
+                for k, rel_path in enumerate(valid_files):
+                    index[rel_path] = batch_start + k
+                written = end_row
+                h5.attrs["written"] = written
+        finally:
+            h5.flush()
+            h5.close()
+            work_index.write_text(json.dumps(index, separators=(",", ":")))
+            print()
 
     elapsed = time.time() - t0
-    final_dest = target_h5 if target_h5 is not None else work_h5
-    log_ok(f"Done {written:,} images in {elapsed/3600:.2f}h  ->  {final_dest}")
-    log_ok(f"Index saved  ->  {target_index if target_index is not None else work_index}  ({len(index):,} entries)")
+    log_ok(f"Done {len(index):,} images in {elapsed/3600:.2f}h  ->  {index_path}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -624,14 +701,17 @@ def embed_videos(
     projector: Optional[torch.nn.Module] = None,
     staging_dir: Optional[Path] = None,
     sync_interval_mins: float = 15.0,
+    videos_per_shard: int = 250,
+    enable_sharding: bool = True,
 ):
     """
     Encodes videos through LanguageBind (and optional mm_projector) to HDF5.
+    When enable_sharding=True (default), writes into 5 GB shards (default 250 videos/shard)
+    so Google Drive uploads and clears each shard from Colab SSD cache without overflow.
     """
     n_total = len(file_list)
-    log_header(f"Embedding {n_total:,} videos  ->  {h5_path.name}")
+    log_header(f"Embedding {n_total:,} videos  ->  {h5_path.parent}")
 
-    # Probe feature shape
     probe_path = None
     for probe_rel in file_list[:100]:
         candidate = video_folder / probe_rel
@@ -653,79 +733,140 @@ def embed_videos(
     log(f"  Feature shape per video: {feat_shape} (projected={projector is not None})")
     del probe_feat, probe_pv
 
-    work_h5, work_index, target_h5, target_index = _prepare_staged_paths(
-        h5_path, index_path, staging_dir
-    )
-    h5, dset, written = _open_or_create_hdf5(work_h5, n_total, feat_shape)
+    index: Dict[str, Any] = {}
+    if index_path.exists():
+        try:
+            index = json.loads(index_path.read_text())
+        except Exception as exc:
+            log_warn(f"Failed to load existing index {index_path}: {exc}")
 
-    index: Dict[str, int] = {}
-    if work_index.exists():
-        index = json.loads(work_index.read_text())
+    pending_files = [f for f in file_list if f not in index]
+    already_done = n_total - len(pending_files)
+    if already_done > 0:
+        log_ok(f"Resuming: {already_done:,} / {n_total:,} videos already cached in index.")
+    if not pending_files:
+        log_ok(f"All {n_total:,} videos are already embedded!")
+        return
 
     t0 = time.time()
-    last_sync = time.time()
-    sync_interval_sec = max(60.0, sync_interval_mins * 60.0)
+    h5 = None
 
-    try:
-        for batch_start in range(written, n_total, batch_size):
-            batch_files = file_list[batch_start: batch_start + batch_size]
-            pvs: List[torch.Tensor] = []
-            valid_files: List[str] = []
+    if enable_sharding:
+        current_shard_idx = len(index) // videos_per_shard
+        shard_filename = f"{h5_path.stem}_shard_{current_shard_idx:04d}.h5"
+        shard_path = h5_path.parent / shard_filename
+        h5, dset, written_in_shard = _open_or_create_hdf5(shard_path, videos_per_shard, feat_shape)
+        if written_in_shard >= videos_per_shard:
+            h5.close()
+            current_shard_idx += 1
+            shard_filename = f"{h5_path.stem}_shard_{current_shard_idx:04d}.h5"
+            shard_path = h5_path.parent / shard_filename
+            h5, dset, written_in_shard = _open_or_create_hdf5(shard_path, videos_per_shard, feat_shape)
 
-            for rel_path in batch_files:
-                full = str(video_folder / rel_path)
+        try:
+            for batch_start in range(0, len(pending_files), batch_size):
+                batch_files = pending_files[batch_start : batch_start + batch_size]
+                pvs: List[torch.Tensor] = []
+                valid_files: List[str] = []
+
+                for rel_path in batch_files:
+                    full = str(video_folder / rel_path)
+                    try:
+                        pv = processor(full, return_tensors="pt")["pixel_values"][0]
+                        pvs.append(pv)
+                    except Exception as exc:
+                        log_warn(f"  Skipping {rel_path}: {exc}")
+                        pvs.append(torch.zeros((8, 3, 224, 224), dtype=dtype))
+                    valid_files.append(rel_path)
+
+                batch_tensor = torch.stack(pvs).to(device=device, dtype=dtype)
+                with torch.no_grad():
+                    feats = tower(batch_tensor)
+                    if projector is not None:
+                        feats = projector(feats.to(next(projector.parameters()).dtype))
+
+                feats_np = feats.cpu().to(torch.float16).numpy().astype(np.float16)
+
+                for k, rel_path in enumerate(valid_files):
+                    if written_in_shard >= videos_per_shard:
+                        h5.attrs["written"] = written_in_shard
+                        h5.flush()
+                        h5.close()
+                        log_ok(f"  [Shard {current_shard_idx:04d}] Full ({written_in_shard:,} videos) -> {shard_filename}")
+                        index_path.write_text(json.dumps(index, separators=(",", ":")))
+
+                        current_shard_idx += 1
+                        shard_filename = f"{h5_path.stem}_shard_{current_shard_idx:04d}.h5"
+                        shard_path = h5_path.parent / shard_filename
+                        h5, dset, written_in_shard = _open_or_create_hdf5(shard_path, videos_per_shard, feat_shape)
+
+                    dset[written_in_shard] = feats_np[k]
+                    index[rel_path] = {"shard": shard_filename, "idx": written_in_shard}
+                    written_in_shard += 1
+
+                h5.attrs["written"] = written_in_shard
+
+                if (batch_start // batch_size) % 50 == 49:
+                    h5.flush()
+                    index_path.write_text(json.dumps(index, separators=(",", ":")))
+
+                elapsed = time.time() - t0
+                cur_total = len(index)
+                pct = cur_total / n_total * 100
+                rate = (cur_total - already_done) / elapsed if elapsed > 1 else 0
+                eta_s = (n_total - cur_total) / rate if rate > 0 else float("inf")
+                print(
+                    f"\r  [{cur_total:>6,}/{n_total:,}] {pct:5.1f}% | "
+                    f"{rate:.2f} vid/s | shard {current_shard_idx:04d} ({written_in_shard}/{videos_per_shard}) | ETA {eta_s/3600:.1f}h",
+                    end="", flush=True,
+                )
+        finally:
+            if h5 is not None:
                 try:
-                    pv = processor(full, return_tensors="pt")["pixel_values"][0]
-                    pvs.append(pv)
-                except Exception as exc:
-                    log_warn(f"  Skipping {rel_path}: {exc}")
-                    pvs.append(torch.zeros((8, 3, 224, 224), dtype=dtype))
-                valid_files.append(rel_path)
-
-            batch_tensor = torch.stack(pvs).to(device=device, dtype=dtype)
-            with torch.no_grad():
-                feats = tower(batch_tensor)  # [B, T, N, D]
-                if projector is not None:
-                    feats = projector(feats.to(next(projector.parameters()).dtype))
-
-            feats_np = feats.cpu().to(torch.float16).numpy().astype(np.float16)
-            end_row = batch_start + len(valid_files)
-            dset[batch_start:end_row] = feats_np
-
-            for k, rel_path in enumerate(valid_files):
-                index[rel_path] = batch_start + k
-
-            written = end_row
-            h5.attrs["written"] = written
-
-            if (batch_start // batch_size) % 50 == 49:
-                h5.flush()
-                work_index.write_text(json.dumps(index, separators=(",", ":")))
-                if target_h5 is not None and (time.time() - last_sync >= sync_interval_sec):
-                    _sync_staged_files(work_h5, work_index, target_h5, target_index)
-                    last_sync = time.time()
-
-            elapsed = time.time() - t0
-            pct = written / n_total * 100
-            rate = written / elapsed if elapsed > 1 else 0
-            eta_s = (n_total - written) / rate if rate > 0 else float("inf")
-            print(
-                f"\r  [{written:>6,}/{n_total:,}] {pct:5.1f}% | "
-                f"{rate:.2f} vid/s | ETA {eta_s/3600:.1f}h",
-                end="", flush=True,
-            )
-    finally:
-        h5.flush()
-        h5.close()
-        work_index.write_text(json.dumps(index, separators=(",", ":")))
-        if target_h5 is not None:
-            _sync_staged_files(work_h5, work_index, target_h5, target_index)
-        print()
+                    h5.attrs["written"] = written_in_shard
+                    h5.flush()
+                    h5.close()
+                except Exception:
+                    pass
+            index_path.write_text(json.dumps(index, separators=(",", ":")))
+            print()
+    else:
+        work_h5, work_index, target_h5, target_index = _prepare_staged_paths(
+            h5_path, index_path, staging_dir
+        )
+        h5, dset, written = _open_or_create_hdf5(work_h5, n_total, feat_shape)
+        try:
+            for batch_start in range(written, n_total, batch_size):
+                batch_files = file_list[batch_start : batch_start + batch_size]
+                pvs = []
+                valid_files = []
+                for rel_path in batch_files:
+                    full = str(video_folder / rel_path)
+                    try:
+                        pvs.append(processor(full, return_tensors="pt")["pixel_values"][0])
+                    except Exception:
+                        pvs.append(torch.zeros((8, 3, 224, 224), dtype=dtype))
+                    valid_files.append(rel_path)
+                batch_tensor = torch.stack(pvs).to(device=device, dtype=dtype)
+                with torch.no_grad():
+                    feats = tower(batch_tensor)
+                    if projector is not None:
+                        feats = projector(feats.to(next(projector.parameters()).dtype))
+                feats_np = feats.cpu().to(torch.float16).numpy().astype(np.float16)
+                end_row = batch_start + len(valid_files)
+                dset[batch_start:end_row] = feats_np
+                for k, rel_path in enumerate(valid_files):
+                    index[rel_path] = batch_start + k
+                written = end_row
+                h5.attrs["written"] = written
+        finally:
+            h5.flush()
+            h5.close()
+            work_index.write_text(json.dumps(index, separators=(",", ":")))
+            print()
 
     elapsed = time.time() - t0
-    final_dest = target_h5 if target_h5 is not None else work_h5
-    log_ok(f"Done {written:,} videos in {elapsed/3600:.2f}h  ->  {final_dest}")
-    log_ok(f"Index saved  ->  {target_index if target_index is not None else work_index}")
+    log_ok(f"Done {len(index):,} videos in {elapsed/3600:.2f}h  ->  {index_path}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -806,7 +947,7 @@ def _preprocess_sample_text(
 def embed_text(
     json_paths: List[Path],
     tokenizer: transformers.PreTrainedTokenizer,
-    embed_tokens_layer: torch.nn.Module,
+    embed_tokens_layer: Optional[torch.nn.Module],
     vocab_weight: np.ndarray,
     hidden_size: int,
     h5_path: Path,
@@ -816,10 +957,12 @@ def embed_text(
     batch_size: int = 256,
     staging_dir: Optional[Path] = None,
     sync_interval_mins: float = 15.0,
+    save_raw_embeds: bool = False,
 ):
     """
-    Precomputes textual token embeddings, token_ids, labels, and offsets into an
-    extensible HDF5 file. Fully resumable.
+    Precomputes pre-tokenized token_ids, labels, and offsets into an HDF5 file.
+    By default, saves in compact mode (~500 MB for 1.26M samples) without the
+    redundant 1 TB float16 expansion, enabling fast tokenization without filling SSD cache.
     """
     # Load all items across JSONs
     all_samples: List[Dict[str, Any]] = []
@@ -840,7 +983,7 @@ def embed_text(
         h5_path, index_path, staging_dir
     )
     h5, dset_embeds, dset_tokens, dset_labels, dset_offsets, written, total_tokens = (
-        _open_or_create_text_hdf5(work_h5, vocab_weight, hidden_size)
+        _open_or_create_text_hdf5(work_h5, vocab_weight, hidden_size, save_raw_embeds=save_raw_embeds)
     )
 
     index: Dict[str, Any] = {}
@@ -896,30 +1039,28 @@ def embed_text(
                     "media_path": mpath,
                 })
 
-            # Concatenate token IDs and look up embeddings on GPU
+            # Concatenate token IDs and labels
             flat_tokens = np.concatenate(batch_token_ids_list)
             flat_labels = np.concatenate(batch_labels_list)
             num_tokens_in_batch = len(flat_tokens)
 
-            # Clamp negative token ids (like -200) to 0 for embedding lookup
-            lookup_tokens = np.where(flat_tokens >= 0, flat_tokens, 0)
-            tokens_tensor = torch.from_numpy(lookup_tokens).to(device=device, dtype=torch.long)
-
-            with torch.no_grad():
-                embeds = embed_tokens_layer(tokens_tensor)  # [num_tokens, hidden_size]
-                # Zero out embeddings for image tokens (-200)
-                mask_non_text = torch.from_numpy(flat_tokens < 0).to(device=device)
-                if mask_non_text.any():
-                    embeds[mask_non_text] = 0
-
-            embeds_np = embeds.cpu().to(torch.float16).numpy().astype(np.float16)
-
-            # Append to HDF5
-            cur_tokens = dset_embeds.shape[0]
+            cur_tokens = dset_tokens.shape[0]
             new_tokens = cur_tokens + num_tokens_in_batch
-            dset_embeds.resize((new_tokens, hidden_size))
-            dset_embeds[cur_tokens:new_tokens] = embeds_np
 
+            if save_raw_embeds and dset_embeds is not None and embed_tokens_layer is not None:
+                # Clamp negative token ids (like -200) to 0 for embedding lookup
+                lookup_tokens = np.where(flat_tokens >= 0, flat_tokens, 0)
+                tokens_tensor = torch.from_numpy(lookup_tokens).to(device=device, dtype=torch.long)
+                with torch.no_grad():
+                    embeds = embed_tokens_layer(tokens_tensor)
+                    mask_non_text = torch.from_numpy(flat_tokens < 0).to(device=device)
+                    if mask_non_text.any():
+                        embeds[mask_non_text] = 0
+                embeds_np = embeds.cpu().to(torch.float16).numpy().astype(np.float16)
+                dset_embeds.resize((new_tokens, hidden_size))
+                dset_embeds[cur_tokens:new_tokens] = embeds_np
+
+            # Append to compact token_ids and labels
             dset_tokens.resize((new_tokens,))
             dset_tokens[cur_tokens:new_tokens] = flat_tokens
 
@@ -1260,6 +1401,28 @@ def main():
         default=15.0,
         help="Minutes between periodic syncs from local staging to Drive (default: 15.0).",
     )
+    parser.add_argument(
+        "--images_per_shard",
+        type=int,
+        default=2000,
+        help="Images per HDF5 shard (default: 2000, ~4.2 GB uncompressed). Prevents Colab SSD cache overflow.",
+    )
+    parser.add_argument(
+        "--videos_per_shard",
+        type=int,
+        default=250,
+        help="Videos per HDF5 shard (default: 250, ~4.2 GB uncompressed). Prevents Colab SSD cache overflow.",
+    )
+    parser.add_argument(
+        "--no_sharding",
+        action="store_true",
+        help="Disable HDF5 sharding and write a single monolithic file (not recommended on Google Drive FUSE).",
+    )
+    parser.add_argument(
+        "--save_raw_text_embeddings",
+        action="store_true",
+        help="Save raw 4096-dim float16 embeddings (~1 TB). Default is False (compact pre-tokenized token_ids & labels ~500 MB).",
+    )
     args = parser.parse_args()
 
     # -- device / dtype ------------------------------------------------------
@@ -1390,6 +1553,8 @@ def main():
                     projector=projector,
                     staging_dir=staging_dir,
                     sync_interval_mins=args.sync_interval_mins,
+                    images_per_shard=args.images_per_shard,
+                    enable_sharding=not args.no_sharding,
                 )
 
         # 2. Videos
@@ -1410,6 +1575,8 @@ def main():
                     projector=projector,
                     staging_dir=staging_dir,
                     sync_interval_mins=args.sync_interval_mins,
+                    videos_per_shard=args.videos_per_shard,
+                    enable_sharding=not args.no_sharding,
                 )
 
         # 3. Text
@@ -1427,6 +1594,7 @@ def main():
                 batch_size=args.text_batch_size,
                 staging_dir=staging_dir,
                 sync_interval_mins=args.sync_interval_mins,
+                save_raw_embeds=args.save_raw_text_embeddings,
             )
 
     # -- write meta -----------------------------------------------------------
