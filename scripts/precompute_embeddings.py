@@ -223,6 +223,11 @@ def _open_or_create_text_hdf5(path: Path, vocab_weight: np.ndarray, hidden_size:
 # Tower & Model Loading
 # ──────────────────────────────────────────────────────────────────────────────
 
+class _TowerArgs:
+    mm_vision_select_layer = -2
+    mm_vision_select_feature = "patch"
+
+
 def load_image_tower(model_name: str, device: torch.device, dtype: torch.dtype):
     """Loads the LanguageBind Image tower in eval/frozen mode."""
     from videollava.model.multimodal_encoder.languagebind import (
@@ -230,7 +235,7 @@ def load_image_tower(model_name: str, device: torch.device, dtype: torch.dtype):
         LanguageBindImageProcessor,
     )
     log(f"Loading image tower: {model_name}")
-    tower = LanguageBindImageTower(model_name, args=None, cache_dir=None, delay_load=False)
+    tower = LanguageBindImageTower(model_name, args=_TowerArgs(), cache_dir=None, delay_load=False)
     tower = tower.to(device=device, dtype=dtype).eval()
     for p in tower.parameters():
         p.requires_grad_(False)
@@ -246,7 +251,7 @@ def load_video_tower(model_name: str, device: torch.device, dtype: torch.dtype):
         LanguageBindVideoProcessor,
     )
     log(f"Loading video tower: {model_name}")
-    tower = LanguageBindVideoTower(model_name, args=None, cache_dir=None, delay_load=False)
+    tower = LanguageBindVideoTower(model_name, args=_TowerArgs(), cache_dir=None, delay_load=False)
     tower = tower.to(device=device, dtype=dtype).eval()
     for p in tower.parameters():
         p.requires_grad_(False)

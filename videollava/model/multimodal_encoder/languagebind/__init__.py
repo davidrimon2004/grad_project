@@ -120,8 +120,8 @@ class LanguageBindImageTower(nn.Module):
         self.is_loaded = False
 
         self.image_tower_name = image_tower
-        self.select_layer = args.mm_vision_select_layer
-        self.select_feature = getattr(args, 'mm_vision_select_feature', 'patch')
+        self.select_layer = getattr(args, 'mm_vision_select_layer', -2) if args is not None else -2
+        self.select_feature = getattr(args, 'mm_vision_select_feature', 'patch') if args is not None else 'patch'
 
         self.cache_dir = cache_dir
 
@@ -210,8 +210,8 @@ class LanguageBindVideoTower(nn.Module):
         self.is_loaded = False
 
         self.video_tower_name = video_tower
-        self.select_layer = args.mm_vision_select_layer
-        self.select_feature = getattr(args, 'mm_vision_select_feature', 'patch')
+        self.select_layer = getattr(args, 'mm_vision_select_layer', -2) if args is not None else -2
+        self.select_feature = getattr(args, 'mm_vision_select_feature', 'patch') if args is not None else 'patch'
 
         self.cache_dir = cache_dir
 
