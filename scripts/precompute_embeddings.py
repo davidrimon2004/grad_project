@@ -998,35 +998,46 @@ def extract_file_lists(json_paths: List[Path]) -> Tuple[List[str], List[str]]:
     return image_files, video_files
 
 
-def resolve_json_paths(base: Path, candidate_names: List[str]) -> List[Path]:
-    """Finds existing annotation JSON files across common dataset/annotation directory structures."""
+def resolve_json_paths(base: Path, candidate_groups: List[Any]) -> List[Path]:
+    """
+    Finds existing annotation JSON files across common dataset/annotation directory structures.
+    candidate_groups can be a list of filenames or a list of alias groups (e.g. [['a.json', 'b.json']]).
+    Stops searching an alias group once a matching file is found. Never performs recursive rglob
+    over network filesystems like Google Drive.
+    """
     found: List[Path] = []
     common_subdirs = [
+        base / "datasets" / "annotations",
         base / "datasets" / "pt_json",
         base / "datasets" / "ft_json",
-        base / "datasets" / "annotations",
         base / "datasets",
+        base / "data" / "annotations",
         base / "data" / "pt_json",
         base / "data" / "ft_json",
-        base / "data" / "annotations",
         base / "data",
         base / "annotations",
         base / "pt_json",
         base / "ft_json",
+        base / "download" / "annotations",
+        base / "download",
         base,
     ]
-    for name in candidate_names:
+    existing_subdirs = [s for s in common_subdirs if s.exists() and s.is_dir()]
+
+    for item in candidate_groups:
+        group = item if isinstance(item, list) else [item]
         matched = None
-        for sdir in common_subdirs:
-            p = sdir / name
-            if p.exists() and p.is_file() and p.stat().st_size > 0:
-                matched = p
+        for name in group:
+            for sdir in existing_subdirs:
+                p = sdir / name
+                try:
+                    if p.is_file() and p.stat().st_size > 0:
+                        matched = p
+                        break
+                except Exception:
+                    continue
+            if matched is not None:
                 break
-        if not matched and base.exists():
-            for p in base.rglob(name):
-                if p.is_file() and p.stat().st_size > 0:
-                    matched = p
-                    break
         if matched and matched not in found:
             found.append(matched)
             try:
@@ -1175,32 +1186,42 @@ def main():
             staging_dir = default_stage
             log_ok(f"Detected Google Drive destination. Auto-enabled local NVMe staging: {staging_dir}")
 
-    log_header(f"Resolving Dataset Paths under {base}")
-    pretrain_jsons = resolve_json_paths(
-        base, ["llava_image_.json", "llava_image.json", "valley_.json", "valley.json"]
-    )
-    finetune_jsons = resolve_json_paths(
-        base, ["llava_image_tune_.json", "videochatgpt_tune_.json", "videochatgpt_.json", "nlp_tune.json"]
-    )
-
-    cfg = {
-        "pretrain": {
-            "jsons": pretrain_jsons,
-            "image_folder_name": "llava_image",
-            "video_folder_name": "valley",
-        },
-        "finetune": {
-            "jsons": finetune_jsons,
-            "image_folder_name": "llava_image_tune",
-            "video_folder_name": "videochatgpt_tune",
-        },
-    }
-
     splits_to_run = ["pretrain", "finetune"] if args.split == "all" else [args.split]
 
     run_images = args.action in ["images", "visual", "all"]
     run_videos = args.action in ["videos", "visual", "all"]
     run_text = args.action in ["text", "all"]
+
+    log_header(f"Resolving Dataset Paths under {base}")
+    cfg = {}
+    if "pretrain" in splits_to_run:
+        pretrain_jsons = resolve_json_paths(
+            base,
+            [
+                ["llava_image_.json", "llava_image.json"],
+                ["valley_.json", "valley.json"],
+            ],
+        )
+        cfg["pretrain"] = {
+            "jsons": pretrain_jsons,
+            "image_folder_name": "llava_image",
+            "video_folder_name": "valley",
+        }
+
+    if "finetune" in splits_to_run:
+        finetune_jsons = resolve_json_paths(
+            base,
+            [
+                ["llava_image_tune_.json", "llava_image_tune.json"],
+                ["videochatgpt_tune_.json", "videochatgpt_.json", "videochatgpt_tune.json"],
+                ["nlp_tune.json"],
+            ],
+        )
+        cfg["finetune"] = {
+            "jsons": finetune_jsons,
+            "image_folder_name": "llava_image_tune",
+            "video_folder_name": "videochatgpt_tune",
+        }
 
     # -- lazy model loading --------------------------------------------------
     image_tower = image_proc = None
