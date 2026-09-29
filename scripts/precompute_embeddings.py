@@ -599,6 +599,7 @@ def embed_images(
     log_ok(f"Probing image feature shape using: {probe_path}")
     probe_img = PILImage.open(str(probe_path)).convert("RGB")
     probe_tensor = processor.preprocess(probe_img, return_tensors="pt")["pixel_values"]
+    img_pv_shape = tuple(probe_tensor[0].shape)
     with torch.no_grad():
         probe_feat = tower(probe_tensor.to(device=device, dtype=dtype))
         if projector is not None:
@@ -650,10 +651,12 @@ def embed_images(
                     try:
                         img = PILImage.open(str(full)).convert("RGB")
                         pv = processor.preprocess(img, return_tensors="pt")["pixel_values"][0]
+                        if tuple(pv.shape) != img_pv_shape:
+                            pv = torch.zeros(img_pv_shape, dtype=dtype)
                         tensors.append(pv)
                     except Exception as exc:
                         log_warn(f"  Skipping {rel_path}: {exc}")
-                        tensors.append(torch.zeros((3, 224, 224), dtype=dtype))
+                        tensors.append(torch.zeros(img_pv_shape, dtype=dtype))
                     valid_files.append(rel_path)
 
                 batch_tensor = torch.stack(tensors).to(device=device, dtype=dtype)
@@ -723,9 +726,12 @@ def embed_images(
                     full = image_folder / actual_rel
                     try:
                         img = PILImage.open(str(full)).convert("RGB")
-                        tensors.append(processor.preprocess(img, return_tensors="pt")["pixel_values"][0])
+                        pv = processor.preprocess(img, return_tensors="pt")["pixel_values"][0]
+                        if tuple(pv.shape) != img_pv_shape:
+                            pv = torch.zeros(img_pv_shape, dtype=dtype)
+                        tensors.append(pv)
                     except Exception:
-                        tensors.append(torch.zeros((3, 224, 224), dtype=dtype))
+                        tensors.append(torch.zeros(img_pv_shape, dtype=dtype))
                     valid_files.append(rel_path)
                 batch_tensor = torch.stack(tensors).to(device=device, dtype=dtype)
                 with torch.no_grad():
@@ -791,11 +797,13 @@ def embed_videos(
     probe_pv = processor(str(probe_path), return_tensors="pt")["pixel_values"].to(
         device=device, dtype=dtype
     )
+    pv_shape = tuple(probe_pv[0].shape)
     with torch.no_grad():
         probe_feat = tower(probe_pv)
         if projector is not None:
             probe_feat = projector(probe_feat.to(next(projector.parameters()).dtype))
     feat_shape = tuple(probe_feat.shape[1:])
+    log(f"  Pixel values shape per video: {pv_shape}")
     log(f"  Feature shape per video: {feat_shape} (projected={projector is not None})")
     del probe_feat, probe_pv
 
@@ -840,10 +848,13 @@ def embed_videos(
                     full = str(video_folder / actual_rel)
                     try:
                         pv = processor(full, return_tensors="pt")["pixel_values"][0]
+                        if tuple(pv.shape) != pv_shape:
+                            log_warn(f"  Unexpected shape for {rel_path}: {pv.shape} != {pv_shape}")
+                            pv = torch.zeros(pv_shape, dtype=dtype)
                         pvs.append(pv)
                     except Exception as exc:
                         log_warn(f"  Skipping {rel_path}: {exc}")
-                        pvs.append(torch.zeros((8, 3, 224, 224), dtype=dtype))
+                        pvs.append(torch.zeros(pv_shape, dtype=dtype))
                     valid_files.append(rel_path)
 
                 batch_tensor = torch.stack(pvs).to(device=device, dtype=dtype)
@@ -911,9 +922,12 @@ def embed_videos(
                     actual_rel = rel_path[len(strip_prefix):] if strip_prefix and rel_path.startswith(strip_prefix) else rel_path
                     full = str(video_folder / actual_rel)
                     try:
-                        pvs.append(processor(full, return_tensors="pt")["pixel_values"][0])
+                        pv = processor(full, return_tensors="pt")["pixel_values"][0]
+                        if tuple(pv.shape) != pv_shape:
+                            pv = torch.zeros(pv_shape, dtype=dtype)
+                        pvs.append(pv)
                     except Exception:
-                        pvs.append(torch.zeros((8, 3, 224, 224), dtype=dtype))
+                        pvs.append(torch.zeros(pv_shape, dtype=dtype))
                     valid_files.append(rel_path)
                 batch_tensor = torch.stack(pvs).to(device=device, dtype=dtype)
                 with torch.no_grad():
@@ -1309,14 +1323,12 @@ def resolve_media_path_mapping(
     NEVER scans directories or calls iterdir() over Google Drive FUSE.
     Returns: (actual_folder, strip_prefix, valid_probe_path)
     """
-    for probe_rel in probe_files[:5]:
-        # 1. Direct path check: folder / probe_rel
+    # 1. Direct targeted path checks across first 25 probe files
+    for probe_rel in probe_files[:25]:
         direct = folder / probe_rel
         if _safe_is_file(direct):
             return folder, None, direct
 
-        # 2. Check if folder.name or default_name is prefixed in probe_rel
-        # e.g. folder is ".../datasets/valley", probe_rel is "valley/v_xxx.mp4"
         for name in [folder.name, default_name]:
             if name and probe_rel.startswith(f"{name}/"):
                 stripped = probe_rel[len(name) + 1:]
@@ -1324,20 +1336,54 @@ def resolve_media_path_mapping(
                 if _safe_is_file(candidate):
                     return folder, f"{name}/", candidate
 
-        # 3. Check if file is in folder.parent (e.g. folder is ".../datasets", probe_rel is "valley/v_xxx.mp4")
         if _safe_is_file(folder.parent / probe_rel):
             return folder.parent, None, folder.parent / probe_rel
 
-        # 4. Check nested folder (e.g. folder / folder.name / probe_rel)
         if _safe_is_file(folder / folder.name / probe_rel):
             return folder / folder.name, None, folder / folder.name / probe_rel
 
-        # 5. Check nested stripped (e.g. folder / default_name / stripped)
         if default_name and probe_rel.startswith(f"{default_name}/"):
             stripped = probe_rel[len(default_name) + 1:]
             candidate = folder / default_name / stripped
             if _safe_is_file(candidate):
                 return folder / default_name, f"{default_name}/", candidate
+
+    # 2. If direct checks failed, peek at first few items physically in folder
+    if _safe_is_dir(folder):
+        sample_names = []
+        try:
+            with os.scandir(str(folder)) as it:
+                for _, entry in zip(range(10), it):
+                    sample_names.append(entry.name)
+        except Exception:
+            pass
+
+        if not sample_names:
+            log_warn(f"Directory {folder} exists but is EMPTY!")
+            return folder, None, None
+
+        # Check if sample files match any probe files by basename (fast O(1) in-memory lookup)
+        probe_basenames = {Path(p).name: p for p in probe_files[:1000]}
+        for entry_name in sample_names:
+            if entry_name in probe_basenames:
+                matched_probe = probe_basenames[entry_name]
+                actual_file = folder / entry_name
+                prefix = matched_probe.rsplit("/", 1)[0] + "/" if "/" in matched_probe else None
+                return folder, prefix, actual_file
+
+        # Check subdirectories inside folder (e.g. folder / 'videos' or folder / 'valley')
+        for entry_name in sample_names:
+            sub = folder / entry_name
+            if _safe_is_dir(sub):
+                for probe_rel in probe_files[:10]:
+                    bare_name = Path(probe_rel).name
+                    if _safe_is_file(sub / bare_name):
+                        prefix = probe_rel.rsplit("/", 1)[0] + "/" if "/" in probe_rel else None
+                        return sub, prefix, sub / bare_name
+                    if _safe_is_file(sub / probe_rel):
+                        return sub, None, sub / probe_rel
+
+        log_warn(f"Folder {folder} contains {len(sample_names)} items (e.g. {sample_names[:3]}), but none match probe paths (e.g. {probe_files[:2]})")
 
     return folder, None, None
 
@@ -1365,7 +1411,7 @@ def resolve_media_folder(
         if not _safe_is_dir(c):
             continue
         actual_folder, strip_prefix, probe_path = resolve_media_path_mapping(
-            c, probe_files[:5], default_name=default_name
+            c, probe_files[:25], default_name=default_name
         )
         if probe_path is not None:
             prefix_msg = f" (strip prefix: '{strip_prefix}')" if strip_prefix else ""
@@ -1624,67 +1670,85 @@ def main():
         if run_images:
             img_files, _ = extract_file_lists(scfg["jsons"])
             if img_files:
+                resolved_img_folder = None
+                img_strip_prefix = None
+                img_probe = None
                 if args.image_folder:
-                    resolved_img_folder = Path(args.image_folder)
-                    log_ok(f"Using explicitly specified image folder: {resolved_img_folder}")
+                    candidate = Path(args.image_folder)
                     resolved_img_folder, img_strip_prefix, img_probe = resolve_media_path_mapping(
-                        resolved_img_folder, img_files[:5], default_name=scfg["image_folder_name"]
+                        candidate, img_files[:25], default_name=scfg["image_folder_name"]
                     )
-                else:
+                    if img_probe is not None:
+                        log_ok(f"Using explicitly specified image folder: {resolved_img_folder}")
+
+                if img_probe is None:
                     resolved_img_folder, img_strip_prefix, img_probe = resolve_media_folder(
                         base, scfg["image_folder_name"], img_files
                     )
-                embed_images(
-                    file_list=img_files,
-                    image_folder=resolved_img_folder,
-                    tower=image_tower,
-                    processor=image_proc,
-                    h5_path=out / f"{split}_images.h5",
-                    index_path=out / f"{split}_image_index.json",
-                    device=device,
-                    dtype=dtype,
-                    batch_size=args.image_batch_size,
-                    projector=projector,
-                    staging_dir=staging_dir,
-                    sync_interval_mins=args.sync_interval_mins,
-                    images_per_shard=args.images_per_shard,
-                    enable_sharding=not args.no_sharding,
-                    strip_prefix=img_strip_prefix,
-                    probe_path=img_probe,
-                )
+
+                if img_probe is None:
+                    log_warn(f"No valid probe image found for split '{split}'. Skipping image embedding for this split.")
+                else:
+                    embed_images(
+                        file_list=img_files,
+                        image_folder=resolved_img_folder,
+                        tower=image_tower,
+                        processor=image_proc,
+                        h5_path=out / f"{split}_images.h5",
+                        index_path=out / f"{split}_image_index.json",
+                        device=device,
+                        dtype=dtype,
+                        batch_size=args.image_batch_size,
+                        projector=projector,
+                        staging_dir=staging_dir,
+                        sync_interval_mins=args.sync_interval_mins,
+                        images_per_shard=args.images_per_shard,
+                        enable_sharding=not args.no_sharding,
+                        strip_prefix=img_strip_prefix,
+                        probe_path=img_probe,
+                    )
 
         # 2. Videos
         if run_videos:
             _, vid_files = extract_file_lists(scfg["jsons"])
             if vid_files:
+                resolved_vid_folder = None
+                vid_strip_prefix = None
+                vid_probe = None
                 if args.video_folder:
-                    resolved_vid_folder = Path(args.video_folder)
-                    log_ok(f"Using explicitly specified video folder: {resolved_vid_folder}")
+                    candidate = Path(args.video_folder)
                     resolved_vid_folder, vid_strip_prefix, vid_probe = resolve_media_path_mapping(
-                        resolved_vid_folder, vid_files[:5], default_name=scfg["video_folder_name"]
+                        candidate, vid_files[:25], default_name=scfg["video_folder_name"]
                     )
-                else:
+                    if vid_probe is not None:
+                        log_ok(f"Using explicitly specified video folder: {resolved_vid_folder}")
+
+                if vid_probe is None:
                     resolved_vid_folder, vid_strip_prefix, vid_probe = resolve_media_folder(
                         base, scfg["video_folder_name"], vid_files
                     )
-                embed_videos(
-                    file_list=vid_files,
-                    video_folder=resolved_vid_folder,
-                    tower=video_tower,
-                    processor=video_proc,
-                    h5_path=out / f"{split}_videos.h5",
-                    index_path=out / f"{split}_video_index.json",
-                    device=device,
-                    dtype=dtype,
-                    batch_size=args.video_batch_size,
-                    projector=projector,
-                    staging_dir=staging_dir,
-                    sync_interval_mins=args.sync_interval_mins,
-                    videos_per_shard=args.videos_per_shard,
-                    enable_sharding=not args.no_sharding,
-                    strip_prefix=vid_strip_prefix,
-                    probe_path=vid_probe,
-                )
+
+                if vid_probe is None:
+                    log_warn(f"No valid probe video found for split '{split}'. Skipping video embedding for this split.")
+                else:
+                    embed_videos(
+                        file_list=vid_files,
+                        video_folder=resolved_vid_folder,
+                        tower=video_tower,
+                        processor=video_proc,
+                        h5_path=out / f"{split}_videos.h5",
+                        index_path=out / f"{split}_video_index.json",
+                        device=device,
+                        dtype=dtype,
+                        batch_size=args.video_batch_size,
+                        projector=projector,
+                        staging_dir=staging_dir,
+                        sync_interval_mins=args.sync_interval_mins,
+                        videos_per_shard=args.videos_per_shard,
+                        enable_sharding=not args.no_sharding,
+                        strip_prefix=vid_strip_prefix,
+                        probe_path=vid_probe,
+                    )
 
         # 3. Text
         if run_text:
