@@ -117,11 +117,18 @@ def _open_or_create_hdf5(path: Path, n_samples: int, feat_shape: Tuple[int, ...]
         sys.exit(1)
 
     if path.exists():
-        h5 = h5py.File(str(path), "a")
-        dset = h5["features"]
-        written = int(h5.attrs.get("written", 0))
-        log(f"  Resuming {path.name}: {written:,} / {dset.shape[0]:,} already done")
-        return h5, dset, written
+        try:
+            h5 = h5py.File(str(path), "a")
+            dset = h5["features"]
+            written = int(h5.attrs.get("written", 0))
+            log(f"  Resuming {path.name}: {written:,} / {dset.shape[0]:,} already done")
+            return h5, dset, written
+        except Exception as exc:
+            log_warn(f"Existing file {path.name} is corrupt or unreadable ({exc}). Overwriting with fresh file.")
+            try:
+                path.unlink()
+            except Exception:
+                pass
 
     path.parent.mkdir(parents=True, exist_ok=True)
     h5 = h5py.File(str(path), "w")
@@ -165,15 +172,22 @@ def _open_or_create_text_hdf5(
         sys.exit(1)
 
     if path.exists():
-        h5 = h5py.File(str(path), "a")
-        dset_embeds = h5["text_embeddings"] if "text_embeddings" in h5 else None
-        dset_tokens = h5["token_ids"]
-        dset_labels = h5["labels"]
-        dset_offsets = h5["offsets"]
-        written = int(h5.attrs.get("written_samples", 0))
-        total_tokens = int(h5.attrs.get("total_tokens", 0))
-        log(f"  Resuming {path.name}: {written:,} samples, {total_tokens:,} tokens already done")
-        return h5, dset_embeds, dset_tokens, dset_labels, dset_offsets, written, total_tokens
+        try:
+            h5 = h5py.File(str(path), "a")
+            dset_embeds = h5["text_embeddings"] if "text_embeddings" in h5 else None
+            dset_tokens = h5["token_ids"]
+            dset_labels = h5["labels"]
+            dset_offsets = h5["offsets"]
+            written = int(h5.attrs.get("written_samples", 0))
+            total_tokens = int(h5.attrs.get("total_tokens", 0))
+            log(f"  Resuming {path.name}: {written:,} samples, {total_tokens:,} tokens already done")
+            return h5, dset_embeds, dset_tokens, dset_labels, dset_offsets, written, total_tokens
+        except Exception as exc:
+            log_warn(f"Existing file {path.name} is corrupt or unreadable ({exc}). Overwriting with fresh file.")
+            try:
+                path.unlink()
+            except Exception:
+                pass
 
     path.parent.mkdir(parents=True, exist_ok=True)
     h5 = h5py.File(str(path), "w")
