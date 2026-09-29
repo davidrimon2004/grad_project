@@ -149,6 +149,75 @@ def check_drive_responsive(path: Path, timeout_sec: int = 5) -> bool:
             return False
 
 
+def _safe_read_json(path: Path) -> Dict[str, Any]:
+    """Safely loads a JSON index or dictionary file."""
+    if not _safe_is_file(path):
+        return {}
+    try:
+        with open(str(path), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:
+        log_warn(f"Failed to load JSON from {path}: {exc}")
+        return {}
+
+
+def load_json_cached(jp: Path, cache_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """
+    Safely loads a JSON dataset file. If the file resides on Google Drive FUSE,
+    it copies it in 8MB binary chunks to a local fast cache directory
+    (e.g. /tmp/cache_jsons) first, preventing FUSE socket timeouts and Python
+    text decoding stalls over network filesystem sockets.
+    """
+    if cache_dir is None:
+        if Path("/content").exists():
+            cache_dir = Path("/content/cache_jsons")
+        elif Path("/tmp").exists():
+            cache_dir = Path("/tmp/cache_jsons")
+        else:
+            cache_dir = Path("./cache_jsons")
+
+    p_str = str(jp)
+    is_network_fs = "/drive/" in p_str or "/MyDrive/" in p_str or p_str.startswith("/content/drive")
+
+    if not is_network_fs:
+        with open(str(jp), "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    local_cached = cache_dir / jp.name
+
+    try:
+        remote_size = os.path.getsize(str(jp))
+    except Exception:
+        remote_size = -1
+
+    need_copy = True
+    if local_cached.exists() and remote_size > 0:
+        try:
+            if local_cached.stat().st_size == remote_size:
+                need_copy = False
+        except Exception:
+            pass
+
+    if need_copy:
+        size_str = f" ({remote_size / (1024 * 1024):.1f} MB)" if remote_size > 0 else ""
+        log(f"Caching {jp.name}{size_str} to local fast storage ({local_cached})...")
+        t0 = time.time()
+        with open(str(jp), "rb") as src, open(str(local_cached), "wb") as dst:
+            shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
+        elapsed = time.time() - t0
+        log_ok(f"Cached {jp.name} locally in {elapsed:.1f}s.")
+    else:
+        log_ok(f"Using locally cached JSON: {local_cached}")
+
+    t0 = time.time()
+    with open(str(local_cached), "r", encoding="utf-8") as f:
+        data = json.load(f)
+    log_ok(f"Parsed {len(data):,} items from {jp.name} in {time.time() - t0:.1f}s.")
+    return data
+
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # HDF5 helpers: Visual
 # ──────────────────────────────────────────────────────────────────────────────
@@ -608,12 +677,7 @@ def embed_images(
     log(f"  Feature shape per image: {feat_shape} (projected={projector is not None})")
     del probe_feat, probe_tensor
 
-    index: Dict[str, Any] = {}
-    if _safe_exists(index_path):
-        try:
-            index = json.loads(index_path.read_text())
-        except Exception as exc:
-            log_warn(f"Failed to load existing index {index_path}: {exc}")
+    index: Dict[str, Any] = _safe_read_json(index_path)
 
     # Resume check: filter files already processed
     pending_files = [f for f in file_list if f not in index]
@@ -807,12 +871,7 @@ def embed_videos(
     log(f"  Feature shape per video: {feat_shape} (projected={projector is not None})")
     del probe_feat, probe_pv
 
-    index: Dict[str, Any] = {}
-    if _safe_exists(index_path):
-        try:
-            index = json.loads(index_path.read_text())
-        except Exception as exc:
-            log_warn(f"Failed to load existing index {index_path}: {exc}")
+    index: Dict[str, Any] = _safe_read_json(index_path)
 
     pending_files = [f for f in file_list if f not in index]
     already_done = n_total - len(pending_files)
@@ -1049,11 +1108,11 @@ def embed_text(
     # Load all items across JSONs
     all_samples: List[Dict[str, Any]] = []
     for jp in json_paths:
-        if not jp.exists():
+        if not _safe_is_file(jp):
             log_warn(f"JSON not found, skipping: {jp}")
             continue
         try:
-            data = json.loads(jp.read_text())
+            data = load_json_cached(jp, staging_dir)
             all_samples.extend(data)
         except Exception as exc:
             log_warn(f"Failed to parse {jp}: {exc}")
@@ -1068,12 +1127,7 @@ def embed_text(
         _open_or_create_text_hdf5(work_h5, vocab_weight, hidden_size, save_raw_embeds=save_raw_embeds)
     )
 
-    index: Dict[str, Any] = {}
-    if work_index.exists():
-        try:
-            index = json.loads(work_index.read_text())
-        except Exception:
-            index = {}
+    index: Dict[str, Any] = _safe_read_json(work_index)
 
     t0 = time.time()
     last_sync = time.time()
@@ -1211,31 +1265,48 @@ def embed_text(
 # File extraction
 # ──────────────────────────────────────────────────────────────────────────────
 
-def extract_file_lists(json_paths: List[Path]) -> Tuple[List[str], List[str]]:
+def extract_file_lists(
+    json_paths: List[Path],
+    modality: Optional[str] = None,
+) -> Tuple[List[str], List[str]]:
     """
     Parses data JSON files and returns (image_files, video_files) as
     deduplicated lists of relative paths.
+    
+    If modality == 'videos', skips pure image or pure NLP annotation files.
+    If modality == 'images', skips pure video or pure NLP annotation files.
     """
     seen_images: Dict[str, int] = {}
     seen_videos: Dict[str, int] = {}
 
     for jp in json_paths:
-        if not jp.exists():
+        if not _safe_is_file(jp):
             log_warn(f"JSON not found, skipping: {jp}")
             continue
+
+        jp_name = jp.name.lower()
+        if modality == "videos":
+            if "image" in jp_name or "nlp" in jp_name:
+                log(f"Skipping non-video annotation file: {jp.name}")
+                continue
+        elif modality == "images":
+            if "video" in jp_name or "valley" in jp_name or "nlp" in jp_name:
+                log(f"Skipping non-image annotation file: {jp.name}")
+                continue
+
         try:
-            data = json.loads(jp.read_text())
+            data = load_json_cached(jp)
         except Exception as exc:
-            log_warn(f"Failed to parse {jp}: {exc}")
+            log_warn(f"Failed to load {jp}: {exc}")
             continue
 
         for item in data:
-            if "image" in item and "video" not in item:
+            if modality != "videos" and "image" in item and "video" not in item:
                 files = item["image"] if isinstance(item["image"], list) else [item["image"]]
                 for f in files:
                     if f not in seen_images:
                         seen_images[f] = len(seen_images)
-            elif "video" in item:
+            elif modality != "images" and "video" in item:
                 files = item["video"] if isinstance(item["video"], list) else [item["video"]]
                 for f in files:
                     if f not in seen_videos:
@@ -1668,7 +1739,7 @@ def main():
 
         # 1. Images
         if run_images:
-            img_files, _ = extract_file_lists(scfg["jsons"])
+            img_files, _ = extract_file_lists(scfg["jsons"], modality="images")
             if img_files:
                 resolved_img_folder = None
                 img_strip_prefix = None
@@ -1710,7 +1781,7 @@ def main():
 
         # 2. Videos
         if run_videos:
-            _, vid_files = extract_file_lists(scfg["jsons"])
+            _, vid_files = extract_file_lists(scfg["jsons"], modality="videos")
             if vid_files:
                 resolved_vid_folder = None
                 vid_strip_prefix = None
