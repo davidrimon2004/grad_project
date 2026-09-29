@@ -1141,8 +1141,11 @@ def check_and_extract_archives(base: Path, folder_name: str, target_dir: Path):
 def resolve_media_folder(base: Path, default_name: str, probe_files: List[str]) -> Path:
     """Locates the directory where media probe files exist."""
     candidates = [
+        base / "datasets" / default_name / default_name,
         base / "datasets" / default_name,
+        base / "data" / default_name / default_name,
         base / "data" / default_name,
+        base / default_name / default_name,
         base / default_name,
         base / "datasets",
         base / "data",
