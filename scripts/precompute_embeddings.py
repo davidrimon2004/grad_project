@@ -1047,16 +1047,14 @@ def resolve_json_paths(base: Path, candidate_groups: List[Any]) -> List[Path]:
         base / "download",
         base,
     ]
-    existing_subdirs = [s for s in common_subdirs if s.exists() and s.is_dir()]
-
     for item in candidate_groups:
         group = item if isinstance(item, list) else [item]
         matched = None
         for name in group:
-            for sdir in existing_subdirs:
+            for sdir in common_subdirs:
                 p = sdir / name
                 try:
-                    if p.is_file() and p.stat().st_size > 0:
+                    if p.exists() and p.is_file() and p.stat().st_size > 0:
                         matched = p
                         break
                 except Exception:
