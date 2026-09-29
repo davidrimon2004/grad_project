@@ -239,7 +239,9 @@ def load_image_tower(model_name: str, device: torch.device, dtype: torch.dtype):
     tower = tower.to(device=device, dtype=dtype).eval()
     for p in tower.parameters():
         p.requires_grad_(False)
-    processor = LanguageBindImageProcessor(tower.config)
+    processor = getattr(tower, 'image_processor', None)
+    if processor is None:
+        processor = LanguageBindImageProcessor(tower.config)
     log_ok(f"Image tower ready  hidden_size={tower.hidden_size}")
     return tower, processor
 
@@ -255,7 +257,9 @@ def load_video_tower(model_name: str, device: torch.device, dtype: torch.dtype):
     tower = tower.to(device=device, dtype=dtype).eval()
     for p in tower.parameters():
         p.requires_grad_(False)
-    processor = LanguageBindVideoProcessor(tower.config)
+    processor = getattr(tower, 'video_processor', None)
+    if processor is None:
+        processor = LanguageBindVideoProcessor(tower.config)
     log_ok(f"Video tower ready  hidden_size={tower.hidden_size}")
     return tower, processor
 

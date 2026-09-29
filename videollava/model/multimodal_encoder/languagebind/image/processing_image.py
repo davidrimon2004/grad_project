@@ -13,7 +13,8 @@ def make_list_of_images(x):
     return x
 
 def get_image_transform(config):
-    config = config.vision_config
+    if hasattr(config, 'vision_config'):
+        config = config.vision_config
     transform = transforms.Compose(
         [
             transforms.ToTensor(),
