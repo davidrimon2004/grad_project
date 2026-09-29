@@ -308,12 +308,15 @@ def load_image_tower(model_name: str, device: torch.device, dtype: torch.dtype):
     from videollava.model.multimodal_encoder.languagebind import (
         LanguageBindImageTower,
         LanguageBindImageProcessor,
+        sanitize_attn_implementation,
     )
     log(f"Loading image tower: {model_name}")
     tower = LanguageBindImageTower(model_name, args=_TowerArgs(), cache_dir=None, delay_load=False)
+    sanitize_attn_implementation(tower)
     tower = tower.to(device=device, dtype=dtype).eval()
     for p in tower.parameters():
         p.requires_grad_(False)
+    sanitize_attn_implementation(tower)
     processor = getattr(tower, 'image_processor', None)
     if processor is None:
         processor = LanguageBindImageProcessor(tower.config)
@@ -326,12 +329,15 @@ def load_video_tower(model_name: str, device: torch.device, dtype: torch.dtype):
     from videollava.model.multimodal_encoder.languagebind import (
         LanguageBindVideoTower,
         LanguageBindVideoProcessor,
+        sanitize_attn_implementation,
     )
     log(f"Loading video tower: {model_name}")
     tower = LanguageBindVideoTower(model_name, args=_TowerArgs(), cache_dir=None, delay_load=False)
+    sanitize_attn_implementation(tower)
     tower = tower.to(device=device, dtype=dtype).eval()
     for p in tower.parameters():
         p.requires_grad_(False)
+    sanitize_attn_implementation(tower)
     processor = getattr(tower, 'video_processor', None)
     if processor is None:
         processor = LanguageBindVideoProcessor(tower.config)

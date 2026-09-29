@@ -382,6 +382,12 @@ class LanguageBindVideoConfig(PretrainedConfig):
 
         self.text_config = CLIPTextConfig(**text_config)
         self.vision_config = CLIPVisionConfig(**vision_config)
+        if getattr(self.vision_config, "_attn_implementation", None) is None:
+            self.vision_config._attn_implementation = "eager"
+        if getattr(self.text_config, "_attn_implementation", None) is None:
+            self.text_config._attn_implementation = "eager"
+        if getattr(self, "_attn_implementation", None) is None:
+            self._attn_implementation = "eager"
 
         self.projection_dim = projection_dim
         self.logit_scale_init_value = logit_scale_init_value

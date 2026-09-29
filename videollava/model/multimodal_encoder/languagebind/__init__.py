@@ -51,6 +51,26 @@ def sanitize_position_ids(vision_model):
             embeddings.position_ids = torch.arange(num_pos, device=dev).unsqueeze(0)
 
 
+def sanitize_attn_implementation(model_or_module):
+    """
+    HuggingFace transformers (v4.45+) introduced _attn_implementation in CLIPAttention.
+    If _attn_implementation is None on the config, ALL_ATTENTION_FUNCTIONS[None] raises KeyError: None.
+    This helper guarantees _attn_implementation is set to 'eager' across all submodules and configs.
+    """
+    if model_or_module is None:
+        return
+    modules_list = model_or_module.modules() if hasattr(model_or_module, 'modules') else [model_or_module]
+    for m in modules_list:
+        cfg = getattr(m, 'config', None)
+        if cfg is not None:
+            if getattr(cfg, '_attn_implementation', None) is None:
+                cfg._attn_implementation = 'eager'
+            if hasattr(cfg, 'vision_config') and getattr(cfg.vision_config, '_attn_implementation', None) is None:
+                cfg.vision_config._attn_implementation = 'eager'
+            if hasattr(cfg, 'text_config') and getattr(cfg.text_config, '_attn_implementation', None) is None:
+                cfg.text_config._attn_implementation = 'eager'
+
+
 config_dict = {
     'thermal': LanguageBindThermalConfig,
     'image': LanguageBindImageConfig,
@@ -135,10 +155,13 @@ class LanguageBindImageTower(nn.Module):
         if self.is_loaded:
             return
         model = LanguageBindImage.from_pretrained(self.image_tower_name, cache_dir=self.cache_dir)
+        sanitize_attn_implementation(model)
         self.image_tower = model.vision_model
         sanitize_position_ids(self.image_tower)
+        sanitize_attn_implementation(self.image_tower)
         self.image_tower.to(torch.float16)
         sanitize_position_ids(self.image_tower)
+        sanitize_attn_implementation(self.image_tower)
         self.image_tower.requires_grad_(False)
         self.image_tower.eval()
 
@@ -159,6 +182,7 @@ class LanguageBindImageTower(nn.Module):
     @torch.no_grad()
     def forward(self, images):
         sanitize_position_ids(self.image_tower)
+        sanitize_attn_implementation(self.image_tower)
         self.image_tower.eval()
         if type(images) is list:
             image_features = []
@@ -225,12 +249,15 @@ class LanguageBindVideoTower(nn.Module):
         if self.is_loaded:
             return
         model = LanguageBindVideo.from_pretrained(self.video_tower_name, cache_dir=self.cache_dir)
+        sanitize_attn_implementation(model)
         self.video_processor = LanguageBindVideoProcessor(model.config)
 
         self.video_tower = model.vision_model
         sanitize_position_ids(self.video_tower)
+        sanitize_attn_implementation(self.video_tower)
         self.video_tower.to(torch.float16)
         sanitize_position_ids(self.video_tower)
+        sanitize_attn_implementation(self.video_tower)
         self.video_tower.requires_grad_(False)
         self.video_tower.eval()
 
@@ -250,6 +277,7 @@ class LanguageBindVideoTower(nn.Module):
     @torch.no_grad()
     def forward(self, videos):
         sanitize_position_ids(self.video_tower)
+        sanitize_attn_implementation(self.video_tower)
         self.video_tower.eval()
         if type(videos) is list:
             video_features = []
