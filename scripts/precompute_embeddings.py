@@ -1293,41 +1293,64 @@ def check_and_extract_archives(base: Path, folder_name: str, target_dir: Path):
                 log_warn(f"Failed to auto-extract {archive_path.name}: {exc}")
 
 
+def _safe_exists(p: Path) -> bool:
+    try:
+        return os.path.exists(str(p))
+    except (OSError, Exception):
+        return False
+
+def _safe_is_dir(p: Path) -> bool:
+    try:
+        return os.path.isdir(str(p))
+    except (OSError, Exception):
+        return False
+
+
 def resolve_media_folder(base: Path, default_name: str, probe_files: List[str]) -> Path:
     """Locates the directory where media probe files exist."""
     candidates = [
-        base / "datasets" / default_name / default_name,
         base / "datasets" / default_name,
-        base / "data" / default_name / default_name,
+        base / "datasets" / default_name / default_name,
         base / "data" / default_name,
-        base / default_name / default_name,
+        base / "data" / default_name / default_name,
         base / default_name,
+        base / default_name / default_name,
         base / "datasets",
         base / "data",
     ]
     # Check for archive extraction first
-    for c in candidates[:3]:
-        check_and_extract_archives(base, default_name, c)
+    for c in candidates[:2]:
+        try:
+            check_and_extract_archives(base, default_name, c)
+        except Exception:
+            pass
+
     # 1. Direct candidate check
     for c in candidates:
-        if c.exists() and c.is_dir():
+        if _safe_is_dir(c):
             for p in probe_files[:50]:
-                if (c / p).exists():
+                if _safe_exists(c / p):
                     log_ok(f"Found media folder for '{default_name}': {c}")
                     return c
+
     # 2. Immediate subdirectories of candidates
     for c in candidates:
-        if c.exists() and c.is_dir():
+        if _safe_is_dir(c):
             try:
                 for sub in c.iterdir():
-                    if sub.is_dir():
+                    if _safe_is_dir(sub):
                         for p in probe_files[:50]:
-                            if (sub / p).exists():
+                            if _safe_exists(sub / p):
                                 log_ok(f"Found media subfolder for '{default_name}': {sub}")
                                 return sub
             except Exception:
                 pass
-    return candidates[0]
+
+    # 3. Fallback
+    for c in candidates:
+        if _safe_is_dir(c):
+            return c
+    return base / "datasets" / default_name
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1408,6 +1431,18 @@ def main():
         "--no_staging",
         action="store_true",
         help="Disable local SSD staging and write directly to Google Drive.",
+    )
+    parser.add_argument(
+        "--image_folder",
+        type=str,
+        default=None,
+        help="Explicit directory path for images (overrides auto-detection).",
+    )
+    parser.add_argument(
+        "--video_folder",
+        type=str,
+        default=None,
+        help="Explicit directory path for videos (overrides auto-detection).",
     )
     parser.add_argument(
         "--sync_interval_mins",
@@ -1553,7 +1588,11 @@ def main():
         if run_images:
             img_files, _ = extract_file_lists(scfg["jsons"])
             if img_files:
-                resolved_img_folder = resolve_media_folder(base, scfg["image_folder_name"], img_files)
+                if args.image_folder:
+                    resolved_img_folder = Path(args.image_folder)
+                    log_ok(f"Using explicitly specified image folder: {resolved_img_folder}")
+                else:
+                    resolved_img_folder = resolve_media_folder(base, scfg["image_folder_name"], img_files)
                 embed_images(
                     file_list=img_files,
                     image_folder=resolved_img_folder,
@@ -1575,7 +1614,11 @@ def main():
         if run_videos:
             _, vid_files = extract_file_lists(scfg["jsons"])
             if vid_files:
-                resolved_vid_folder = resolve_media_folder(base, scfg["video_folder_name"], vid_files)
+                if args.video_folder:
+                    resolved_vid_folder = Path(args.video_folder)
+                    log_ok(f"Using explicitly specified video folder: {resolved_vid_folder}")
+                else:
+                    resolved_vid_folder = resolve_media_folder(base, scfg["video_folder_name"], vid_files)
                 embed_videos(
                     file_list=vid_files,
                     video_folder=resolved_vid_folder,
