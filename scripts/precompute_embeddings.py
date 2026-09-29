@@ -1314,6 +1314,7 @@ def extract_file_lists(
 
     image_files = sorted(seen_images, key=seen_images.__getitem__)
     video_files = sorted(seen_videos, key=seen_videos.__getitem__)
+    log_ok(f"Extracted {len(image_files):,} unique image(s) and {len(video_files):,} unique video(s).")
     return image_files, video_files
 
 
@@ -1391,70 +1392,56 @@ def resolve_media_path_mapping(
     finds the actual location on disk and determines if a relative prefix needs
     to be stripped or adjusted.
     Tests at most 5 probe files with direct os.path.isfile checks.
-    NEVER scans directories or calls iterdir() over Google Drive FUSE.
+    NEVER scans directories or calls iterdir() or os.scandir() over Google Drive FUSE.
     Returns: (actual_folder, strip_prefix, valid_probe_path)
     """
-    # 1. Direct targeted path checks across first 25 probe files
-    for probe_rel in probe_files[:25]:
+    if not _safe_is_dir(folder):
+        return folder, None, None
+
+    for probe_rel in probe_files[:5]:
+        bare_name = Path(probe_rel).name
+
+        # 1. Exact match: folder / probe_rel
         direct = folder / probe_rel
         if _safe_is_file(direct):
             return folder, None, direct
 
-        for name in [folder.name, default_name]:
-            if name and probe_rel.startswith(f"{name}/"):
-                stripped = probe_rel[len(name) + 1:]
-                candidate = folder / stripped
-                if _safe_is_file(candidate):
-                    return folder, f"{name}/", candidate
+        # 2. Flat match: folder / bare_name (prefix stripped completely)
+        if _safe_is_file(folder / bare_name):
+            prefix = probe_rel[:-len(bare_name)] if len(probe_rel) > len(bare_name) else None
+            return folder, prefix, folder / bare_name
 
+        # 3. Progressive prefix stripping if probe_rel has directories (e.g. "valley/data/v.mp4")
+        if "/" in probe_rel:
+            parts = probe_rel.split("/")
+            for i in range(1, len(parts)):
+                subpath = "/".join(parts[i:])
+                if _safe_is_file(folder / subpath):
+                    prefix = "/".join(parts[:i]) + "/"
+                    return folder, prefix, folder / subpath
+
+        # 4. Standard subdirectories under folder (e.g. folder / "data" / bare_name, folder / "videos" / bare_name, folder / default_name / bare_name)
+        subdirs_to_check = [default_name, "data", "videos"]
+        for sname in subdirs_to_check:
+            if not sname:
+                continue
+            sub = folder / sname
+            # Check flat in sub
+            if _safe_is_file(sub / bare_name):
+                prefix = probe_rel[:-len(bare_name)] if len(probe_rel) > len(bare_name) else None
+                return sub, prefix, sub / bare_name
+            # Check full probe_rel in sub
+            if _safe_is_file(sub / probe_rel):
+                return sub, None, sub / probe_rel
+
+        # 5. Check in parent folder: folder.parent / probe_rel
         if _safe_is_file(folder.parent / probe_rel):
             return folder.parent, None, folder.parent / probe_rel
 
-        if _safe_is_file(folder / folder.name / probe_rel):
-            return folder / folder.name, None, folder / folder.name / probe_rel
-
-        if default_name and probe_rel.startswith(f"{default_name}/"):
-            stripped = probe_rel[len(default_name) + 1:]
-            candidate = folder / default_name / stripped
-            if _safe_is_file(candidate):
-                return folder / default_name, f"{default_name}/", candidate
-
-    # 2. If direct checks failed, peek at first few items physically in folder
-    if _safe_is_dir(folder):
-        sample_names = []
-        try:
-            with os.scandir(str(folder)) as it:
-                for _, entry in zip(range(10), it):
-                    sample_names.append(entry.name)
-        except Exception:
-            pass
-
-        if not sample_names:
-            log_warn(f"Directory {folder} exists but is EMPTY!")
-            return folder, None, None
-
-        # Check if sample files match any probe files by basename (fast O(1) in-memory lookup)
-        probe_basenames = {Path(p).name: p for p in probe_files[:1000]}
-        for entry_name in sample_names:
-            if entry_name in probe_basenames:
-                matched_probe = probe_basenames[entry_name]
-                actual_file = folder / entry_name
-                prefix = matched_probe.rsplit("/", 1)[0] + "/" if "/" in matched_probe else None
-                return folder, prefix, actual_file
-
-        # Check subdirectories inside folder (e.g. folder / 'videos' or folder / 'valley')
-        for entry_name in sample_names:
-            sub = folder / entry_name
-            if _safe_is_dir(sub):
-                for probe_rel in probe_files[:10]:
-                    bare_name = Path(probe_rel).name
-                    if _safe_is_file(sub / bare_name):
-                        prefix = probe_rel.rsplit("/", 1)[0] + "/" if "/" in probe_rel else None
-                        return sub, prefix, sub / bare_name
-                    if _safe_is_file(sub / probe_rel):
-                        return sub, None, sub / probe_rel
-
-        log_warn(f"Folder {folder} contains {len(sample_names)} items (e.g. {sample_names[:3]}), but none match probe paths (e.g. {probe_files[:2]})")
+        # 6. Check default_name under parent: folder.parent / default_name / bare_name
+        if default_name and _safe_is_file(folder.parent / default_name / bare_name):
+            prefix = probe_rel[:-len(bare_name)] if len(probe_rel) > len(bare_name) else None
+            return folder.parent / default_name, prefix, folder.parent / default_name / bare_name
 
     return folder, None, None
 
