@@ -1031,6 +1031,22 @@ def resolve_json_paths(base: Path, candidate_groups: List[Any]) -> List[Path]:
     over network filesystems like Google Drive.
     """
     found: List[Path] = []
+    base_str = str(base)
+
+    if not os.path.exists(base_str):
+        log_err(f"Base path does not exist: {base}")
+        log_err("Google Drive is NOT mounted or disconnected! Run in Colab: drive.mount('/content/drive', force_remount=True)")
+        return []
+
+    try:
+        base_items = os.listdir(base_str)
+        if not base_items:
+            log_warn(f"Drive directory {base} appears empty. Google Drive may need remounting.")
+    except Exception as exc:
+        log_err(f"Cannot access Google Drive at {base}: {exc}")
+        log_err("The Google Drive network socket has disconnected. Run in Colab: drive.mount('/content/drive', force_remount=True)")
+        return []
+
     common_subdirs = [
         base / "datasets" / "annotations",
         base / "datasets" / "pt_json",
@@ -1054,9 +1070,13 @@ def resolve_json_paths(base: Path, candidate_groups: List[Any]) -> List[Path]:
             for sdir in common_subdirs:
                 p = sdir / name
                 try:
-                    if p.exists() and p.is_file() and p.stat().st_size > 0:
+                    p_str = str(p)
+                    if os.path.exists(p_str) and os.path.isfile(p_str) and os.path.getsize(p_str) > 0:
                         matched = p
                         break
+                except OSError as exc:
+                    log_err(f"Drive error reading {p}: {exc}")
+                    continue
                 except Exception:
                     continue
             if matched is not None:
@@ -1068,6 +1088,8 @@ def resolve_json_paths(base: Path, candidate_groups: List[Any]) -> List[Path]:
             except Exception:
                 rel = matched
             log_ok(f"Found annotation: {rel}")
+        elif not matched:
+            log_warn(f"Could not find any of {group} in standard subdirectories under {base}")
     return found
 
 
