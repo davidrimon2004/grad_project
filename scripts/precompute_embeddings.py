@@ -1073,6 +1073,51 @@ def resolve_json_paths(base: Path, candidate_groups: List[Any]) -> List[Path]:
     return found
 
 
+def check_and_extract_archives(base: Path, folder_name: str, target_dir: Path):
+    """
+    Checks if media folder is missing files but archive files (.zip, .tar) exist on Drive,
+    and extracts them automatically.
+    """
+    import zipfile
+    import tarfile
+
+    candidate_archives = [
+        base / f"{folder_name}.zip",
+        base / "datasets" / f"{folder_name}.zip",
+        base / "download" / f"{folder_name}.zip",
+        base / f"{folder_name}.tar",
+        base / "datasets" / f"{folder_name}.tar",
+    ]
+    if "image" in folder_name:
+        candidate_archives.extend([
+            base / "images.zip",
+            base / "datasets" / "images.zip",
+            base / "download" / "images.zip",
+        ])
+
+    for archive_path in candidate_archives:
+        if archive_path.exists() and archive_path.is_file():
+            log(f"Found archive {archive_path.name} ({archive_path.stat().st_size / 1e6:.1f} MB). Checking if extraction needed...")
+            target_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                if archive_path.suffix == ".zip":
+                    with zipfile.ZipFile(str(archive_path), 'r') as zf:
+                        names = zf.namelist()[:3]
+                        if not any((target_dir / n).exists() for n in names):
+                            log(f"Extracting {archive_path.name} -> {target_dir}...")
+                            zf.extractall(str(target_dir))
+                            log_ok(f"Extracted {archive_path.name}")
+                elif archive_path.suffix in [".tar", ".gz", ".tgz"]:
+                    with tarfile.open(str(archive_path), 'r:*') as tf:
+                        names = tf.getnames()[:3]
+                        if not any((target_dir / n).exists() for n in names):
+                            log(f"Extracting {archive_path.name} -> {target_dir}...")
+                            tf.extractall(str(target_dir))
+                            log_ok(f"Extracted {archive_path.name}")
+            except Exception as exc:
+                log_warn(f"Failed to auto-extract {archive_path.name}: {exc}")
+
+
 def resolve_media_folder(base: Path, default_name: str, probe_files: List[str]) -> Path:
     """Locates the directory where media probe files exist."""
     candidates = [
@@ -1082,6 +1127,9 @@ def resolve_media_folder(base: Path, default_name: str, probe_files: List[str]) 
         base / "datasets",
         base / "data",
     ]
+    # Check for archive extraction first
+    for c in candidates[:3]:
+        check_and_extract_archives(base, default_name, c)
     # 1. Direct candidate check
     for c in candidates:
         if c.exists() and c.is_dir():
@@ -1179,6 +1227,11 @@ def main():
         help="Local staging directory (e.g. /content/staging_embeddings) on fast local NVMe to prevent Google Drive FUSE timeouts. Periodically synced to Drive.",
     )
     parser.add_argument(
+        "--no_staging",
+        action="store_true",
+        help="Disable local SSD staging and write directly to Google Drive.",
+    )
+    parser.add_argument(
         "--sync_interval_mins",
         type=float,
         default=15.0,
@@ -1203,13 +1256,23 @@ def main():
 
     # -- staging setup --------------------------------------------------------
     staging_dir = None
-    if args.staging_dir:
+    if args.no_staging or (args.staging_dir and args.staging_dir.lower() in ["none", "false", "no"]):
+        staging_dir = None
+        log_ok("Writing directly to Google Drive (local NVMe SSD staging disabled).")
+    elif args.staging_dir:
         staging_dir = Path(args.staging_dir)
     elif "/drive/" in str(out) or "/MyDrive/" in str(out) or str(out).startswith("/content/drive"):
-        default_stage = Path("/content/staging_embeddings")
+        # Check local SSD capacity
         if Path("/content").exists():
-            staging_dir = default_stage
-            log_ok(f"Detected Google Drive destination. Auto-enabled local NVMe staging: {staging_dir}")
+            free_gb = shutil.disk_usage("/content").free / 1e9
+            # If dataset is huge (e.g. pretrain images: ~1.1 TB) and SSD only has ~40 GB free, write directly to Drive!
+            if free_gb < 80.0 and args.action in ["images", "visual", "all"] and (args.split in ["pretrain", "all"]):
+                log_warn(f"Local NVMe SSD has only {free_gb:.1f} GB free, but pretrain visual dataset requires much more space.")
+                log_ok("Writing directly to Google Drive to prevent local disk space exhaustion.")
+                staging_dir = None
+            else:
+                staging_dir = Path("/content/staging_embeddings")
+                log_ok(f"Detected Google Drive destination. Using local NVMe staging: {staging_dir}")
 
     splits_to_run = ["pretrain", "finetune"] if args.split == "all" else [args.split]
 
