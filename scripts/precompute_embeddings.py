@@ -102,6 +102,54 @@ def log_header(msg: str):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Safe I/O and Google Drive helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _safe_exists(p: Path) -> bool:
+    try:
+        return os.path.exists(str(p))
+    except (OSError, Exception):
+        return False
+
+def _safe_is_dir(p: Path) -> bool:
+    try:
+        return os.path.isdir(str(p))
+    except (OSError, Exception):
+        return False
+
+def _safe_is_file(p: Path) -> bool:
+    try:
+        return os.path.isfile(str(p))
+    except (OSError, Exception):
+        return False
+
+def check_drive_responsive(path: Path, timeout_sec: int = 5) -> bool:
+    """Checks if a path on Google Drive responds within timeout_sec."""
+    import signal
+    if hasattr(signal, "SIGALRM"):
+        def handler(signum, frame):
+            raise TimeoutError("Drive check timed out")
+        old = signal.signal(signal.SIGALRM, handler)
+        signal.alarm(timeout_sec)
+        try:
+            exists = os.path.exists(str(path))
+            signal.alarm(0)
+            return exists
+        except TimeoutError:
+            return False
+        except Exception:
+            return False
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+    else:
+        try:
+            return os.path.exists(str(path))
+        except Exception:
+            return False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # HDF5 helpers: Visual
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -116,7 +164,7 @@ def _open_or_create_hdf5(path: Path, n_samples: int, feat_shape: Tuple[int, ...]
         log_err("h5py not installed. Run: pip install h5py")
         sys.exit(1)
 
-    if path.exists():
+    if _safe_exists(path):
         try:
             h5 = h5py.File(str(path), "a")
             dset = h5["features"]
@@ -171,7 +219,7 @@ def _open_or_create_text_hdf5(
         log_err("h5py not installed. Run: pip install h5py")
         sys.exit(1)
 
-    if path.exists():
+    if _safe_exists(path):
         try:
             h5 = h5py.File(str(path), "a")
             dset_embeds = h5["text_embeddings"] if "text_embeddings" in h5 else None
@@ -526,6 +574,8 @@ def embed_images(
     sync_interval_mins: float = 15.0,
     images_per_shard: int = 2000,
     enable_sharding: bool = True,
+    strip_prefix: Optional[str] = None,
+    probe_path: Optional[Path] = None,
 ):
     """
     Encodes images through LanguageBind (and optional mm_projector) to HDF5.
@@ -538,16 +588,15 @@ def embed_images(
     log_header(f"Embedding {n_total:,} images  ->  {h5_path.parent}")
 
     # Probe feature shape
-    probe_path = None
-    for probe_rel in file_list[:100]:
-        candidate = image_folder / probe_rel
-        if candidate.exists() and candidate.is_file():
-            probe_path = candidate
-            break
+    if probe_path is None:
+        image_folder, strip_prefix, probe_path = resolve_media_path_mapping(
+            image_folder, file_list[:5], default_name="llava_image"
+        )
     if probe_path is None:
         log_err(f"Could not find any probe image in image_folder: {image_folder}. Check paths.")
         return
 
+    log_ok(f"Probing image feature shape using: {probe_path}")
     probe_img = PILImage.open(str(probe_path)).convert("RGB")
     probe_tensor = processor.preprocess(probe_img, return_tensors="pt")["pixel_values"]
     with torch.no_grad():
@@ -559,7 +608,7 @@ def embed_images(
     del probe_feat, probe_tensor
 
     index: Dict[str, Any] = {}
-    if index_path.exists():
+    if _safe_exists(index_path):
         try:
             index = json.loads(index_path.read_text())
         except Exception as exc:
@@ -596,7 +645,8 @@ def embed_images(
                 valid_files: List[str] = []
 
                 for rel_path in batch_files:
-                    full = image_folder / rel_path
+                    actual_rel = rel_path[len(strip_prefix):] if strip_prefix and rel_path.startswith(strip_prefix) else rel_path
+                    full = image_folder / actual_rel
                     try:
                         img = PILImage.open(str(full)).convert("RGB")
                         pv = processor.preprocess(img, return_tensors="pt")["pixel_values"][0]
@@ -669,7 +719,8 @@ def embed_images(
                 tensors = []
                 valid_files = []
                 for rel_path in batch_files:
-                    full = image_folder / rel_path
+                    actual_rel = rel_path[len(strip_prefix):] if strip_prefix and rel_path.startswith(strip_prefix) else rel_path
+                    full = image_folder / actual_rel
                     try:
                         img = PILImage.open(str(full)).convert("RGB")
                         tensors.append(processor.preprocess(img, return_tensors="pt")["pixel_values"][0])
@@ -717,6 +768,8 @@ def embed_videos(
     sync_interval_mins: float = 15.0,
     videos_per_shard: int = 250,
     enable_sharding: bool = True,
+    strip_prefix: Optional[str] = None,
+    probe_path: Optional[Path] = None,
 ):
     """
     Encodes videos through LanguageBind (and optional mm_projector) to HDF5.
@@ -726,16 +779,15 @@ def embed_videos(
     n_total = len(file_list)
     log_header(f"Embedding {n_total:,} videos  ->  {h5_path.parent}")
 
-    probe_path = None
-    for probe_rel in file_list[:100]:
-        candidate = video_folder / probe_rel
-        if candidate.exists() and candidate.is_file():
-            probe_path = candidate
-            break
+    if probe_path is None:
+        video_folder, strip_prefix, probe_path = resolve_media_path_mapping(
+            video_folder, file_list[:5], default_name="valley"
+        )
     if probe_path is None:
         log_err(f"Could not find any probe video in video_folder: {video_folder}. Check paths.")
         return
 
+    log_ok(f"Probing video feature shape using: {probe_path}")
     probe_pv = processor(str(probe_path), return_tensors="pt")["pixel_values"].to(
         device=device, dtype=dtype
     )
@@ -748,7 +800,7 @@ def embed_videos(
     del probe_feat, probe_pv
 
     index: Dict[str, Any] = {}
-    if index_path.exists():
+    if _safe_exists(index_path):
         try:
             index = json.loads(index_path.read_text())
         except Exception as exc:
@@ -784,7 +836,8 @@ def embed_videos(
                 valid_files: List[str] = []
 
                 for rel_path in batch_files:
-                    full = str(video_folder / rel_path)
+                    actual_rel = rel_path[len(strip_prefix):] if strip_prefix and rel_path.startswith(strip_prefix) else rel_path
+                    full = str(video_folder / actual_rel)
                     try:
                         pv = processor(full, return_tensors="pt")["pixel_values"][0]
                         pvs.append(pv)
@@ -855,7 +908,8 @@ def embed_videos(
                 pvs = []
                 valid_files = []
                 for rel_path in batch_files:
-                    full = str(video_folder / rel_path)
+                    actual_rel = rel_path[len(strip_prefix):] if strip_prefix and rel_path.startswith(strip_prefix) else rel_path
+                    full = str(video_folder / actual_rel)
                     try:
                         pvs.append(processor(full, return_tensors="pt")["pixel_values"][0])
                     except Exception:
@@ -1186,20 +1240,15 @@ def resolve_json_paths(base: Path, candidate_groups: List[Any]) -> List[Path]:
     over network filesystems like Google Drive.
     """
     found: List[Path] = []
-    base_str = str(base)
 
-    if not os.path.exists(base_str):
+    if not _safe_exists(base):
         log_err(f"Base path does not exist: {base}")
         log_err("Google Drive is NOT mounted or disconnected! Run in Colab: drive.mount('/content/drive', force_remount=True)")
         return []
 
-    try:
-        base_items = os.listdir(base_str)
-        if not base_items:
-            log_warn(f"Drive directory {base} appears empty. Google Drive may need remounting.")
-    except Exception as exc:
-        log_err(f"Cannot access Google Drive at {base}: {exc}")
-        log_err("The Google Drive network socket has disconnected. Run in Colab: drive.mount('/content/drive', force_remount=True)")
+    if not check_drive_responsive(base, timeout_sec=5):
+        log_err(f"Google Drive at {base} is UNRESPONSIVE (timed out after 5s).")
+        log_err("Drive FUSE socket has hung. Run in Colab: drive.mount('/content/drive', force_remount=True)")
         return []
 
     common_subdirs = [
@@ -1223,17 +1272,16 @@ def resolve_json_paths(base: Path, candidate_groups: List[Any]) -> List[Path]:
         matched = None
         for name in group:
             for sdir in common_subdirs:
+                if not _safe_is_dir(sdir):
+                    continue
                 p = sdir / name
-                try:
-                    p_str = str(p)
-                    if os.path.exists(p_str) and os.path.isfile(p_str) and os.path.getsize(p_str) > 0:
-                        matched = p
-                        break
-                except OSError as exc:
-                    log_err(f"Drive error reading {p}: {exc}")
-                    continue
-                except Exception:
-                    continue
+                if _safe_is_file(p):
+                    try:
+                        if os.path.getsize(str(p)) > 0:
+                            matched = p
+                            break
+                    except Exception:
+                        continue
             if matched is not None:
                 break
         if matched and matched not in found:
@@ -1248,109 +1296,86 @@ def resolve_json_paths(base: Path, candidate_groups: List[Any]) -> List[Path]:
     return found
 
 
-def check_and_extract_archives(base: Path, folder_name: str, target_dir: Path):
+def resolve_media_path_mapping(
+    folder: Path,
+    probe_files: List[str],
+    default_name: str = "",
+) -> Tuple[Path, Optional[str], Optional[Path]]:
     """
-    Checks if media folder is missing files but archive files (.zip, .tar) exist on Drive,
-    and extracts them automatically.
+    Given a candidate folder and probe relative paths from annotation JSON,
+    finds the actual location on disk and determines if a relative prefix needs
+    to be stripped or adjusted.
+    Tests at most 5 probe files with direct os.path.isfile checks.
+    NEVER scans directories or calls iterdir() over Google Drive FUSE.
+    Returns: (actual_folder, strip_prefix, valid_probe_path)
     """
-    import zipfile
-    import tarfile
+    for probe_rel in probe_files[:5]:
+        # 1. Direct path check: folder / probe_rel
+        direct = folder / probe_rel
+        if _safe_is_file(direct):
+            return folder, None, direct
 
-    candidate_archives = [
-        base / f"{folder_name}.zip",
-        base / "datasets" / f"{folder_name}.zip",
-        base / "download" / f"{folder_name}.zip",
-        base / f"{folder_name}.tar",
-        base / "datasets" / f"{folder_name}.tar",
-    ]
-    if "image" in folder_name:
-        candidate_archives.extend([
-            base / "images.zip",
-            base / "datasets" / "images.zip",
-            base / "download" / "images.zip",
-        ])
+        # 2. Check if folder.name or default_name is prefixed in probe_rel
+        # e.g. folder is ".../datasets/valley", probe_rel is "valley/v_xxx.mp4"
+        for name in [folder.name, default_name]:
+            if name and probe_rel.startswith(f"{name}/"):
+                stripped = probe_rel[len(name) + 1:]
+                candidate = folder / stripped
+                if _safe_is_file(candidate):
+                    return folder, f"{name}/", candidate
 
-    for archive_path in candidate_archives:
-        if archive_path.exists() and archive_path.is_file():
-            log(f"Found archive {archive_path.name} ({archive_path.stat().st_size / 1e6:.1f} MB). Checking if extraction needed...")
-            target_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                if archive_path.suffix == ".zip":
-                    with zipfile.ZipFile(str(archive_path), 'r') as zf:
-                        names = zf.namelist()[:3]
-                        if not any((target_dir / n).exists() for n in names):
-                            log(f"Extracting {archive_path.name} -> {target_dir}...")
-                            zf.extractall(str(target_dir))
-                            log_ok(f"Extracted {archive_path.name}")
-                elif archive_path.suffix in [".tar", ".gz", ".tgz"]:
-                    with tarfile.open(str(archive_path), 'r:*') as tf:
-                        names = tf.getnames()[:3]
-                        if not any((target_dir / n).exists() for n in names):
-                            log(f"Extracting {archive_path.name} -> {target_dir}...")
-                            tf.extractall(str(target_dir))
-                            log_ok(f"Extracted {archive_path.name}")
-            except Exception as exc:
-                log_warn(f"Failed to auto-extract {archive_path.name}: {exc}")
+        # 3. Check if file is in folder.parent (e.g. folder is ".../datasets", probe_rel is "valley/v_xxx.mp4")
+        if _safe_is_file(folder.parent / probe_rel):
+            return folder.parent, None, folder.parent / probe_rel
+
+        # 4. Check nested folder (e.g. folder / folder.name / probe_rel)
+        if _safe_is_file(folder / folder.name / probe_rel):
+            return folder / folder.name, None, folder / folder.name / probe_rel
+
+        # 5. Check nested stripped (e.g. folder / default_name / stripped)
+        if default_name and probe_rel.startswith(f"{default_name}/"):
+            stripped = probe_rel[len(default_name) + 1:]
+            candidate = folder / default_name / stripped
+            if _safe_is_file(candidate):
+                return folder / default_name, f"{default_name}/", candidate
+
+    return folder, None, None
 
 
-def _safe_exists(p: Path) -> bool:
-    try:
-        return os.path.exists(str(p))
-    except (OSError, Exception):
-        return False
-
-def _safe_is_dir(p: Path) -> bool:
-    try:
-        return os.path.isdir(str(p))
-    except (OSError, Exception):
-        return False
-
-
-def resolve_media_folder(base: Path, default_name: str, probe_files: List[str]) -> Path:
-    """Locates the directory where media probe files exist."""
+def resolve_media_folder(
+    base: Path,
+    default_name: str,
+    probe_files: List[str],
+) -> Tuple[Path, Optional[str], Optional[Path]]:
+    """
+    Locates the directory where media probe files exist under base.
+    Uses targeted single-file existence checks without any directory listing.
+    """
     candidates = [
         base / "datasets" / default_name,
         base / "datasets" / default_name / default_name,
-        base / "data" / default_name,
-        base / "data" / default_name / default_name,
+        base / "datasets",
         base / default_name,
         base / default_name / default_name,
-        base / "datasets",
+        base / "data" / default_name,
         base / "data",
+        base,
     ]
-    # Check for archive extraction first
-    for c in candidates[:2]:
-        try:
-            check_and_extract_archives(base, default_name, c)
-        except Exception:
-            pass
-
-    # 1. Direct candidate check
     for c in candidates:
-        if _safe_is_dir(c):
-            for p in probe_files[:50]:
-                if _safe_exists(c / p):
-                    log_ok(f"Found media folder for '{default_name}': {c}")
-                    return c
+        if not _safe_is_dir(c):
+            continue
+        actual_folder, strip_prefix, probe_path = resolve_media_path_mapping(
+            c, probe_files[:5], default_name=default_name
+        )
+        if probe_path is not None:
+            prefix_msg = f" (strip prefix: '{strip_prefix}')" if strip_prefix else ""
+            log_ok(f"Found media folder for '{default_name}': {actual_folder}{prefix_msg}")
+            return actual_folder, strip_prefix, probe_path
 
-    # 2. Immediate subdirectories of candidates
-    for c in candidates:
-        if _safe_is_dir(c):
-            try:
-                for sub in c.iterdir():
-                    if _safe_is_dir(sub):
-                        for p in probe_files[:50]:
-                            if _safe_exists(sub / p):
-                                log_ok(f"Found media subfolder for '{default_name}': {sub}")
-                                return sub
-            except Exception:
-                pass
-
-    # 3. Fallback
-    for c in candidates:
-        if _safe_is_dir(c):
-            return c
-    return base / "datasets" / default_name
+    # Fallback if no probe matched
+    fallback = base / "datasets" / default_name
+    log_warn(f"Could not confirm media probe files for '{default_name}'. Defaulting to {fallback}")
+    return fallback, None, None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1486,6 +1511,17 @@ def main():
 
     # -- paths ----------------------------------------------------------------
     base = Path(args.drive_base)
+    if "/drive/" in str(base) or "/MyDrive/" in str(base) or str(base).startswith("/content/drive"):
+        log("Checking Google Drive connectivity...")
+        if not _safe_exists(base) or not check_drive_responsive(base, timeout_sec=5):
+            log_err(f"Google Drive base path is inaccessible or unresponsive: {base}")
+            log_err("The Google Drive connection timed out or is unmounted. Run in Colab:")
+            log_err("  from google.colab import drive")
+            log_err("  drive.flush_and_unmount()")
+            log_err("  drive.mount('/content/drive', force_remount=True)")
+            sys.exit(1)
+        log_ok(f"Google Drive is responsive: {base}")
+
     out = Path(args.output_dir) if args.output_dir else base / "embeddings"
     out.mkdir(parents=True, exist_ok=True)
 
@@ -1591,8 +1627,13 @@ def main():
                 if args.image_folder:
                     resolved_img_folder = Path(args.image_folder)
                     log_ok(f"Using explicitly specified image folder: {resolved_img_folder}")
+                    resolved_img_folder, img_strip_prefix, img_probe = resolve_media_path_mapping(
+                        resolved_img_folder, img_files[:5], default_name=scfg["image_folder_name"]
+                    )
                 else:
-                    resolved_img_folder = resolve_media_folder(base, scfg["image_folder_name"], img_files)
+                    resolved_img_folder, img_strip_prefix, img_probe = resolve_media_folder(
+                        base, scfg["image_folder_name"], img_files
+                    )
                 embed_images(
                     file_list=img_files,
                     image_folder=resolved_img_folder,
@@ -1608,6 +1649,8 @@ def main():
                     sync_interval_mins=args.sync_interval_mins,
                     images_per_shard=args.images_per_shard,
                     enable_sharding=not args.no_sharding,
+                    strip_prefix=img_strip_prefix,
+                    probe_path=img_probe,
                 )
 
         # 2. Videos
@@ -1617,8 +1660,13 @@ def main():
                 if args.video_folder:
                     resolved_vid_folder = Path(args.video_folder)
                     log_ok(f"Using explicitly specified video folder: {resolved_vid_folder}")
+                    resolved_vid_folder, vid_strip_prefix, vid_probe = resolve_media_path_mapping(
+                        resolved_vid_folder, vid_files[:5], default_name=scfg["video_folder_name"]
+                    )
                 else:
-                    resolved_vid_folder = resolve_media_folder(base, scfg["video_folder_name"], vid_files)
+                    resolved_vid_folder, vid_strip_prefix, vid_probe = resolve_media_folder(
+                        base, scfg["video_folder_name"], vid_files
+                    )
                 embed_videos(
                     file_list=vid_files,
                     video_folder=resolved_vid_folder,
@@ -1634,6 +1682,8 @@ def main():
                     sync_interval_mins=args.sync_interval_mins,
                     videos_per_shard=args.videos_per_shard,
                     enable_sharding=not args.no_sharding,
+                    strip_prefix=vid_strip_prefix,
+                    probe_path=vid_probe,
                 )
 
         # 3. Text
