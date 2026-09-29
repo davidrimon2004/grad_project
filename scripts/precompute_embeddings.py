@@ -350,6 +350,7 @@ def load_projector(
     mm_projector_path: Optional[str],
     device: torch.device,
     dtype: torch.dtype,
+    base_dir: Optional[Path] = None,
 ):
     """
     Loads or initializes mm_projector (MLP 1024 -> 4096) to project visual features.
@@ -369,15 +370,21 @@ def load_projector(
         log(f"Loading mm_projector from {mm_projector_path}")
         weights = torch.load(mm_projector_path, map_location="cpu")
     else:
-        # Check inside model_name_or_path
-        for candidate in ["mm_projector.bin", "non_lora_trainables.bin"]:
-            p = Path(model_name_or_path) / candidate
-            if p.exists():
-                log(f"Loading mm_projector from {p}")
-                weights = torch.load(str(p), map_location="cpu")
+        # 1. Check inside local path or Drive base
+        search_dirs = [Path(model_name_or_path)]
+        if base_dir is not None:
+            search_dirs.extend([base_dir, base_dir / "checkpoints", base_dir / "models"])
+        for sdir in search_dirs:
+            for candidate in ["mm_projector.bin", "non_lora_trainables.bin"]:
+                p = sdir / candidate
+                if p.exists() and p.is_file():
+                    log_ok(f"Found mm_projector weights: {p}")
+                    weights = torch.load(str(p), map_location="cpu")
+                    break
+            if weights is not None:
                 break
 
-        # Check HF hub if model_name_or_path is a repo id
+        # 2. Check HF hub repo from model_name_or_path
         if weights is None and "/" in model_name_or_path:
             try:
                 from huggingface_hub import hf_hub_download
@@ -385,12 +392,24 @@ def load_projector(
                     try:
                         f = hf_hub_download(repo_id=model_name_or_path, filename=candidate)
                         weights = torch.load(f, map_location="cpu")
-                        log(f"Downloaded mm_projector weights from {model_name_or_path}/{candidate}")
+                        log_ok(f"Downloaded mm_projector weights from {model_name_or_path}/{candidate}")
                         break
                     except Exception:
                         pass
             except Exception:
                 pass
+
+        # 3. Automatic fallback to official Video-LLaVA pretrained projector weights
+        if weights is None:
+            for repo in ["LanguageBind/Video-LLaVA-7B", "LanguageBind/Video-LLaVA-Pretrain-7B"]:
+                try:
+                    from huggingface_hub import hf_hub_download
+                    f = hf_hub_download(repo_id=repo, filename="mm_projector.bin")
+                    weights = torch.load(f, map_location="cpu")
+                    log_ok(f"Downloaded official pretrained mm_projector weights from {repo}")
+                    break
+                except Exception:
+                    pass
 
     if weights is not None:
         clean = {}
@@ -1242,6 +1261,7 @@ def main():
             args.mm_projector_path,
             device=device,
             dtype=dtype,
+            base_dir=base,
         )
 
     if run_images:
