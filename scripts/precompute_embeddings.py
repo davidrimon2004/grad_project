@@ -408,12 +408,14 @@ def embed_images(
     log_header(f"Embedding {n_total:,} images  ->  {h5_path.name}")
 
     # Probe feature shape
-    for probe_rel in file_list[:10]:
-        probe_path = image_folder / probe_rel
-        if probe_path.exists():
+    probe_path = None
+    for probe_rel in file_list[:100]:
+        candidate = image_folder / probe_rel
+        if candidate.exists() and candidate.is_file():
+            probe_path = candidate
             break
-    else:
-        log_err("Could not find any probe image in image_folder. Check paths.")
+    if probe_path is None:
+        log_err(f"Could not find any probe image in image_folder: {image_folder}. Check paths.")
         return
 
     probe_img = PILImage.open(str(probe_path)).convert("RGB")
@@ -514,12 +516,14 @@ def embed_videos(
     log_header(f"Embedding {n_total:,} videos  ->  {h5_path.name}")
 
     # Probe feature shape
-    for probe_rel in file_list[:10]:
-        probe_path = video_folder / probe_rel
-        if probe_path.exists():
+    probe_path = None
+    for probe_rel in file_list[:100]:
+        candidate = video_folder / probe_rel
+        if candidate.exists() and candidate.is_file():
+            probe_path = candidate
             break
-    else:
-        log_err("Could not find any probe video in video_folder. Check paths.")
+    if probe_path is None:
+        log_err(f"Could not find any probe video in video_folder: {video_folder}. Check paths.")
         return
 
     probe_pv = processor(str(probe_path), return_tensors="pt")["pixel_values"].to(
@@ -877,6 +881,76 @@ def extract_file_lists(json_paths: List[Path]) -> Tuple[List[str], List[str]]:
     return image_files, video_files
 
 
+def resolve_json_paths(base: Path, candidate_names: List[str]) -> List[Path]:
+    """Finds existing annotation JSON files across common dataset/annotation directory structures."""
+    found: List[Path] = []
+    common_subdirs = [
+        base / "datasets" / "pt_json",
+        base / "datasets" / "ft_json",
+        base / "datasets" / "annotations",
+        base / "datasets",
+        base / "data" / "pt_json",
+        base / "data" / "ft_json",
+        base / "data" / "annotations",
+        base / "data",
+        base / "annotations",
+        base / "pt_json",
+        base / "ft_json",
+        base,
+    ]
+    for name in candidate_names:
+        matched = None
+        for sdir in common_subdirs:
+            p = sdir / name
+            if p.exists() and p.is_file() and p.stat().st_size > 0:
+                matched = p
+                break
+        if not matched and base.exists():
+            for p in base.rglob(name):
+                if p.is_file() and p.stat().st_size > 0:
+                    matched = p
+                    break
+        if matched and matched not in found:
+            found.append(matched)
+            try:
+                rel = matched.relative_to(base)
+            except Exception:
+                rel = matched
+            log_ok(f"Found annotation: {rel}")
+    return found
+
+
+def resolve_media_folder(base: Path, default_name: str, probe_files: List[str]) -> Path:
+    """Locates the directory where media probe files exist."""
+    candidates = [
+        base / "datasets" / default_name,
+        base / "data" / default_name,
+        base / default_name,
+        base / "datasets",
+        base / "data",
+    ]
+    # 1. Direct candidate check
+    for c in candidates:
+        if c.exists() and c.is_dir():
+            for p in probe_files[:50]:
+                if (c / p).exists():
+                    log_ok(f"Found media folder for '{default_name}': {c}")
+                    return c
+    # 2. Immediate subdirectories of candidates
+    for c in candidates:
+        if c.exists() and c.is_dir():
+            try:
+                for sub in c.iterdir():
+                    if sub.is_dir():
+                        for p in probe_files[:50]:
+                            if (sub / p).exists():
+                                log_ok(f"Found media subfolder for '{default_name}': {sub}")
+                                return sub
+            except Exception:
+                pass
+    return candidates[0]
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
@@ -962,25 +1036,24 @@ def main():
     out = Path(args.output_dir) if args.output_dir else base / "embeddings"
     out.mkdir(parents=True, exist_ok=True)
 
-    datasets_dir = base / "datasets"
+    log_header(f"Resolving Dataset Paths under {base}")
+    pretrain_jsons = resolve_json_paths(
+        base, ["llava_image_.json", "llava_image.json", "valley_.json", "valley.json"]
+    )
+    finetune_jsons = resolve_json_paths(
+        base, ["llava_image_tune_.json", "videochatgpt_tune_.json", "videochatgpt_.json", "nlp_tune.json"]
+    )
 
     cfg = {
         "pretrain": {
-            "jsons": [
-                datasets_dir / "pt_json" / "llava_image_.json",
-                datasets_dir / "pt_json" / "valley_.json",
-            ],
-            "image_folder": datasets_dir / "llava_image",
-            "video_folder": datasets_dir / "valley",
+            "jsons": pretrain_jsons,
+            "image_folder_name": "llava_image",
+            "video_folder_name": "valley",
         },
         "finetune": {
-            "jsons": [
-                datasets_dir / "ft_json" / "llava_image_tune_.json",
-                datasets_dir / "ft_json" / "videochatgpt_.json",
-                datasets_dir / "ft_json" / "nlp_tune.json",
-            ],
-            "image_folder": datasets_dir / "llava_image_tune",
-            "video_folder": datasets_dir / "videochatgpt_tune",
+            "jsons": finetune_jsons,
+            "image_folder_name": "llava_image_tune",
+            "video_folder_name": "videochatgpt_tune",
         },
     }
 
@@ -1023,13 +1096,18 @@ def main():
         log_header(f"Split: {split.upper()}")
         scfg = cfg[split]
 
+        if not scfg["jsons"]:
+            log_warn(f"No annotation JSONs found for split '{split}'. Skipping.")
+            continue
+
         # 1. Images
         if run_images:
             img_files, _ = extract_file_lists(scfg["jsons"])
             if img_files:
+                resolved_img_folder = resolve_media_folder(base, scfg["image_folder_name"], img_files)
                 embed_images(
                     file_list=img_files,
-                    image_folder=scfg["image_folder"],
+                    image_folder=resolved_img_folder,
                     tower=image_tower,
                     processor=image_proc,
                     h5_path=out / f"{split}_images.h5",
@@ -1044,9 +1122,10 @@ def main():
         if run_videos:
             _, vid_files = extract_file_lists(scfg["jsons"])
             if vid_files:
+                resolved_vid_folder = resolve_media_folder(base, scfg["video_folder_name"], vid_files)
                 embed_videos(
                     file_list=vid_files,
-                    video_folder=scfg["video_folder"],
+                    video_folder=resolved_vid_folder,
                     tower=video_tower,
                     processor=video_proc,
                     h5_path=out / f"{split}_videos.h5",
