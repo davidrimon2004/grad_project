@@ -307,21 +307,60 @@ class LlavaMetaForCausalLM(ABC):
         return fused
 
     def encode_images(self, images):
-        with torch.no_grad():
-            image_features = self.get_model().get_image_tower()(images)
-        proj = self.get_model().mm_projector
-        proj_dtype = next(proj.parameters()).dtype
-        image_features = proj(image_features.to(proj_dtype))
-        return image_features
+        """
+        Encodes a batch of images through the frozen LanguageBind image tower,
+        then projects to the LLM embedding space via mm_projector.
 
-    def encode_videos(self, videos):  # [mini_b, c, t, h, w]
-        b, _, t, _, _ = videos.shape
-        with torch.no_grad():
-            video_features = self.get_model().get_video_tower()(videos)  # [mini_b, t, n, c]
+        Supports two input formats:
+          - Raw pixels:            [B, 3, H, W]       -- normal path
+          - Pre-computed features: [B, N_patches, D]  -- skips frozen encoder
+            (produced by scripts/precompute_embeddings.py when --embed_cache_dir
+             is passed to the training launcher)
+        """
         proj = self.get_model().mm_projector
         proj_dtype = next(proj.parameters()).dtype
-        video_features = proj(video_features.to(proj_dtype))
-        return video_features
+
+        if images.dim() == 3:
+            # Pre-computed LanguageBind features [B, N_patches, encoder_dim]
+            # The frozen encoder forward pass is intentionally skipped here.
+            image_features = images.to(proj_dtype)
+            if image_features.shape[-1] == getattr(self.get_model().config, 'hidden_size', 4096):
+                return image_features
+        else:
+            # Raw pixel tensors [B, 3, H, W] -- standard path
+            with torch.no_grad():
+                image_features = self.get_model().get_image_tower()(images)
+            image_features = image_features.to(proj_dtype)
+
+        return proj(image_features)
+
+    def encode_videos(self, videos):
+        """
+        Encodes a batch of videos through the frozen LanguageBind video tower,
+        then projects to the LLM embedding space via mm_projector.
+
+        Supports two input formats:
+          - Raw pixels:            [B, C, T, H, W]       -- normal path
+          - Pre-computed features: [B, T, N_patches, D]  -- skips frozen encoder
+            (produced by scripts/precompute_embeddings.py when --embed_cache_dir
+             is passed to the training launcher)
+        """
+        proj = self.get_model().mm_projector
+        proj_dtype = next(proj.parameters()).dtype
+
+        if videos.dim() == 4:
+            # Pre-computed LanguageBind features [B, T, N_patches, encoder_dim]
+            # The frozen encoder forward pass is intentionally skipped here.
+            video_features = videos.to(proj_dtype)
+            if video_features.shape[-1] == getattr(self.get_model().config, 'hidden_size', 4096):
+                return video_features
+        else:
+            # Raw pixel tensors [B, C, T, H, W] -- standard path
+            with torch.no_grad():
+                video_features = self.get_model().get_video_tower()(videos)  # [B, T, N, D]
+            video_features = video_features.to(proj_dtype)
+
+        return proj(video_features)
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels, images

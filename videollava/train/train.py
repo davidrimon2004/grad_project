@@ -90,6 +90,19 @@ class DataArguments:
     video_folder: Optional[str] = field(default=None)
     num_frames: int = 8
     # ===================================================================
+    # Pre-computed embedding cache (produced by scripts/precompute_embeddings.py).
+    # When set, the DataLoader loads LanguageBind features from HDF5 files instead
+    # of opening raw image/video files, completely bypassing the Drive FUSE IO
+    # bottleneck and the frozen encoder forward pass.
+    embed_cache_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": (
+            "Path to the directory containing pre-computed HDF5 embedding files "
+            "(pretrain_images.h5, finetune_images.h5, etc.) and their index JSONs. "
+            "Produced by scripts/precompute_embeddings.py.  When provided, the frozen "
+            "LanguageBind encoder is bypassed during training."
+        )},
+    )
 
 
 @dataclass
@@ -702,6 +715,134 @@ class LazySupervisedDataset(Dataset):
         self.list_data_dict = list_data_dict
         self.data_args = data_args
 
+        # ── Pre-computed embedding cache (optional) ───────────────────────
+        # Populated when data_args.embed_cache_dir is set.  Stores open h5py
+        # file handles and index dicts for each HDF5 file found in the cache
+        # directory.  Each DataLoader worker re-opens the files independently
+        # in _ensure_h5_open() to avoid multiprocessing file-handle conflicts.
+        self._h5_handles: dict = {}          # name -> h5py.File (per worker)
+        self._embed_image_index: dict = {}   # rel_path -> row_int
+        self._embed_video_index: dict = {}   # rel_path -> row_int
+        self._embed_text_index: dict = {}    # sample_id/key -> {"offset": int, "length": int}
+        self._embed_image_h5_name: Optional[str] = None
+        self._embed_video_h5_name: Optional[str] = None
+        self._embed_text_h5_name: Optional[str] = None
+
+        if data_args.embed_cache_dir:
+            self._init_embed_cache(data_args.embed_cache_dir)
+
+    # ── Embedding-cache helpers ───────────────────────────────────────────
+
+    def _init_embed_cache(self, cache_dir: str):
+        """Loads index JSONs and records HDF5 file names for later use."""
+        import glob
+        cdir = Path(cache_dir)
+        if not cdir.exists():
+            rank0_print(f"[EmbedCache] WARNING: cache_dir does not exist: {cdir}")
+            return
+
+        # Determine which HDF5 files apply for this run (pretrain vs finetune)
+        # by probing which index JSON contains keys present in our data.
+        for prefix in ["pretrain", "finetune"]:
+            img_idx_path = cdir / f"{prefix}_image_index.json"
+            vid_idx_path = cdir / f"{prefix}_video_index.json"
+            txt_idx_path = cdir / f"{prefix}_text_index.json"
+            img_h5_path  = cdir / f"{prefix}_images.h5"
+            vid_h5_path  = cdir / f"{prefix}_videos.h5"
+            txt_h5_path  = cdir / f"{prefix}_text.h5"
+
+            if img_idx_path.exists() and img_h5_path.exists():
+                idx = json.loads(img_idx_path.read_text())
+                if idx and self._embed_image_h5_name is None:
+                    self._embed_image_index   = idx
+                    self._embed_image_h5_name = str(img_h5_path)
+                    rank0_print(
+                        f"[EmbedCache] Image cache: {img_h5_path.name}  "
+                        f"({len(idx):,} entries)"
+                    )
+
+            if vid_idx_path.exists() and vid_h5_path.exists():
+                idx = json.loads(vid_idx_path.read_text())
+                if idx and self._embed_video_h5_name is None:
+                    self._embed_video_index   = idx
+                    self._embed_video_h5_name = str(vid_h5_path)
+                    rank0_print(
+                        f"[EmbedCache] Video cache: {vid_h5_path.name}  "
+                        f"({len(idx):,} entries)"
+                    )
+
+            if txt_idx_path.exists() and txt_h5_path.exists():
+                idx = json.loads(txt_idx_path.read_text())
+                if idx and self._embed_text_h5_name is None:
+                    self._embed_text_index   = idx
+                    self._embed_text_h5_name = str(txt_h5_path)
+                    rank0_print(
+                        f"[EmbedCache] Text cache: {txt_h5_path.name}  "
+                        f"({len(idx):,} entries)"
+                    )
+
+    def _load_image_feature(self, rel_path: str) -> Optional[torch.Tensor]:
+        """Returns pre-computed image feature tensor [N_patches, D] or None."""
+        if not self._embed_image_h5_name or rel_path not in self._embed_image_index:
+            return None
+        try:
+            import h5py
+            h5_path = self._embed_image_h5_name
+            if h5_path not in self._h5_handles:
+                self._h5_handles[h5_path] = h5py.File(h5_path, "r", swmr=True)
+            row = self._embed_image_index[rel_path]
+            feat_np = self._h5_handles[h5_path]["features"][row]  # [N, D] np.float16
+            return torch.from_numpy(feat_np.astype("float32"))    # [N, D] fp32
+        except Exception as exc:
+            rank0_print(f"[EmbedCache] Failed to load image feature for {rel_path}: {exc}")
+            return None
+
+    def _load_video_feature(self, rel_path: str) -> Optional[torch.Tensor]:
+        """Returns pre-computed video feature tensor [T, N_patches, D] or None."""
+        if not self._embed_video_h5_name or rel_path not in self._embed_video_index:
+            return None
+        try:
+            import h5py
+            h5_path = self._embed_video_h5_name
+            if h5_path not in self._h5_handles:
+                self._h5_handles[h5_path] = h5py.File(h5_path, "r", swmr=True)
+            row = self._embed_video_index[rel_path]
+            feat_np = self._h5_handles[h5_path]["features"][row]  # [T, N, D]
+            return torch.from_numpy(feat_np.astype("float32"))    # [T, N, D] fp32
+        except Exception as exc:
+            rank0_print(f"[EmbedCache] Failed to load video feature for {rel_path}: {exc}")
+            return None
+
+    def _load_text_feature(self, i: int) -> Optional[Dict[str, torch.Tensor]]:
+        """Returns pre-computed token_ids, labels, and text_embeddings for sample index i."""
+        if not self._embed_text_h5_name or not self._embed_text_index:
+            return None
+        sample = self.list_data_dict[i]
+        key = str(sample.get("id", i))
+        if key not in self._embed_text_index:
+            key = str(i)
+        if key not in self._embed_text_index:
+            return None
+        try:
+            import h5py
+            h5_path = self._embed_text_h5_name
+            if h5_path not in self._h5_handles:
+                self._h5_handles[h5_path] = h5py.File(h5_path, "r", swmr=True)
+            meta = self._embed_text_index[key]
+            start = meta["offset"]
+            length = meta["length"]
+            end = start + length
+            h5 = self._h5_handles[h5_path]
+            input_ids = torch.from_numpy(h5["token_ids"][start:end].astype("int64"))
+            labels = torch.from_numpy(h5["labels"][start:end].astype("int64"))
+            res = {"input_ids": input_ids.unsqueeze(0), "labels": labels.unsqueeze(0)}
+            if "text_embeddings" in h5:
+                res["text_embeddings"] = torch.from_numpy(h5["text_embeddings"][start:end].astype("float32")).unsqueeze(0)
+            return res
+        except Exception as exc:
+            rank0_print(f"[EmbedCache] Failed to load text feature for sample {i}: {exc}")
+            return None
+
     def __len__(self):
         return len(self.list_data_dict)
 
@@ -737,15 +878,26 @@ class LazySupervisedDataset(Dataset):
                 image_processor = self.data_args.image_processor
                 image_file = image_file if isinstance(image_file, list) else [image_file]
                 image_file = order_pick_k(image_file, MAX_IMAGE_LENGTH)
-                # print(f"total {len(self.list_data_dict[i]['image'])} now {len(image_file)}")
-                image = [Image.open(os.path.join(image_folder, file)).convert('RGB') for file in image_file]
-                if self.data_args.image_aspect_ratio == 'pad':
-                    image = [expand2square(i, tuple(int(x * 255) for x in image_processor.image_mean)) for i in image]
-                    image = [image_processor.preprocess(i, return_tensors='pt')['pixel_values'][0] for i in image]
+
+                # -- Try pre-computed embedding cache first -----------------
+                image = [self._load_image_feature(f) for f in image_file]
+                if any(feat is None for feat in image):
+                    # Fall back to raw pixel loading for missing cache entries
+                    image = [Image.open(os.path.join(image_folder, file)).convert('RGB')
+                             for file in image_file]
+                    if self.data_args.image_aspect_ratio == 'pad':
+                        image = [expand2square(i, tuple(int(x * 255) for x in image_processor.image_mean))
+                                 for i in image]
+                    image = [image_processor.preprocess(i, return_tensors='pt')['pixel_values'][0]
+                             for i in image]
+                # ----------------------------------------------------------
+
+                cached_text = self._load_text_feature(i)
+                if cached_text is not None:
+                    data_dict = cached_text
                 else:
-                    image = [image_processor.preprocess(i, return_tensors='pt')['pixel_values'][0] for i in image]
-                sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
-                data_dict = preprocess(sources, self.tokenizer, has_image=True)
+                    sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
+                    data_dict = preprocess(sources, self.tokenizer, has_image=True)
 
             elif 'image' not in sources[0] and 'video' in sources[0]:
                 # rank0_print('video')
@@ -754,13 +906,20 @@ class LazySupervisedDataset(Dataset):
                 video_processor = self.data_args.video_processor
                 video_file = video_file if isinstance(video_file, list) else [video_file]
                 video_file = order_pick_k(video_file, MAX_VIDEO_LENGTH)
-                video = [os.path.join(video_folder, file) for file in video_file]
-                image = [video_processor(i, return_tensors='pt')['pixel_values'][0] for i in video]  # fake image
-                # image = [torch.randn(3, 8, 224, 224) for i in video]  # fake image
-                sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
-                # print('after preprocess_multimodal', sources[0])
-                data_dict = preprocess(sources, self.tokenizer, has_image=True)
-                # print('after preprocess', data_dict['input_ids'])
+
+                # -- Try pre-computed embedding cache first -----------------
+                image = [self._load_video_feature(f) for f in video_file]
+                if any(feat is None for feat in image):
+                    video = [os.path.join(video_folder, file) for file in video_file]
+                    image = [video_processor(i, return_tensors='pt')['pixel_values'][0] for i in video]
+                # ----------------------------------------------------------
+
+                cached_text = self._load_text_feature(i)
+                if cached_text is not None:
+                    data_dict = cached_text
+                else:
+                    sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
+                    data_dict = preprocess(sources, self.tokenizer, has_image=True)
 
             elif 'image' in sources[0] and 'video' in sources[0]:
                 # rank0_print('image & video')
@@ -789,17 +948,27 @@ class LazySupervisedDataset(Dataset):
 
                 image = video + image  # video must before image
 
-                sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
-                data_dict = preprocess(sources, self.tokenizer, has_image=True)
+                cached_text = self._load_text_feature(i)
+                if cached_text is not None:
+                    data_dict = cached_text
+                else:
+                    sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
+                    data_dict = preprocess(sources, self.tokenizer, has_image=True)
             else:
-                sources = copy.deepcopy([e["conversations"] for e in sources])
-                data_dict = preprocess(sources, self.tokenizer, has_image=False)
+                cached_text = self._load_text_feature(i)
+                if cached_text is not None:
+                    data_dict = cached_text
+                else:
+                    sources = copy.deepcopy([e["conversations"] for e in sources])
+                    data_dict = preprocess(sources, self.tokenizer, has_image=False)
 
             # ==========================================================================================================
 
             if isinstance(i, int):
-                data_dict = dict(input_ids=data_dict["input_ids"][0],
-                                 labels=data_dict["labels"][0])
+                data_dict["input_ids"] = data_dict["input_ids"][0]
+                data_dict["labels"] = data_dict["labels"][0]
+                if "text_embeddings" in data_dict:
+                    data_dict["text_embeddings"] = data_dict["text_embeddings"][0]
             # image exist in the data
             if 'image' in self.list_data_dict[i] or 'video' in self.list_data_dict[i]:
                 data_dict['image'] = image
