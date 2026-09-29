@@ -52,6 +52,7 @@ import argparse
 import copy
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -217,6 +218,80 @@ def _open_or_create_text_hdf5(path: Path, vocab_weight: np.ndarray, hidden_size:
     h5.attrs["hidden_size"] = hidden_size
     log(f"  Created extensible {path.name}: hidden_size={hidden_size}")
     return h5, dset_embeds, dset_tokens, dset_labels, dset_offsets, 0, 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Staging & Syncing helpers (Fast local NVMe SSD <-> Google Drive)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _prepare_staged_paths(
+    h5_path: Path,
+    index_path: Path,
+    staging_dir: Optional[Path] = None,
+) -> Tuple[Path, Path, Optional[Path], Optional[Path]]:
+    """
+    If staging_dir is provided, ensures heavy random I/O occurs on fast local SSD,
+    and returns (work_h5, work_index, target_h5, target_index).
+    Resumes seamlessly by copying existing data from target storage to staging_dir.
+    """
+    if staging_dir is None:
+        return h5_path, index_path, None, None
+
+    staging_dir = Path(staging_dir)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    work_h5 = staging_dir / h5_path.name
+    work_index = staging_dir / index_path.name
+
+    try:
+        free_gb = shutil.disk_usage(str(staging_dir)).free / 1e9
+        log(f"  [Staging] Local NVMe staging active: {staging_dir} ({free_gb:.1f} GB free)")
+    except Exception:
+        pass
+
+    # If local working file does not exist, but storage target exists, copy down to resume
+    if not work_h5.exists() and h5_path.exists():
+        log(f"  [Staging] Fetching existing {h5_path.name} from storage to local SSD ({h5_path.stat().st_size / 1e6:.1f} MB)...")
+        shutil.copy2(str(h5_path), str(work_h5))
+        if index_path.exists():
+            shutil.copy2(str(index_path), str(work_index))
+        log_ok(f"  [Staging] Staged existing checkpoint to {work_h5}")
+    elif work_h5.exists() and h5_path.exists():
+        if h5_path.stat().st_size > work_h5.stat().st_size:
+            log(f"  [Staging] Storage file is larger ({h5_path.stat().st_size / 1e6:.1f} MB vs {work_h5.stat().st_size / 1e6:.1f} MB). Fetching from storage...")
+            shutil.copy2(str(h5_path), str(work_h5))
+            if index_path.exists():
+                shutil.copy2(str(index_path), str(work_index))
+        else:
+            log(f"  [Staging] Using existing local working file: {work_h5} ({work_h5.stat().st_size / 1e6:.1f} MB)")
+    elif work_h5.exists():
+        log(f"  [Staging] Found existing local working file: {work_h5} ({work_h5.stat().st_size / 1e6:.1f} MB)")
+
+    return work_h5, work_index, h5_path, index_path
+
+
+def _sync_staged_files(
+    work_h5: Path,
+    work_index: Path,
+    target_h5: Optional[Path],
+    target_index: Optional[Path],
+):
+    """
+    Syncs working files from local SSD staging to long-term storage (e.g. Google Drive).
+    Catches network/FUSE exceptions so a transient Drive error doesn't crash the script.
+    """
+    if target_h5 is None:
+        return
+    try:
+        target_h5.parent.mkdir(parents=True, exist_ok=True)
+        # Sync index first (fast metadata)
+        if work_index.exists() and target_index is not None:
+            shutil.copy2(str(work_index), str(target_index))
+        # Sync HDF5
+        if work_h5.exists():
+            shutil.copy2(str(work_h5), str(target_h5))
+            log(f"\n  [Sync] Successfully backed up {work_h5.name} to {target_h5.parent} ({work_h5.stat().st_size / 1e6:.1f} MB)")
+    except Exception as exc:
+        log_warn(f"\n  [Sync Notice] Sync to Drive encountered: {exc}. Local progress on SSD is safe; will retry next sync.")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -398,6 +473,8 @@ def embed_images(
     dtype: torch.dtype,
     batch_size: int = 64,
     projector: Optional[torch.nn.Module] = None,
+    staging_dir: Optional[Path] = None,
+    sync_interval_mins: float = 15.0,
 ):
     """
     Encodes images through LanguageBind (and optional mm_projector) to HDF5.
@@ -428,13 +505,19 @@ def embed_images(
     log(f"  Feature shape per image: {feat_shape} (projected={projector is not None})")
     del probe_feat, probe_tensor
 
-    h5, dset, written = _open_or_create_hdf5(h5_path, n_total, feat_shape)
+    work_h5, work_index, target_h5, target_index = _prepare_staged_paths(
+        h5_path, index_path, staging_dir
+    )
+    h5, dset, written = _open_or_create_hdf5(work_h5, n_total, feat_shape)
 
     index: Dict[str, int] = {}
-    if index_path.exists():
-        index = json.loads(index_path.read_text())
+    if work_index.exists():
+        index = json.loads(work_index.read_text())
 
     t0 = time.time()
+    last_sync = time.time()
+    sync_interval_sec = max(60.0, sync_interval_mins * 60.0)
+
     try:
         for batch_start in range(written, n_total, batch_size):
             batch_files = file_list[batch_start: batch_start + batch_size]
@@ -468,10 +551,13 @@ def embed_images(
             written = end_row
             h5.attrs["written"] = written
 
-            # Flush periodically
-            if (batch_start // batch_size) % 500 == 499:
+            # Flush periodically to local disk
+            if (batch_start // batch_size) % 100 == 99:
                 h5.flush()
-                index_path.write_text(json.dumps(index, separators=(",", ":")))
+                work_index.write_text(json.dumps(index, separators=(",", ":")))
+                if target_h5 is not None and (time.time() - last_sync >= sync_interval_sec):
+                    _sync_staged_files(work_h5, work_index, target_h5, target_index)
+                    last_sync = time.time()
 
             elapsed = time.time() - t0
             pct = written / n_total * 100
@@ -485,12 +571,15 @@ def embed_images(
     finally:
         h5.flush()
         h5.close()
-        index_path.write_text(json.dumps(index, separators=(",", ":")))
+        work_index.write_text(json.dumps(index, separators=(",", ":")))
+        if target_h5 is not None:
+            _sync_staged_files(work_h5, work_index, target_h5, target_index)
         print()
 
     elapsed = time.time() - t0
-    log_ok(f"Done {written:,} images in {elapsed/3600:.2f}h  ->  {h5_path}")
-    log_ok(f"Index saved  ->  {index_path}  ({len(index):,} entries)")
+    final_dest = target_h5 if target_h5 is not None else work_h5
+    log_ok(f"Done {written:,} images in {elapsed/3600:.2f}h  ->  {final_dest}")
+    log_ok(f"Index saved  ->  {target_index if target_index is not None else work_index}  ({len(index):,} entries)")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -508,6 +597,8 @@ def embed_videos(
     dtype: torch.dtype,
     batch_size: int = 4,
     projector: Optional[torch.nn.Module] = None,
+    staging_dir: Optional[Path] = None,
+    sync_interval_mins: float = 15.0,
 ):
     """
     Encodes videos through LanguageBind (and optional mm_projector) to HDF5.
@@ -537,13 +628,19 @@ def embed_videos(
     log(f"  Feature shape per video: {feat_shape} (projected={projector is not None})")
     del probe_feat, probe_pv
 
-    h5, dset, written = _open_or_create_hdf5(h5_path, n_total, feat_shape)
+    work_h5, work_index, target_h5, target_index = _prepare_staged_paths(
+        h5_path, index_path, staging_dir
+    )
+    h5, dset, written = _open_or_create_hdf5(work_h5, n_total, feat_shape)
 
     index: Dict[str, int] = {}
-    if index_path.exists():
-        index = json.loads(index_path.read_text())
+    if work_index.exists():
+        index = json.loads(work_index.read_text())
 
     t0 = time.time()
+    last_sync = time.time()
+    sync_interval_sec = max(60.0, sync_interval_mins * 60.0)
+
     try:
         for batch_start in range(written, n_total, batch_size):
             batch_files = file_list[batch_start: batch_start + batch_size]
@@ -576,9 +673,12 @@ def embed_videos(
             written = end_row
             h5.attrs["written"] = written
 
-            if (batch_start // batch_size) % 100 == 99:
+            if (batch_start // batch_size) % 50 == 49:
                 h5.flush()
-                index_path.write_text(json.dumps(index, separators=(",", ":")))
+                work_index.write_text(json.dumps(index, separators=(",", ":")))
+                if target_h5 is not None and (time.time() - last_sync >= sync_interval_sec):
+                    _sync_staged_files(work_h5, work_index, target_h5, target_index)
+                    last_sync = time.time()
 
             elapsed = time.time() - t0
             pct = written / n_total * 100
@@ -592,12 +692,15 @@ def embed_videos(
     finally:
         h5.flush()
         h5.close()
-        index_path.write_text(json.dumps(index, separators=(",", ":")))
+        work_index.write_text(json.dumps(index, separators=(",", ":")))
+        if target_h5 is not None:
+            _sync_staged_files(work_h5, work_index, target_h5, target_index)
         print()
 
     elapsed = time.time() - t0
-    log_ok(f"Done {written:,} videos in {elapsed/3600:.2f}h  ->  {h5_path}")
-    log_ok(f"Index saved  ->  {index_path}")
+    final_dest = target_h5 if target_h5 is not None else work_h5
+    log_ok(f"Done {written:,} videos in {elapsed/3600:.2f}h  ->  {final_dest}")
+    log_ok(f"Index saved  ->  {target_index if target_index is not None else work_index}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -686,6 +789,8 @@ def embed_text(
     device: torch.device,
     dtype: torch.dtype,
     batch_size: int = 256,
+    staging_dir: Optional[Path] = None,
+    sync_interval_mins: float = 15.0,
 ):
     """
     Precomputes textual token embeddings, token_ids, labels, and offsets into an
@@ -706,18 +811,24 @@ def embed_text(
     n_samples = len(all_samples)
     log_header(f"Embedding text for {n_samples:,} conversation samples  ->  {h5_path.name}")
 
+    work_h5, work_index, target_h5, target_index = _prepare_staged_paths(
+        h5_path, index_path, staging_dir
+    )
     h5, dset_embeds, dset_tokens, dset_labels, dset_offsets, written, total_tokens = (
-        _open_or_create_text_hdf5(h5_path, vocab_weight, hidden_size)
+        _open_or_create_text_hdf5(work_h5, vocab_weight, hidden_size)
     )
 
     index: Dict[str, Any] = {}
-    if index_path.exists():
+    if work_index.exists():
         try:
-            index = json.loads(index_path.read_text())
+            index = json.loads(work_index.read_text())
         except Exception:
             index = {}
 
     t0 = time.time()
+    last_sync = time.time()
+    sync_interval_sec = max(60.0, sync_interval_mins * 60.0)
+
     try:
         for batch_start in range(written, n_samples, batch_size):
             batch_samples = all_samples[batch_start : batch_start + batch_size]
@@ -816,10 +927,13 @@ def embed_text(
             h5.attrs["written_samples"] = written
             h5.attrs["total_tokens"] = total_tokens
 
-            # Flush periodically
-            if (batch_start // batch_size) % 100 == 99:
+            # Flush periodically to local disk
+            if (batch_start // batch_size) % 50 == 49:
                 h5.flush()
-                index_path.write_text(json.dumps(index, separators=(",", ":")))
+                work_index.write_text(json.dumps(index, separators=(",", ":")))
+                if target_h5 is not None and (time.time() - last_sync >= sync_interval_sec):
+                    _sync_staged_files(work_h5, work_index, target_h5, target_index)
+                    last_sync = time.time()
 
             elapsed = time.time() - t0
             pct = written / n_samples * 100
@@ -834,12 +948,15 @@ def embed_text(
     finally:
         h5.flush()
         h5.close()
-        index_path.write_text(json.dumps(index, separators=(",", ":")))
+        work_index.write_text(json.dumps(index, separators=(",", ":")))
+        if target_h5 is not None:
+            _sync_staged_files(work_h5, work_index, target_h5, target_index)
         print()
 
     elapsed = time.time() - t0
-    log_ok(f"Done {written:,} samples ({total_tokens:,} tokens) in {elapsed/3600:.2f}h  ->  {h5_path}")
-    log_ok(f"Index saved  ->  {index_path}")
+    final_dest = target_h5 if target_h5 is not None else work_h5
+    log_ok(f"Done {written:,} samples ({total_tokens:,} tokens) in {elapsed/3600:.2f}h  ->  {final_dest}")
+    log_ok(f"Index saved  ->  {target_index if target_index is not None else work_index}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1019,6 +1136,18 @@ def main():
         default="fp16",
         help="Encoder compute precision (storage is always fp16).",
     )
+    parser.add_argument(
+        "--staging_dir",
+        type=str,
+        default=None,
+        help="Local staging directory (e.g. /content/staging_embeddings) on fast local NVMe to prevent Google Drive FUSE timeouts. Periodically synced to Drive.",
+    )
+    parser.add_argument(
+        "--sync_interval_mins",
+        type=float,
+        default=15.0,
+        help="Minutes between periodic syncs from local staging to Drive (default: 15.0).",
+    )
     args = parser.parse_args()
 
     # -- device / dtype ------------------------------------------------------
@@ -1035,6 +1164,16 @@ def main():
     base = Path(args.drive_base)
     out = Path(args.output_dir) if args.output_dir else base / "embeddings"
     out.mkdir(parents=True, exist_ok=True)
+
+    # -- staging setup --------------------------------------------------------
+    staging_dir = None
+    if args.staging_dir:
+        staging_dir = Path(args.staging_dir)
+    elif "/drive/" in str(out) or "/MyDrive/" in str(out) or str(out).startswith("/content/drive"):
+        default_stage = Path("/content/staging_embeddings")
+        if Path("/content").exists():
+            staging_dir = default_stage
+            log_ok(f"Detected Google Drive destination. Auto-enabled local NVMe staging: {staging_dir}")
 
     log_header(f"Resolving Dataset Paths under {base}")
     pretrain_jsons = resolve_json_paths(
@@ -1116,6 +1255,8 @@ def main():
                     dtype=dtype,
                     batch_size=args.image_batch_size,
                     projector=projector,
+                    staging_dir=staging_dir,
+                    sync_interval_mins=args.sync_interval_mins,
                 )
 
         # 2. Videos
@@ -1134,6 +1275,8 @@ def main():
                     dtype=dtype,
                     batch_size=args.video_batch_size,
                     projector=projector,
+                    staging_dir=staging_dir,
+                    sync_interval_mins=args.sync_interval_mins,
                 )
 
         # 3. Text
@@ -1149,6 +1292,8 @@ def main():
                 device=device,
                 dtype=dtype,
                 batch_size=args.text_batch_size,
+                staging_dir=staging_dir,
+                sync_interval_mins=args.sync_interval_mins,
             )
 
     # -- write meta -----------------------------------------------------------
@@ -1168,7 +1313,10 @@ def main():
             "and embedding lookups."
         ),
     }
-    (out / "meta.json").write_text(json.dumps(meta, indent=2))
+    meta_json_str = json.dumps(meta, indent=2)
+    (out / "meta.json").write_text(meta_json_str)
+    if staging_dir is not None and staging_dir.exists():
+        (staging_dir / "meta.json").write_text(meta_json_str)
     log_ok(f"All done! Embeddings written to {out}")
 
 
