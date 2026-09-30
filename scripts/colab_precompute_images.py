@@ -507,6 +507,34 @@ def extract_image_file_list(json_paths: List[Path]) -> List[str]:
     return img_files
 
 
+def safe_is_file(p: Path) -> bool:
+    try:
+        return os.path.isfile(str(p))
+    except (OSError, Exception):
+        return False
+
+
+def safe_is_dir(p: Path) -> bool:
+    try:
+        return os.path.isdir(str(p))
+    except (OSError, Exception):
+        return False
+
+
+def safe_exists(p: Path) -> bool:
+    try:
+        return os.path.exists(str(p))
+    except (OSError, Exception):
+        return False
+
+
+def safe_getsize(p: Path) -> int:
+    try:
+        return os.path.getsize(str(p))
+    except (OSError, Exception):
+        return 0
+
+
 def resolve_image_path_mapping(
     folder: Path,
     probe_files: List[str],
@@ -516,18 +544,18 @@ def resolve_image_path_mapping(
     Checks probe images against a candidate folder to locate the exact images path
     and detect any prefix differences without scanning entire Google Drive directories.
     """
-    if not folder.exists() or not folder.is_dir():
+    if not safe_is_dir(folder):
         return folder, None, None
 
     for probe_rel in probe_files[:10]:
         bare = Path(probe_rel).name
 
         # 1. Exact match
-        if (folder / probe_rel).is_file():
+        if safe_is_file(folder / probe_rel):
             return folder, None, folder / probe_rel
 
         # 2. Flat match
-        if (folder / bare).is_file():
+        if safe_is_file(folder / bare):
             pfx = probe_rel[:-len(bare)] if len(probe_rel) > len(bare) else None
             return folder, pfx, folder / bare
 
@@ -536,19 +564,19 @@ def resolve_image_path_mapping(
             parts = probe_rel.split("/")
             for i in range(1, len(parts)):
                 subpath = "/".join(parts[i:])
-                if (folder / subpath).is_file():
+                if safe_is_file(folder / subpath):
                     pfx = "/".join(parts[:i]) + "/"
                     return folder, pfx, folder / subpath
 
         # 4. Standard subdirectories
-        for sname in [default_name, "images", "data", "train2017"]:
+        for sname in [default_name, "images", "data", "train2017", "coco", "gqa", "vg"]:
             sub = folder / sname
-            if not sub.is_dir():
+            if not safe_is_dir(sub):
                 continue
-            if (sub / bare).is_file():
+            if safe_is_file(sub / bare):
                 pfx = probe_rel[:-len(bare)] if len(probe_rel) > len(bare) else None
                 return sub, pfx, sub / bare
-            if (sub / probe_rel).is_file():
+            if safe_is_file(sub / probe_rel):
                 return sub, None, sub / probe_rel
 
     return folder, None, None
@@ -573,7 +601,7 @@ def resolve_image_folder(
         base,
     ]
     for c in candidates:
-        if not c.exists() or not c.is_dir():
+        if not safe_is_dir(c):
             continue
         actual_folder, strip_pfx, probe_path = resolve_image_path_mapping(
             c, probe_files[:25], default_name=folder_name
@@ -594,10 +622,12 @@ def resolve_annotation_jsons(base: Path, candidate_names: List[str]) -> List[Pat
         base / "datasets" / "pt_json",
         base / "datasets" / "ft_json",
         base / "datasets" / "annotations",
+        base / "datasets" / "train_json",
         base / "datasets",
         base / "pt_json",
         base / "ft_json",
         base / "annotations",
+        base / "train_json",
         base / "data",
         Path("/content/datasets"),
         Path("/content"),

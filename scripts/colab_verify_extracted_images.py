@@ -174,6 +174,34 @@ def extract_image_files(json_paths: List[Path]) -> List[str]:
     return sorted(seen, key=seen.__getitem__)
 
 
+def safe_is_file(p: Path) -> bool:
+    try:
+        return os.path.isfile(str(p))
+    except (OSError, Exception):
+        return False
+
+
+def safe_is_dir(p: Path) -> bool:
+    try:
+        return os.path.isdir(str(p))
+    except (OSError, Exception):
+        return False
+
+
+def safe_exists(p: Path) -> bool:
+    try:
+        return os.path.exists(str(p))
+    except (OSError, Exception):
+        return False
+
+
+def safe_getsize(p: Path) -> int:
+    try:
+        return os.path.getsize(str(p))
+    except (OSError, Exception):
+        return 0
+
+
 def resolve_image_folder_and_prefix(
     base: Path,
     folder_name: str,
@@ -193,17 +221,17 @@ def resolve_image_folder_and_prefix(
     ]
 
     for c in candidate_folders:
-        if not c.exists() or not c.is_dir():
+        if not safe_is_dir(c):
             continue
         for probe in probe_files[:20]:
             bare = Path(probe).name
 
             # Direct match
-            if (c / probe).is_file():
+            if safe_is_file(c / probe):
                 return c, None
 
             # Flat match
-            if (c / bare).is_file():
+            if safe_is_file(c / bare):
                 pfx = probe[:-len(bare)] if len(probe) > len(bare) else None
                 return c, pfx
 
@@ -212,17 +240,19 @@ def resolve_image_folder_and_prefix(
                 parts = probe.split("/")
                 for i in range(1, len(parts)):
                     subpath = "/".join(parts[i:])
-                    if (c / subpath).is_file():
+                    if safe_is_file(c / subpath):
                         pfx = "/".join(parts[:i]) + "/"
                         return c, pfx
 
-            for sname in [folder_name, "images", "data", "train2017"]:
+            for sname in [folder_name, "images", "data", "train2017", "coco", "gqa", "vg"]:
                 sub = c / sname
-                if sub.is_dir() and (sub / bare).is_file():
+                if safe_is_dir(sub) and safe_is_file(sub / bare):
                     pfx = probe[:-len(bare)] if len(probe) > len(bare) else None
                     return sub, pfx
 
-    return None, None
+    # Fallback to standard datasets folder
+    fallback = base / "datasets" / folder_name
+    return fallback, None
 
 
 def resolve_annotation_json(base: Path, candidate_names: List[str]) -> Optional[Path]:
@@ -230,10 +260,12 @@ def resolve_annotation_json(base: Path, candidate_names: List[str]) -> Optional[
         base / "datasets" / "pt_json",
         base / "datasets" / "ft_json",
         base / "datasets" / "annotations",
+        base / "datasets" / "train_json",
         base / "datasets",
         base / "pt_json",
         base / "ft_json",
         base / "annotations",
+        base / "train_json",
         base / "data",
         Path("/content/datasets"),
         Path("/content"),
@@ -241,10 +273,10 @@ def resolve_annotation_json(base: Path, candidate_names: List[str]) -> Optional[
     ]
     for cand in candidate_names:
         for sdir in search_dirs:
-            if not sdir.is_dir():
+            if not safe_is_dir(sdir):
                 continue
             target = sdir / cand
-            if target.is_file() and os.path.getsize(str(target)) > 0:
+            if safe_is_file(target) and safe_getsize(target) > 0:
                 return target
     return None
 
@@ -266,11 +298,11 @@ def check_single_image(
     )
     full_path = image_folder / actual_rel
     try:
-        if full_path.is_file():
-            size = os.path.getsize(str(full_path))
+        if safe_is_file(full_path):
+            size = safe_getsize(full_path)
             return rel_path, size > 0, size
         return rel_path, False, 0
-    except Exception:
+    except (OSError, Exception):
         return rel_path, False, 0
 
 
