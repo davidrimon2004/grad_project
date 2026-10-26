@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 High-Performance Downloader & Extractor for Video-LLaVA / MuLER Fine-Tuning Datasets (Stage 2)
+=============================================================================================
 
 Datasets handled:
   1. Annotations (Google Drive ~471MB):
@@ -18,17 +19,14 @@ Datasets handled:
      - videochatgpt_tune_2.zip.005 (3.82 GB)
 
 Usage:
-  # Download everything:
-  python scripts/download_finetune_data.py --data_root ./data --components all --extract
+  # 1. Download video tuning dataset only (recommended):
+  python scripts/download_finetune_data.py --data_root E:\\videollava_data --components video
 
-  # Download annotations only:
-  python scripts/download_finetune_data.py --data_root ./data --components annotations
+  # 2. Download and automatically extract:
+  python scripts/download_finetune_data.py --data_root E:\\videollava_data --components video --extract
 
-  # Download image tuning data only:
-  python scripts/download_finetune_data.py --data_root ./data --components image --extract
-
-  # Download video tuning data only:
-  python scripts/download_finetune_data.py --data_root ./data --components video --extract
+  # 3. Verify downloaded parts without downloading:
+  python scripts/download_finetune_data.py --data_root E:\\videollava_data --components video --verify
 """
 
 import os
@@ -40,6 +38,7 @@ import zipfile
 import argparse
 import subprocess
 import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -59,17 +58,14 @@ VIDEO_TUNE_PARTS = [
     "videochatgpt_tune_2.zip.005",
 ]
 
-IMAGE_PART_MIN_BYTES = {
-    "llava_image_tune_2.zip.001": int(38.5 * (1024 ** 3)),
-    "llava_image_tune_2.zip.002": int(27.5 * (1024 ** 3)),
-}
-
-VIDEO_PART_MIN_BYTES = {
-    "videochatgpt_tune_2.zip.001": int(38.5 * (1024 ** 3)),
-    "videochatgpt_tune_2.zip.002": int(38.5 * (1024 ** 3)),
-    "videochatgpt_tune_2.zip.003": int(38.5 * (1024 ** 3)),
-    "videochatgpt_tune_2.zip.004": int(38.5 * (1024 ** 3)),
-    "videochatgpt_tune_2.zip.005": int(3.5 * (1024 ** 3)),
+EXACT_BYTES: Dict[str, int] = {
+    "llava_image_tune_2.zip.001": 41_943_040_000,
+    "llava_image_tune_2.zip.002": 30_468_547_028,
+    "videochatgpt_tune_2.zip.001": 41_943_040_000,
+    "videochatgpt_tune_2.zip.002": 41_943_040_000,
+    "videochatgpt_tune_2.zip.003": 41_943_040_000,
+    "videochatgpt_tune_2.zip.004": 41_943_040_000,
+    "videochatgpt_tune_2.zip.005": 4_103_350_672,
 }
 
 FT_ANNOTATION_FILES = [
@@ -78,20 +74,21 @@ FT_ANNOTATION_FILES = [
     "nlp_tune.json",
 ]
 
+ZIP_MAGIC = b'PK\x03\x04'
+
 
 class Colors:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKCYAN = '\033[96m'
+    HEADER  = '\033[95m'
+    OKCYAN  = '\033[96m'
     OKGREEN = '\033[92m'
     WARNING = '\033[93m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
+    FAIL    = '\033[91m'
+    ENDC    = '\033[0m'
+    BOLD    = '\033[1m'
 
 
 def log_info(msg: str):
-    print(f"{Colors.OKCYAN}[INFO]{Colors.ENDC} {msg}", flush=True)
+    print(f"{Colors.OKCYAN}[INFO]{Colors.ENDC}    {msg}", flush=True)
 
 
 def log_success(msg: str):
@@ -99,29 +96,75 @@ def log_success(msg: str):
 
 
 def log_warn(msg: str):
-    print(f"{Colors.WARNING}[WARN]{Colors.ENDC} {msg}", flush=True)
+    print(f"{Colors.WARNING}[WARN]{Colors.ENDC}    {msg}", flush=True)
 
 
 def log_err(msg: str):
-    print(f"{Colors.FAIL}[ERROR]{Colors.ENDC} {msg}", flush=True)
+    print(f"{Colors.FAIL}[ERROR]{Colors.ENDC}   {msg}", flush=True)
 
 
 def log_header(msg: str):
-    print(f"\n{Colors.HEADER}{Colors.BOLD}{'='*60}\n{msg}\n{'='*60}{Colors.ENDC}", flush=True)
+    print(f"\n{Colors.HEADER}{Colors.BOLD}{'='*64}\n  {msg}\n{'='*64}{Colors.ENDC}", flush=True)
 
 
-def download_file_with_resume(url: str, output_path: Path, min_bytes: int = 0, use_aria2: bool = True) -> bool:
-    """Downloads a file with resume support using aria2c or requests/urllib."""
+def find_7z() -> Optional[str]:
+    """Return path to 7z.exe or None."""
+    for candidate in ("7z", "7za"):
+        p = shutil.which(candidate)
+        if p:
+            return p
+    if os.name == "nt":
+        for win_path in [
+            r"C:\Program Files\7-Zip\7z.exe",
+            r"C:\Program Files (x86)\7-Zip\7z.exe",
+        ]:
+            if os.path.exists(win_path):
+                return win_path
+    return None
+
+
+def is_valid_zip_part(path: Path, is_first_part: bool) -> bool:
+    """Return True if the file looks like a valid zip part."""
+    if not is_first_part:
+        return True  # Continuation parts don't have PK header
+    try:
+        with open(path, 'rb') as f:
+            header = f.read(4)
+        if header == ZIP_MAGIC:
+            return True
+        log_warn(
+            f"{path.name}: header is {header.hex()!r} (expected {ZIP_MAGIC.hex()!r}). "
+            "File appears corrupt."
+        )
+        return False
+    except OSError as exc:
+        log_warn(f"Cannot read {path.name} for validation: {exc}")
+        return False
+
+
+def download_file_with_resume(url: str, output_path: Path, expected_bytes: int = 0,
+                              use_aria2: bool = True, max_retries: int = 10,
+                              is_first_part: bool = False) -> bool:
+    """Downloads a file with resume support, auto-retry, and zip magic validation."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Check if already complete and valid
     if output_path.exists():
         actual_size = output_path.stat().st_size
-        if min_bytes > 0 and actual_size >= min_bytes:
-            log_success(f"Already complete: {output_path.name} ({actual_size / (1024**3):.2f} GB)")
-            return True
-        log_info(f"Existing partial found ({actual_size / (1024**3):.2f} GB). Resuming download...")
+        if expected_bytes > 0 and actual_size >= expected_bytes:
+            if is_valid_zip_part(output_path, is_first_part):
+                log_success(f"Already complete: {output_path.name} ({actual_size / (1024**3):.2f} GB)")
+                return True
+            else:
+                log_warn(f"Existing file corrupt, deleting and restarting: {output_path.name}")
+                output_path.unlink()
+        else:
+            log_info(
+                f"Existing partial found: {output_path.name} "
+                f"({actual_size / (1024**3):.2f} / {expected_bytes / (1024**3):.2f} GB). Resuming..."
+            )
 
-    # Try aria2c if available
+    # Fast aria2c if available
     if use_aria2 and shutil.which("aria2c"):
         cmd = [
             "aria2c",
@@ -132,6 +175,8 @@ def download_file_with_resume(url: str, output_path: Path, min_bytes: int = 0, u
             "--continue=true",
             "--auto-file-renaming=false",
             "--allow-overwrite=true",
+            "--max-tries=10",
+            "--retry-wait=5",
             "-d", str(output_path.parent),
             "-o", output_path.name,
             url
@@ -139,53 +184,104 @@ def download_file_with_resume(url: str, output_path: Path, min_bytes: int = 0, u
         log_info(f"Downloading {output_path.name} via aria2c (16 parallel connections)...")
         ret = subprocess.run(cmd)
         if ret.returncode == 0 and output_path.exists():
-            if min_bytes == 0 or output_path.stat().st_size >= min_bytes:
+            if expected_bytes == 0 or output_path.stat().st_size >= expected_bytes:
                 log_success(f"Downloaded: {output_path.name} ({output_path.stat().st_size / (1024**3):.2f} GB)")
                 return True
+        log_warn("aria2c incomplete or not found. Falling back to HTTP streaming.")
 
-    # Fallback to streaming urllib with resume
-    log_info(f"Downloading {output_path.name} via HTTP stream...")
-    existing_bytes = output_path.stat().st_size if output_path.exists() else 0
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    if existing_bytes > 0:
-        req.add_header("Range", f"bytes={existing_bytes}-")
+    # HTTP streaming fallback with automatic retry and resume
+    for attempt in range(1, max_retries + 1):
+        existing_bytes = output_path.stat().st_size if output_path.exists() else 0
+        if expected_bytes > 0 and existing_bytes >= expected_bytes:
+            log_success(f"Already complete: {output_path.name} ({existing_bytes / (1024**3):.2f} GB)")
+            return True
 
-    try:
-        with urllib.request.urlopen(req) as resp:
-            total_size = int(resp.headers.get("Content-Length", 0)) + existing_bytes
-            open_mode = "ab" if existing_bytes > 0 else "wb"
-            chunk_size = 8 * 1024 * 1024  # 8MB
-            downloaded = existing_bytes
-            start_time = time.time()
-            last_log = start_time
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        if existing_bytes > 0:
+            req.add_header("Range", f"bytes={existing_bytes}-")
 
-            with open(output_path, open_mode) as f:
-                while True:
-                    chunk = resp.read(chunk_size)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    now = time.time()
-                    if now - last_log >= 10:
-                        speed = (downloaded - existing_bytes) / (1024 ** 2) / max(now - start_time, 0.1)
-                        pct = (downloaded / total_size * 100) if total_size > 0 else 0
-                        log_info(f"Progress {output_path.name}: {downloaded/(1024**3):.2f} GB / {total_size/(1024**3):.2f} GB ({pct:.1f}%) [{speed:.1f} MB/s]")
-                        last_log = now
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                content_len = int(resp.headers.get("Content-Length", 0))
+                total_size = content_len + existing_bytes
+                open_mode = "ab" if existing_bytes > 0 else "wb"
+                chunk_size = 8 * 1024 * 1024  # 8 MB
+                downloaded = existing_bytes
+                start_time = time.time()
+                last_log = start_time
 
-        log_success(f"Successfully downloaded {output_path.name} ({output_path.stat().st_size / (1024**3):.2f} GB)")
-        return True
-    except Exception as e:
-        log_err(f"Download failed for {output_path.name}: {e}")
-        return False
+                with open(output_path, open_mode) as f:
+                    while True:
+                        chunk = resp.read(chunk_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        now = time.time()
+                        if now - last_log >= 15:
+                            speed = (downloaded - existing_bytes) / (1024 ** 2) / max(now - start_time, 0.1)
+                            pct = (downloaded / total_size * 100) if total_size > 0 else 0
+                            remaining_mb = (total_size - downloaded) / (1024 ** 2)
+                            eta_sec = (remaining_mb / speed) if speed > 0 else 0
+                            eta_str = time.strftime("%Hh %Mm", time.gmtime(eta_sec))
+                            log_info(
+                                f"{output_path.name}: {downloaded / (1024**3):.2f} / {total_size / (1024**3):.2f} GB "
+                                f"({pct:.1f}%) [{speed:.1f} MB/s, ETA: {eta_str}]"
+                            )
+                            last_log = now
+
+            final_sz = output_path.stat().st_size
+            log_success(f"Downloaded: {output_path.name} ({final_sz / (1024**3):.2f} GB)")
+            return True
+
+        except urllib.error.HTTPError as exc:
+            if exc.code == 416:
+                log_success(f"Already complete (remote EOF): {output_path.name}")
+                return True
+            wait = min(20 * attempt, 180)
+            log_warn(f"Attempt {attempt}/{max_retries} HTTP error for {output_path.name}: {exc}. Resuming in {wait}s...")
+            time.sleep(wait)
+
+        except Exception as exc:
+            wait = min(20 * attempt, 180)
+            log_warn(f"Attempt {attempt}/{max_retries} error for {output_path.name}: {exc}. Resuming in {wait}s...")
+            time.sleep(wait)
+
+    log_err(f"All {max_retries} download attempts failed for {output_path.name}.")
+    return False
+
+
+def verify_parts(data_root: Path, parts: List[str]) -> bool:
+    """Check size and magic bytes for downloaded split parts."""
+    log_header("Verifying Downloaded Parts")
+    all_ok = True
+    for i, part_name in enumerate(parts):
+        path = data_root / part_name
+        expected = EXACT_BYTES.get(part_name, 0)
+        is_first = (i == 0)
+        if not path.exists():
+            log_warn(f"[MISSING] {part_name}")
+            all_ok = False
+        else:
+            actual = path.stat().st_size
+            size_ok = actual >= expected if expected > 0 else True
+            magic_ok = is_valid_zip_part(path, is_first)
+            status = "OK" if (size_ok and magic_ok) else "CORRUPT"
+            sym = "[OK]" if status == "OK" else "[XX]"
+            msg = f"{sym} {part_name}  {actual / (1024**3):.2f}/{expected / (1024**3):.2f} GB  [{status}]"
+            if status == "OK":
+                log_success(msg)
+            else:
+                log_err(msg)
+                all_ok = False
+    return all_ok
 
 
 def download_and_extract_annotations(data_root: Path, ft_json_dir: Path) -> bool:
     """Downloads official annotations zip from Google Drive and extracts fine-tuning JSONs."""
-    log_header("Downloading Fine-Tuning Annotations")
+    log_header("Fine-Tuning Annotations (Stage 2)")
     ft_json_dir.mkdir(parents=True, exist_ok=True)
 
-    # Check if all required fine-tuning json files exist
     all_exist = True
     for fn in FT_ANNOTATION_FILES:
         target = ft_json_dir / fn
@@ -198,8 +294,8 @@ def download_and_extract_annotations(data_root: Path, ft_json_dir: Path) -> bool
         return True
 
     zip_tmp = data_root / "train_json_annotations.zip"
-    log_info("Downloading official annotations archive (~471 MB) from Google Drive...")
-    ok = download_file_with_resume(GDRIVE_ANNOTATIONS_URL, zip_tmp, min_bytes=400 * 1024 * 1024, use_aria2=False)
+    log_info("Downloading annotations archive (~471 MB) from Google Drive...")
+    ok = download_file_with_resume(GDRIVE_ANNOTATIONS_URL, zip_tmp, expected_bytes=400 * 1024 * 1024, use_aria2=False)
     if not ok or not zip_tmp.exists():
         log_err("Failed to download annotations zip from Google Drive.")
         return False
@@ -215,7 +311,6 @@ def download_and_extract_annotations(data_root: Path, ft_json_dir: Path) -> bool
                         shutil.copyfileobj(src, dst)
                     log_success(f"Extracted: {base_name} ({dest_file.stat().st_size / (1024**2):.1f} MB)")
 
-        # Remove temp zip
         zip_tmp.unlink(missing_ok=True)
         return True
     except Exception as e:
@@ -223,72 +318,66 @@ def download_and_extract_annotations(data_root: Path, ft_json_dir: Path) -> bool
         return False
 
 
-def extract_split_archive(first_part_path: Path, output_folder: Path, clean_archives: bool = False) -> bool:
-    """Extracts a multi-part split archive (.zip.001, .zip.002, ...) using 7z or python fallback."""
-    output_folder.mkdir(parents=True, exist_ok=True)
-    log_info(f"Extracting {first_part_path.name} into {output_folder}...")
+def extract_video_tuning(data_root: Path, clean_archives: bool = False) -> bool:
+    """Extracts Video-ChatGPT video tuning dataset (.zip.001..005 -> videochatgpt_tune.zip -> videos)."""
+    seven_zip = find_7z()
+    if not seven_zip:
+        log_err("7-Zip not found. Please install 7-Zip (winget install 7zip.7zip).")
+        return False
 
-    # Check if 7z is available
-    seven_zip = shutil.which("7z") or shutil.which("7za")
-    if not seven_zip and os.name == "nt":
-        # Check standard Windows 7-Zip installation paths
-        for candidate in [r"C:\Program Files\7-Zip\7z.exe", r"C:\Program Files (x86)\7-Zip\7z.exe"]:
-            if os.path.exists(candidate):
-                seven_zip = candidate
-                break
+    first_part = data_root / VIDEO_TUNE_PARTS[0]
+    if not first_part.exists():
+        log_err(f"Cannot extract: {first_part.name} not found.")
+        return False
 
-    if seven_zip:
-        log_info(f"Using 7-Zip ({seven_zip}) for high-speed multi-part extraction...")
-        cmd = [seven_zip, "x", str(first_part_path), f"-o{output_folder}", "-y"]
-        ret = subprocess.run(cmd)
-        if ret.returncode == 0:
-            log_success(f"Extracted archive into {output_folder}")
+    log_header("Phase 1: Extracting Split Parts -> videochatgpt_tune.zip")
+    cmd1 = [seven_zip, "x", str(first_part), f"-o{data_root}", "-bsp1", "-y"]
+    ret1 = subprocess.run(cmd1)
+    if ret1.returncode != 0:
+        log_err("Phase 1 split archive extraction failed.")
+        return False
+
+    master_zip = data_root / "videochatgpt_tune.zip"
+    video_dir = data_root / "videochatgpt_tune"
+    video_dir.mkdir(parents=True, exist_ok=True)
+
+    if master_zip.exists():
+        log_header("Phase 2: Extracting videochatgpt_tune.zip -> Videos")
+        cmd2 = [seven_zip, "x", str(master_zip), f"-o{data_root}", "-aos", "-bsp1", "-y"]
+        ret2 = subprocess.run(cmd2)
+        if ret2.returncode == 0:
+            log_success("Extracted video tuning clips successfully!")
+            log_info(f"Deleting intermediate {master_zip.name} to save ~160 GB...")
+            master_zip.unlink(missing_ok=True)
+            log_success("Cleaned intermediate master zip.")
             if clean_archives:
-                pattern = str(first_part_path).replace(".001", ".*")
-                for p in first_part_path.parent.glob(Path(pattern).name):
-                    p.unlink(missing_ok=True)
-                log_info("Cleaned up split archive parts to save disk space.")
+                log_info("Cleaning split archives...")
+                for p in VIDEO_TUNE_PARTS:
+                    (data_root / p).unlink(missing_ok=True)
+                log_success("Cleaned split archives.")
             return True
         else:
-            log_err(f"7-Zip extraction returned non-zero code {ret.returncode}")
-
-    # Linux fallback: check if unzip / p7zip is available
-    if shutil.which("unzip"):
-        log_info("7z not found. Concatenating split parts to single archive for unzip...")
-        base_name = first_part_path.stem  # e.g. llava_image_tune_2.zip
-        merged_zip = first_part_path.parent / f"{base_name}_merged.zip"
-        part_prefix = str(first_part_path).rsplit(".", 1)[0]  # e.g. .../llava_image_tune_2.zip
-        parts = sorted(first_part_path.parent.glob(f"{Path(part_prefix).name}.*"))
-
-        with open(merged_zip, "wb") as out_f:
-            for p in parts:
-                log_info(f"Merging part {p.name}...")
-                with open(p, "rb") as in_f:
-                    shutil.copyfileobj(in_f, out_f, length=64 * 1024 * 1024)
-
-        log_info(f"Extracting merged {merged_zip.name} with unzip...")
-        cmd = ["unzip", "-q", "-o", str(merged_zip), "-d", str(output_folder)]
-        ret = subprocess.run(cmd)
-        merged_zip.unlink(missing_ok=True)
-        if ret.returncode == 0:
-            log_success(f"Extracted into {output_folder}")
-            if clean_archives:
-                for p in parts:
-                    p.unlink(missing_ok=True)
-            return True
-
-    log_err("Could not find 7z or unzip to extract split archives. Please install 7-zip (or p7zip-full).")
-    return False
+            log_err(f"Phase 2 extraction failed with code {ret2.returncode}")
+            return False
+    else:
+        # Some archives extract directly into the target folder
+        log_success(f"Extraction completed into {data_root}.")
+        return True
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Download and extract Video-LLaVA Stage 2 Fine-Tuning Datasets")
-    parser.add_argument("--data_root", type=str, default="./data", help="Root directory to store datasets")
-    parser.add_argument("--components", type=str, default="all", choices=["all", "annotations", "image", "video"],
-                        help="Which components to download (annotations, image, video, or all)")
+    parser = argparse.ArgumentParser(
+        description="Download and extract Video-LLaVA Stage 2 Fine-Tuning Datasets",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--data_root", type=str, default="E:\\videollava_data", help="Root directory to store datasets")
+    parser.add_argument("--components", type=str, default="video", choices=["all", "annotations", "image", "video"],
+                        help="Which components to download (default: video)")
     parser.add_argument("--extract", action="store_true", help="Automatically extract split archives after download")
     parser.add_argument("--clean_archives", action="store_true", help="Delete downloaded split zip files after extraction")
     parser.add_argument("--no_aria2", action="store_true", help="Disable aria2 multi-connection download accelerator")
+    parser.add_argument("--verify", action="store_true", help="Verify downloaded parts without downloading")
 
     args = parser.parse_args()
     data_root = Path(args.data_root).resolve()
@@ -296,13 +385,19 @@ def main():
     use_aria2 = not args.no_aria2
 
     ft_json_dir = data_root / "ft_json"
-    image_dir = data_root / "llava_image_tune"
-    video_dir = data_root / "videochatgpt_tune"
+
+    # --verify mode
+    if args.verify:
+        if args.components in ["all", "video"]:
+            verify_parts(data_root, VIDEO_TUNE_PARTS)
+        if args.components in ["all", "image"]:
+            verify_parts(data_root, IMAGE_TUNE_PARTS)
+        return
 
     log_header("Video-LLaVA Fine-Tuning Dataset Downloader")
-    log_info(f"Target Data Root: {data_root}")
-    log_info(f"Components: {args.components}")
-    log_info(f"Auto-extract: {args.extract}")
+    log_info(f"Target Data Root : {data_root}")
+    log_info(f"Components       : {args.components}")
+    log_info(f"Auto-extract     : {args.extract}")
 
     # 1. Annotations
     if args.components in ["all", "annotations"]:
@@ -310,44 +405,39 @@ def main():
 
     # 2. Image Tuning Dataset (~67.4 GB)
     if args.components in ["all", "image"]:
-        log_header("Downloading Image Tuning Dataset (LLaVA-Instruct ~67.4 GB)")
+        log_header("Image Tuning Dataset (LLaVA-Instruct ~67.4 GB)")
         all_image_ok = True
-        for part in IMAGE_TUNE_PARTS:
+        for i, part in enumerate(IMAGE_TUNE_PARTS):
             url = f"{HF_BASE_URL}/{part}"
             dest = data_root / part
-            min_b = IMAGE_PART_MIN_BYTES.get(part, 0)
-            ok = download_file_with_resume(url, dest, min_bytes=min_b, use_aria2=use_aria2)
+            exp_b = EXACT_BYTES.get(part, 0)
+            ok = download_file_with_resume(url, dest, expected_bytes=exp_b, use_aria2=use_aria2, is_first_part=(i == 0))
             if not ok:
                 all_image_ok = False
                 break
 
-        if all_image_ok and args.extract:
-            first_part = data_root / IMAGE_TUNE_PARTS[0]
-            extract_split_archive(first_part, image_dir, clean_archives=args.clean_archives)
-
     # 3. Video Tuning Dataset (~160.1 GB)
     if args.components in ["all", "video"]:
-        log_header("Downloading Video Tuning Dataset (Video-ChatGPT ~160.1 GB)")
+        log_header("Video Tuning Dataset (Video-ChatGPT ~160.1 GB)")
         all_video_ok = True
-        for part in VIDEO_TUNE_PARTS:
+        for i, part in enumerate(VIDEO_TUNE_PARTS):
             url = f"{HF_BASE_URL}/{part}"
             dest = data_root / part
-            min_b = VIDEO_PART_MIN_BYTES.get(part, 0)
-            ok = download_file_with_resume(url, dest, min_bytes=min_b, use_aria2=use_aria2)
+            exp_b = EXACT_BYTES.get(part, 0)
+            ok = download_file_with_resume(url, dest, expected_bytes=exp_b, use_aria2=use_aria2, is_first_part=(i == 0))
             if not ok:
                 all_video_ok = False
                 break
 
-        if all_video_ok and args.extract:
-            first_part = data_root / VIDEO_TUNE_PARTS[0]
-            extract_split_archive(first_part, video_dir, clean_archives=args.clean_archives)
+        if all_video_ok:
+            log_success("All video tuning parts downloaded successfully!")
+            if args.extract:
+                extract_video_tuning(data_root, clean_archives=args.clean_archives)
+        else:
+            log_warn("Download was interrupted. Re-run to resume seamlessly.")
 
     log_header("Fine-Tuning Dataset Preparation Complete")
-    log_info("Expected Directory Layout:")
-    log_info(f"  {data_root}/")
-    log_info(f"  ├── ft_json/ (llava_image_tune_.json, videochatgpt_tune_.json, nlp_tune.json)")
-    log_info(f"  ├── llava_image_tune/ (COCO, GQA, TextVQA, VisualGenome images)")
-    log_info(f"  └── videochatgpt_tune/ (Video-ChatGPT video mp4 files)")
+    log_info(f"Data Root: {data_root}")
 
 
 if __name__ == "__main__":
