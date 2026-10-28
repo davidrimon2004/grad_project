@@ -47,6 +47,13 @@ class LlavaMetaModel:
                 batch_first=True
             )
             self.early_fusion_ln = nn.LayerNorm(config.hidden_size)
+            # Gate v2: token-wise gating — one scalar per text token, conditioned
+            # on both the text embedding and the cross-attention output.
+            # Linear(2*d -> 1), zero-init => tanh(0)=0 => exact no-op at step 0.
+            gate_linear = nn.Linear(2 * config.hidden_size, 1, bias=True)
+            nn.init.zeros_(gate_linear.weight)
+            nn.init.zeros_(gate_linear.bias)
+            self.early_fusion_gate_linear = gate_linear
 
     def get_image_tower(self):
         image_tower = getattr(self, 'image_tower', None)
@@ -150,10 +157,15 @@ class LlavaMetaModel:
             for p in self.early_fusion_kv_ln.parameters():
                 p.requires_grad = True
 
-        if getattr(self, 'early_fusion_gate', None) is None:
-            self.register_parameter('early_fusion_gate', nn.Parameter(torch.zeros(1)))
+        # Gate v2: token-wise gate linear (replaces scalar early_fusion_gate)
+        if getattr(self, 'early_fusion_gate_linear', None) is None:
+            gate_linear = nn.Linear(2 * self.config.hidden_size, 1, bias=True)
+            nn.init.zeros_(gate_linear.weight)
+            nn.init.zeros_(gate_linear.bias)
+            self.early_fusion_gate_linear = gate_linear
         else:
-            self.early_fusion_gate.requires_grad = True
+            for p in self.early_fusion_gate_linear.parameters():
+                p.requires_grad = True
 
         if pretrain_mm_mlp_adapter is not None:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
@@ -170,9 +182,10 @@ class LlavaMetaModel:
             early_kv_ln_weights = get_w(mm_projector_weights, 'early_fusion_kv_ln')
             if len(early_kv_ln_weights) > 0:
                 self.early_fusion_kv_ln.load_state_dict(early_kv_ln_weights)
-            gate_key = [k for k in mm_projector_weights.keys() if "early_fusion_gate" in k]
-            if len(gate_key) > 0:
-                self.early_fusion_gate.data.copy_(mm_projector_weights[gate_key[0]])
+            # Gate v2: load token-wise gate linear weights
+            gate_lin_weights = get_w(mm_projector_weights, 'early_fusion_gate_linear')
+            if len(gate_lin_weights) > 0:
+                self.early_fusion_gate_linear.load_state_dict(gate_lin_weights)
 
 
 class LlavaMetaForCausalLM(ABC):
@@ -217,93 +230,102 @@ class LlavaMetaForCausalLM(ABC):
             model.early_fusion_kv_ln = kv_ln
         return kv_ln
 
-    def get_early_fusion_gate(self):
+    def get_early_fusion_gate_linear(self):
+        """Return (and lazily create if missing) the token-wise gate linear layer."""
         model = self.get_model()
-        gate = getattr(model, 'early_fusion_gate', None)
-        if gate is None:
-            gate = nn.Parameter(torch.zeros(1))
-            model.register_parameter('early_fusion_gate', gate)
-        return gate
+        gl = getattr(model, 'early_fusion_gate_linear', None)
+        if gl is None:
+            gl = nn.Linear(2 * self.config.hidden_size, 1, bias=True)
+            nn.init.zeros_(gl.weight)
+            nn.init.zeros_(gl.bias)
+            model.early_fusion_gate_linear = gl
+        return gl
 
     def cross_attention_fuse(self, text_embeds, visual_embeds):
         """
-        Early-fusion via Multi-Head Cross-Attention.
+        Early-fusion via Multi-Head Cross-Attention with Gate v2.
 
         Every text token issues a query that attends over the *visual* token
-        sequence for that sample, so text embeddings are refined with
-        fine-grained (per-visual-token) visual context before entering the LLM.
-        This replaces both the text-only self-attention approach (which never
-        looked at the visual tokens at all) and the average-pooling approach
-        (which only exposed text to a single, global visual summary vector).
+        sequence for that sample. Gate v2 replaces the shared scalar gate with
+        a token-wise gate: for each text token t,
 
-        text_embeds:   [Nt, dt] textual token embeddings for one sample
-        visual_embeds: [Nv, dt] projected visual token embeddings for the same sample
-                       (all image/video tokens belonging to this sample, concatenated)
-        Returns fused textual embeddings T_hat: [Nt, dt]. Visual embeddings are
-        NOT modified here -- only the text side is refined.
+            g_t  = tanh( gate_linear( [text_t ; attn_out_t] ) )   # scalar in (-1,1)
+            out_t = text_t + g_t * attn_out_t
+
+        The gate linear is initialised with all-zero weights and bias so that
+        at step 0, g_t = tanh(0) = 0 for every token — an exact no-op.
+        Each token learns *independently* how much of the visual context it
+        needs, allowing, e.g., noun tokens to attend heavily while function
+        words ignore the visual stream entirely.
+
+        text_embeds:   [Nt, d] textual token embeddings for one sample
+        visual_embeds: [Nv, d] projected visual token embeddings for the sample
+        Returns fused textual embeddings: [Nt, d]
         """
         if text_embeds.shape[0] == 0 or visual_embeds.shape[0] == 0:
             return text_embeds
 
-        attn_layer = self.get_early_fusion_attn()
-        ln_layer = self.get_early_fusion_ln()
-        kv_ln_layer = self.get_early_fusion_kv_ln()
-        gate = self.get_early_fusion_gate()
+        attn_layer   = self.get_early_fusion_attn()
+        ln_layer     = self.get_early_fusion_ln()
+        kv_ln_layer  = self.get_early_fusion_kv_ln()
+        gate_linear  = self.get_early_fusion_gate_linear()
 
-        # Determine target precision (float16 or bfloat16)
-        target_dtype = torch.bfloat16 if getattr(self.config, 'bf16', False) else torch.float16
+        # Target dtype (bf16 preferred on Ada Lovelace; fp16 fallback; else input dtype)
+        if getattr(self.config, 'bf16', False):
+            target_dtype = torch.bfloat16
+        elif getattr(self.config, 'fp16', False):
+            target_dtype = torch.float16
+        else:
+            target_dtype = text_embeds.dtype
+
         if text_embeds.dtype != target_dtype:
             text_embeds = text_embeds.to(target_dtype)
         if visual_embeds.dtype != target_dtype:
             visual_embeds = visual_embeds.to(target_dtype)
 
-        # Ensure attention and layernorms match the device of incoming embeddings
+        # Move sub-modules to the same device and dtype as the incoming tensors (DeepSpeed
+        # may place individual param shards on different devices, or init in fp32).
         ref_param = next(attn_layer.parameters())
-        if ref_param.device != text_embeds.device:
-            attn_layer.to(device=text_embeds.device)
+        target_device = text_embeds.device
+        if ref_param.device != target_device or ref_param.dtype != target_dtype:
+            attn_layer.to(device=target_device, dtype=target_dtype)
             ref_param = next(attn_layer.parameters())
+        if next(ln_layer.parameters()).device != target_device or next(ln_layer.parameters()).dtype != target_dtype:
+            ln_layer.to(device=target_device, dtype=target_dtype)
+        if next(kv_ln_layer.parameters()).device != target_device or next(kv_ln_layer.parameters()).dtype != target_dtype:
+            kv_ln_layer.to(device=target_device, dtype=target_dtype)
+        if next(gate_linear.parameters()).device != target_device or next(gate_linear.parameters()).dtype != target_dtype:
+            gate_linear.to(device=target_device, dtype=target_dtype)
 
-        ref_ln = next(ln_layer.parameters())
-        if ref_ln.device != text_embeds.device:
-            ln_layer.to(device=text_embeds.device)
+        # Pre-LayerNorm on text queries and visual keys/values.
+        # Keeps attention logits unit-variance regardless of sequence length.
+        q  = ln_layer(
+            text_embeds.unsqueeze(0).to(dtype=next(ln_layer.parameters()).dtype)
+        ).to(dtype=ref_param.dtype)
+        kv = kv_ln_layer(
+            visual_embeds.unsqueeze(0).to(dtype=next(kv_ln_layer.parameters()).dtype)
+        ).to(dtype=ref_param.dtype)
 
-        ref_kv_ln = next(kv_ln_layer.parameters())
-        if ref_kv_ln.device != text_embeds.device:
-            kv_ln_layer.to(device=text_embeds.device)
-
-        if gate.device != text_embeds.device:
-            model = self.get_model()
-            model.early_fusion_gate.data = model.early_fusion_gate.data.to(device=text_embeds.device)
-            gate = model.early_fusion_gate
-
-        target_device = ref_param.device
-
-        # Pre-LayerNorm on text query and visual key/values for scale matching & numerical stability.
-        # This keeps attention logits strictly unit-variance regardless of visual sequence length (256 vs 2048).
-        q_raw = text_embeds.unsqueeze(0).to(device=target_device, dtype=next(ln_layer.parameters()).dtype)
-        q = ln_layer(q_raw).to(dtype=ref_param.dtype)
-
-        kv_raw = visual_embeds.unsqueeze(0).to(device=target_device, dtype=next(kv_ln_layer.parameters()).dtype)
-        kv = kv_ln_layer(kv_raw).to(dtype=ref_param.dtype)
-
-        # No causal mask here: causality/label-leakage only matters along the text
-        # sequence dimension. Keys/values come from the visual sequence, so every
-        # text token is free to attend to every visual token without leaking any
-        # future *text* information.
+        # Cross-attention: text queries, visual keys/values.
+        # No causal mask — text tokens may freely attend to any visual token.
         attn_out, _ = attn_layer(
-            query=q,
-            key=kv,
-            value=kv,
+            query=q, key=kv, value=kv,
             need_weights=False
-        )
+        )  # [1, Nt, d]
+        attn_out_t = attn_out.squeeze(0).to(target_dtype)  # [Nt, d]
 
-        # Gated residual connection with tanh gating:
-        # At step 0, gate = 0 => tanh(0) = 0 => fused = text_embeds exactly (100% baseline preservation).
-        # Smoothly introduces cross-attention signals without disrupting Vicuna's text embedding scale (~0.02)
-        # or causing FP16 overflow at Video-LLaVA's standard pretraining learning rate (1e-3).
-        gate_val = torch.tanh(gate).to(target_dtype)
-        fused = text_embeds + gate_val * attn_out.squeeze(0).to(target_dtype)
+        # ── Gate v2: token-wise gating ────────────────────────────────────────
+        # Concatenate text embedding and attention output for each token.
+        # gate_linear: Linear(2d -> 1, bias=True), zero-initialised.
+        # g_t = tanh( w · [text_t; attn_out_t] + b ) ∈ (-1, 1)  per token
+        # At step 0: w=0, b=0  =>  tanh(0)=0  =>  fused = text_embeds  (no-op)
+        gate_input  = torch.cat(
+            [text_embeds, attn_out_t], dim=-1
+        ).to(next(gate_linear.parameters()).dtype)  # [Nt, 2d]
+        gate_logits = gate_linear(gate_input)        # [Nt, 1]
+        gate_vals   = torch.tanh(gate_logits).to(target_dtype)  # [Nt, 1]
 
+        fused = text_embeds + gate_vals * attn_out_t  # [Nt, d]
         return fused
 
     def encode_images(self, images):

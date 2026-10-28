@@ -1,11 +1,18 @@
 
 
-JSON_FOLDER="llava_all_image_video/ft_json"
-IMAGE_FOLDER="llava_all_image_video"
-VIDEO_FOLDER="llava_all_image_video"
-cd /path/to/Video-LLaVA
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "${PROJECT_ROOT}"
 
-HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 deepspeed videollava/train/train_mem.py \
+JSON_FOLDER="${PROJECT_ROOT}/llava_all_image_video/ft_json"
+IMAGE_FOLDER="${PROJECT_ROOT}/llava_all_image_video"
+VIDEO_FOLDER="${PROJECT_ROOT}/llava_all_image_video"
+
+NUM_GPUS=${NUM_GPUS:-3}
+PER_DEVICE_BATCH=${PER_DEVICE_BATCH:-8}
+GRAD_ACCUM=${GRAD_ACCUM:-2}
+
+HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 deepspeed --num_gpus ${NUM_GPUS} videollava/train/train_mem.py \
     --lora_enable True --lora_r 128 --lora_alpha 256 --mm_projector_lr 2e-5 \
     --deepspeed ./scripts/zero2_offload.json \
     --model_name_or_path lmsys/vicuna-7b-v1.5 \
@@ -25,10 +32,10 @@ HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 deepspeed videollava/train/train_me
     --bf16 True \
     --output_dir ./checkpoints/videollava-7b-lora \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 16 \
+    --per_device_train_batch_size ${PER_DEVICE_BATCH} \
     --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 1 \
-    --evaluation_strategy "no" \
+    --gradient_accumulation_steps ${GRAD_ACCUM} \
+    --eval_strategy "no" \
     --save_strategy "steps" \
     --save_steps 50000 \
     --save_total_limit 1 \

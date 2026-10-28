@@ -69,6 +69,7 @@ class ModelArguments:
     vision_tower: Optional[str] = field(default=None)
     mm_vision_select_layer: Optional[int] = field(default=-1)   # default to the last layer
     pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
+    freeze_mm_projector: bool = field(default=False)
     mm_projector_type: Optional[str] = field(default='linear')
     mm_use_im_start_end: bool = field(default=False)
     mm_use_im_patch_token: bool = field(default=True)
@@ -1124,7 +1125,7 @@ def train():
             quantization_config=BitsAndBytesConfig(
                 load_in_4bit=training_args.bits == 4,
                 load_in_8bit=training_args.bits == 8,
-                llm_int8_skip_modules=["mm_projector", "early_fusion_attn", "early_fusion_ln", "early_fusion_kv_ln"],
+                llm_int8_skip_modules=["mm_projector", "early_fusion_attn", "early_fusion_ln", "early_fusion_kv_ln", "early_fusion_gate_linear"],
                 llm_int8_threshold=6.0,
                 llm_int8_has_fp16_weight=False,
                 bnb_4bit_compute_dtype=compute_dtype,
@@ -1283,8 +1284,9 @@ def train():
         model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
         if model_args.tune_mm_mlp_adapter:
             model.requires_grad_(False)
-            for p in model.get_model().mm_projector.parameters():
-                p.requires_grad = True
+            if not model_args.freeze_mm_projector:
+                for p in model.get_model().mm_projector.parameters():
+                    p.requires_grad = True
             for name, param in model.get_model().named_parameters():
                 if 'early_fusion' in name:
                     param.requires_grad = True
@@ -1306,8 +1308,6 @@ def train():
             for name, module in model.get_model().named_children():
                 if 'early_fusion' in name:
                     module.to(dtype=adapter_dtype, device=training_args.device)
-            if hasattr(model.get_model(), 'early_fusion_gate') and model.get_model().early_fusion_gate is not None:
-                model.get_model().early_fusion_gate.data = model.get_model().early_fusion_gate.data.to(dtype=adapter_dtype, device=training_args.device)
 
         model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_projector_lr = training_args.mm_projector_lr
@@ -1387,9 +1387,12 @@ def train():
             early_kv_ln = {k.split("early_fusion_kv_ln.")[1]: v for k, v in adapter_weights.items() if "early_fusion_kv_ln." in k}
             if early_kv_ln and hasattr(model.get_model(), "early_fusion_kv_ln") and model.get_model().early_fusion_kv_ln is not None:
                 model.get_model().early_fusion_kv_ln.load_state_dict(early_kv_ln, strict=False)
-            gate_key = [k for k in adapter_weights.keys() if "early_fusion_gate" in k]
-            if gate_key and hasattr(model.get_model(), "early_fusion_gate") and model.get_model().early_fusion_gate is not None:
-                model.get_model().early_fusion_gate.data.copy_(adapter_weights[gate_key[0]])
+            # Gate v2: load token-wise gate linear weights from checkpoint
+            gate_lin_keys = {k.split('early_fusion_gate_linear.')[1]: v
+                             for k, v in adapter_weights.items()
+                             if 'early_fusion_gate_linear.' in k}
+            if gate_lin_keys and hasattr(model.get_model(), 'early_fusion_gate_linear') and model.get_model().early_fusion_gate_linear is not None:
+                model.get_model().early_fusion_gate_linear.load_state_dict(gate_lin_keys, strict=False)
             rank0_print("[SUCCESS] Successfully loaded previous adapter checkpoint weights.")
         trainer.train()
     else:
