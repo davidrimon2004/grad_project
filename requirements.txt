@@ -1,11 +1,36 @@
-torch>=2.0.0
-torchvision
-transformers>=4.37.0
-accelerate>=0.27.0
-languagebind
-decord
-av
-h5py
-pillow
-sentencepiece
-bitsandbytes
+--index-url https://download.pytorch.org/whl/cu121
+--extra-index-url https://pypi.org/simple
+
+# PyTorch (CUDA 12.1 build). Use Python 3.10.
+torch==2.1.2
+torchvision==0.16.2
+
+# Model / training
+transformers==4.37.2
+accelerate==0.27.2
+peft==0.9.0
+bitsandbytes==0.42.0
+deepspeed==0.12.6
+
+# Data / video
+decord==0.6.0
+av==11.0.0
+h5py==3.10.0
+opencv-python-headless==4.9.0.80
+pillow==10.2.0
+
+# Utilities
+einops==0.7.0
+einops-exts==0.0.4
+sentencepiece==0.1.99
+protobuf==4.25.3
+shortuuid==1.0.13
+numpy==1.26.4
+scipy==1.12.0
+tqdm==4.66.2
+tensorboard==2.16.2
+
+# Build helpers (needed to compile flash-attn)
+packaging==24.0
+ninja==1.11.1.1
+wheel==0.43.0

@@ -13,6 +13,7 @@
 #    limitations under the License.
 
 
+import os
 from abc import ABC, abstractmethod
 
 import torch
@@ -33,7 +34,7 @@ class LlavaMetaModel:
             self.image_tower = build_image_tower(config, delay_load=True)
         if getattr(config, "mm_video_tower", None) is not None:
             self.video_tower = build_video_tower(config, delay_load=True)
-        if getattr(config, "mm_image_tower", None) is not None or getattr(config, "mm_video_tower", None) is not None:
+        if (getattr(config, "mm_image_tower", None) is not None or getattr(config, "mm_video_tower", None) is not None) and hasattr(config, "mm_hidden_size"):
             self.mm_projector = build_vision_projector(config)
 
             # Early-Fusion via Multi-Head Cross-Attention: text tokens query the
@@ -47,6 +48,14 @@ class LlavaMetaModel:
                 batch_first=True
             )
             self.early_fusion_ln = nn.LayerNorm(config.hidden_size)
+            self.early_fusion_kv_ln = nn.LayerNorm(config.hidden_size)
+            # Gate v2: token-wise gating — one scalar per text token, conditioned
+            # on both the text embedding and the cross-attention output.
+            # Linear(2*d -> 1), zero-init => tanh(0)=0 => exact no-op at step 0.
+            gate_linear = nn.Linear(2 * config.hidden_size, 1, bias=True)
+            nn.init.zeros_(gate_linear.weight)
+            nn.init.zeros_(gate_linear.bias)
+            self.early_fusion_gate_linear = gate_linear
 
     def get_image_tower(self):
         image_tower = getattr(self, 'image_tower', None)
@@ -150,17 +159,24 @@ class LlavaMetaModel:
             for p in self.early_fusion_kv_ln.parameters():
                 p.requires_grad = True
 
-        if getattr(self, 'early_fusion_gate', None) is None:
-            self.register_parameter('early_fusion_gate', nn.Parameter(torch.zeros(1)))
+        # Gate v2: token-wise gate linear (replaces scalar early_fusion_gate)
+        if getattr(self, 'early_fusion_gate_linear', None) is None:
+            gate_linear = nn.Linear(2 * self.config.hidden_size, 1, bias=True)
+            nn.init.zeros_(gate_linear.weight)
+            nn.init.zeros_(gate_linear.bias)
+            self.early_fusion_gate_linear = gate_linear
         else:
-            self.early_fusion_gate.requires_grad = True
+            for p in self.early_fusion_gate_linear.parameters():
+                p.requires_grad = True
 
         if pretrain_mm_mlp_adapter is not None:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
             def get_w(weights, keyword):
                 return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
 
-            self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
+            proj_w = get_w(mm_projector_weights, 'mm_projector')
+            proj_res = self.mm_projector.load_state_dict(proj_w)
+            print(f"[INFO] Loaded mm_projector from {pretrain_mm_mlp_adapter}: {len(proj_w)} keys matched (missing={len(proj_res.missing_keys)}, unexpected={len(proj_res.unexpected_keys)})")
             early_attn_weights = get_w(mm_projector_weights, 'early_fusion_attn')
             if len(early_attn_weights) > 0:
                 self.early_fusion_attn.load_state_dict(early_attn_weights)
@@ -170,9 +186,10 @@ class LlavaMetaModel:
             early_kv_ln_weights = get_w(mm_projector_weights, 'early_fusion_kv_ln')
             if len(early_kv_ln_weights) > 0:
                 self.early_fusion_kv_ln.load_state_dict(early_kv_ln_weights)
-            gate_key = [k for k in mm_projector_weights.keys() if "early_fusion_gate" in k]
-            if len(gate_key) > 0:
-                self.early_fusion_gate.data.copy_(mm_projector_weights[gate_key[0]])
+            # Gate v2: load token-wise gate linear weights
+            gate_lin_weights = get_w(mm_projector_weights, 'early_fusion_gate_linear')
+            if len(gate_lin_weights) > 0:
+                self.early_fusion_gate_linear.load_state_dict(gate_lin_weights)
 
 
 class LlavaMetaForCausalLM(ABC):
@@ -217,93 +234,102 @@ class LlavaMetaForCausalLM(ABC):
             model.early_fusion_kv_ln = kv_ln
         return kv_ln
 
-    def get_early_fusion_gate(self):
+    def get_early_fusion_gate_linear(self):
+        """Return (and lazily create if missing) the token-wise gate linear layer."""
         model = self.get_model()
-        gate = getattr(model, 'early_fusion_gate', None)
-        if gate is None:
-            gate = nn.Parameter(torch.zeros(1))
-            model.register_parameter('early_fusion_gate', gate)
-        return gate
+        gl = getattr(model, 'early_fusion_gate_linear', None)
+        if gl is None:
+            gl = nn.Linear(2 * self.config.hidden_size, 1, bias=True)
+            nn.init.zeros_(gl.weight)
+            nn.init.zeros_(gl.bias)
+            model.early_fusion_gate_linear = gl
+        return gl
 
     def cross_attention_fuse(self, text_embeds, visual_embeds):
         """
-        Early-fusion via Multi-Head Cross-Attention.
+        Early-fusion via Multi-Head Cross-Attention with Gate v2.
 
         Every text token issues a query that attends over the *visual* token
-        sequence for that sample, so text embeddings are refined with
-        fine-grained (per-visual-token) visual context before entering the LLM.
-        This replaces both the text-only self-attention approach (which never
-        looked at the visual tokens at all) and the average-pooling approach
-        (which only exposed text to a single, global visual summary vector).
+        sequence for that sample. Gate v2 replaces the shared scalar gate with
+        a token-wise gate: for each text token t,
 
-        text_embeds:   [Nt, dt] textual token embeddings for one sample
-        visual_embeds: [Nv, dt] projected visual token embeddings for the same sample
-                       (all image/video tokens belonging to this sample, concatenated)
-        Returns fused textual embeddings T_hat: [Nt, dt]. Visual embeddings are
-        NOT modified here -- only the text side is refined.
+            g_t  = tanh( gate_linear( [text_t ; attn_out_t] ) )   # scalar in (-1,1)
+            out_t = text_t + g_t * attn_out_t
+
+        The gate linear is initialised with all-zero weights and bias so that
+        at step 0, g_t = tanh(0) = 0 for every token — an exact no-op.
+        Each token learns *independently* how much of the visual context it
+        needs, allowing, e.g., noun tokens to attend heavily while function
+        words ignore the visual stream entirely.
+
+        text_embeds:   [Nt, d] textual token embeddings for one sample
+        visual_embeds: [Nv, d] projected visual token embeddings for the sample
+        Returns fused textual embeddings: [Nt, d]
         """
         if text_embeds.shape[0] == 0 or visual_embeds.shape[0] == 0:
             return text_embeds
 
-        attn_layer = self.get_early_fusion_attn()
-        ln_layer = self.get_early_fusion_ln()
-        kv_ln_layer = self.get_early_fusion_kv_ln()
-        gate = self.get_early_fusion_gate()
+        attn_layer   = self.get_early_fusion_attn()
+        ln_layer     = self.get_early_fusion_ln()
+        kv_ln_layer  = self.get_early_fusion_kv_ln()
+        gate_linear  = self.get_early_fusion_gate_linear()
 
-        # Determine target precision (float16 or bfloat16)
-        target_dtype = torch.bfloat16 if getattr(self.config, 'bf16', False) else torch.float16
+        # Target dtype (bf16 preferred on Ada Lovelace; fp16 fallback; else input dtype)
+        if getattr(self.config, 'bf16', False):
+            target_dtype = torch.bfloat16
+        elif getattr(self.config, 'fp16', False):
+            target_dtype = torch.float16
+        else:
+            target_dtype = text_embeds.dtype
+
         if text_embeds.dtype != target_dtype:
             text_embeds = text_embeds.to(target_dtype)
         if visual_embeds.dtype != target_dtype:
             visual_embeds = visual_embeds.to(target_dtype)
 
-        # Ensure attention and layernorms match the device of incoming embeddings
+        # Move sub-modules to the same device and dtype as the incoming tensors (DeepSpeed
+        # may place individual param shards on different devices, or init in fp32).
         ref_param = next(attn_layer.parameters())
-        if ref_param.device != text_embeds.device:
-            attn_layer.to(device=text_embeds.device)
+        target_device = text_embeds.device
+        if ref_param.device != target_device or ref_param.dtype != target_dtype:
+            attn_layer.to(device=target_device, dtype=target_dtype)
             ref_param = next(attn_layer.parameters())
+        if next(ln_layer.parameters()).device != target_device or next(ln_layer.parameters()).dtype != target_dtype:
+            ln_layer.to(device=target_device, dtype=target_dtype)
+        if next(kv_ln_layer.parameters()).device != target_device or next(kv_ln_layer.parameters()).dtype != target_dtype:
+            kv_ln_layer.to(device=target_device, dtype=target_dtype)
+        if next(gate_linear.parameters()).device != target_device or next(gate_linear.parameters()).dtype != target_dtype:
+            gate_linear.to(device=target_device, dtype=target_dtype)
 
-        ref_ln = next(ln_layer.parameters())
-        if ref_ln.device != text_embeds.device:
-            ln_layer.to(device=text_embeds.device)
+        # Pre-LayerNorm on text queries and visual keys/values.
+        # Keeps attention logits unit-variance regardless of sequence length.
+        q  = ln_layer(
+            text_embeds.unsqueeze(0).to(dtype=next(ln_layer.parameters()).dtype)
+        ).to(dtype=ref_param.dtype)
+        kv = kv_ln_layer(
+            visual_embeds.unsqueeze(0).to(dtype=next(kv_ln_layer.parameters()).dtype)
+        ).to(dtype=ref_param.dtype)
 
-        ref_kv_ln = next(kv_ln_layer.parameters())
-        if ref_kv_ln.device != text_embeds.device:
-            kv_ln_layer.to(device=text_embeds.device)
-
-        if gate.device != text_embeds.device:
-            model = self.get_model()
-            model.early_fusion_gate.data = model.early_fusion_gate.data.to(device=text_embeds.device)
-            gate = model.early_fusion_gate
-
-        target_device = ref_param.device
-
-        # Pre-LayerNorm on text query and visual key/values for scale matching & numerical stability.
-        # This keeps attention logits strictly unit-variance regardless of visual sequence length (256 vs 2048).
-        q_raw = text_embeds.unsqueeze(0).to(device=target_device, dtype=next(ln_layer.parameters()).dtype)
-        q = ln_layer(q_raw).to(dtype=ref_param.dtype)
-
-        kv_raw = visual_embeds.unsqueeze(0).to(device=target_device, dtype=next(kv_ln_layer.parameters()).dtype)
-        kv = kv_ln_layer(kv_raw).to(dtype=ref_param.dtype)
-
-        # No causal mask here: causality/label-leakage only matters along the text
-        # sequence dimension. Keys/values come from the visual sequence, so every
-        # text token is free to attend to every visual token without leaking any
-        # future *text* information.
+        # Cross-attention: text queries, visual keys/values.
+        # No causal mask — text tokens may freely attend to any visual token.
         attn_out, _ = attn_layer(
-            query=q,
-            key=kv,
-            value=kv,
+            query=q, key=kv, value=kv,
             need_weights=False
-        )
+        )  # [1, Nt, d]
+        attn_out_t = attn_out.squeeze(0).to(target_dtype)  # [Nt, d]
 
-        # Gated residual connection with tanh gating:
-        # At step 0, gate = 0 => tanh(0) = 0 => fused = text_embeds exactly (100% baseline preservation).
-        # Smoothly introduces cross-attention signals without disrupting Vicuna's text embedding scale (~0.02)
-        # or causing FP16 overflow at Video-LLaVA's standard pretraining learning rate (1e-3).
-        gate_val = torch.tanh(gate).to(target_dtype)
-        fused = text_embeds + gate_val * attn_out.squeeze(0).to(target_dtype)
+        # ── Gate v2: token-wise gating ────────────────────────────────────────
+        # Concatenate text embedding and attention output for each token.
+        # gate_linear: Linear(2d -> 1, bias=True), zero-initialised.
+        # g_t = tanh( w · [text_t; attn_out_t] + b ) ∈ (-1, 1)  per token
+        # At step 0: w=0, b=0  =>  tanh(0)=0  =>  fused = text_embeds  (no-op)
+        gate_input  = torch.cat(
+            [text_embeds, attn_out_t], dim=-1
+        ).to(next(gate_linear.parameters()).dtype)  # [Nt, 2d]
+        gate_logits = gate_linear(gate_input)        # [Nt, 1]
+        gate_vals   = torch.tanh(gate_logits).to(target_dtype)  # [Nt, 1]
 
+        fused = text_embeds + gate_vals * attn_out_t  # [Nt, d]
         return fused
 
     def encode_images(self, images):
@@ -318,19 +344,21 @@ class LlavaMetaForCausalLM(ABC):
              is passed to the training launcher)
         """
         proj = self.get_model().mm_projector
-        proj_dtype = next(proj.parameters()).dtype
+        proj_param = next(proj.parameters())
+        proj_dtype = proj_param.dtype
+        proj_device = proj_param.device
 
         if images.dim() == 3:
             # Pre-computed LanguageBind features [B, N_patches, encoder_dim]
             # The frozen encoder forward pass is intentionally skipped here.
-            image_features = images.to(proj_dtype)
+            image_features = images.to(device=proj_device, dtype=proj_dtype)
             if image_features.shape[-1] == getattr(self.get_model().config, 'hidden_size', 4096):
                 return image_features
         else:
             # Raw pixel tensors [B, 3, H, W] -- standard path
             with torch.no_grad():
                 image_features = self.get_model().get_image_tower()(images)
-            image_features = image_features.to(proj_dtype)
+            image_features = image_features.to(device=proj_device, dtype=proj_dtype)
 
         return proj(image_features)
 
@@ -346,19 +374,21 @@ class LlavaMetaForCausalLM(ABC):
              is passed to the training launcher)
         """
         proj = self.get_model().mm_projector
-        proj_dtype = next(proj.parameters()).dtype
+        proj_param = next(proj.parameters())
+        proj_dtype = proj_param.dtype
+        proj_device = proj_param.device
 
         if videos.dim() == 4:
             # Pre-computed LanguageBind features [B, T, N_patches, encoder_dim]
             # The frozen encoder forward pass is intentionally skipped here.
-            video_features = videos.to(proj_dtype)
+            video_features = videos.to(device=proj_device, dtype=proj_dtype)
             if video_features.shape[-1] == getattr(self.get_model().config, 'hidden_size', 4096):
                 return video_features
         else:
             # Raw pixel tensors [B, C, T, H, W] -- standard path
             with torch.no_grad():
                 video_features = self.get_model().get_video_tower()(videos)  # [B, T, N, D]
-            video_features = video_features.to(proj_dtype)
+            video_features = video_features.to(device=proj_device, dtype=proj_dtype)
 
         return proj(video_features)
 
@@ -368,8 +398,13 @@ class LlavaMetaForCausalLM(ABC):
         # ====================================================================================================
         image_tower = self.get_image_tower()
         video_tower = self.get_video_tower()
-        if (image_tower is None and video_tower is None) or images is None or input_ids.shape[1] == 1:
-            if past_key_values is not None and (image_tower is not None or video_tower is not None) and images is not None and input_ids.shape[1] == 1:
+        has_vision = (
+            image_tower is not None
+            or video_tower is not None
+            or getattr(self.get_model(), 'mm_projector', None) is not None
+        )
+        if (not has_vision) or images is None or input_ids.shape[1] == 1:
+            if past_key_values is not None and has_vision and images is not None and input_ids.shape[1] == 1:
                 target_shape = past_key_values[-1][-1].shape[-2] + 1
                 attention_mask = torch.cat((attention_mask, torch.ones(
                     (attention_mask.shape[0], target_shape - attention_mask.shape[1]),
@@ -380,51 +415,70 @@ class LlavaMetaForCausalLM(ABC):
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
         '''
-            images is a list, if batch_size=6
-            [
-                image(3, 224, 224),      # sample 1
-                image(3, 224, 224),      # sample 2
-                video(t, 3, 224, 224),   # sample 3
-                image(3, 224, 224),      # sample 4
-                image(3, 224, 224),      # sample 4
-                video(t, 3, 224, 224),   # sample 5
-                video(t, 3, 224, 224),   # sample 5
-                video(t, 3, 224, 224),   # sample 6
-                image(3, 224, 224),      # sample 6
-            ]
-            will be converted to image_features, all video_feature will be flatten as image
-            [
-                [n, c],                  # sample 1
-                [n, c),                  # sample 2
-                *(t * [new_n, c]),       # sample 3
-                [n, c],                  # sample 4
-                [n, c],                  # sample 4
-                *(t * [new_n, c]),       # sample 5
-                *(t * [new_n, c]),       # sample 5
-                *(t * [new_n, c]),       # sample 6
-                [n, c],                  # sample 6
-            ]
+            images is a list of tensors per sample; each item can be:
+              - Raw image:                [3, H, W]           (ndim == 3, shape[0] == 3, shape[1] == shape[2])
+              - Pre-computed image feat:  [N_patches, D]      (ndim == 2)
+              - Raw video:                [3, T, H, W]        (ndim == 4)
+              - Pre-computed video feat:  [T, N_patches, D]   (ndim == 3, not a raw RGB image)
         '''
-        image_idx = [idx for idx, img in enumerate(images) if img.ndim == 3]
-        is_all_image = len(image_idx) == len(images)
-        video_idx = [idx for idx, vid in enumerate(images) if vid.ndim == 4]
-        images_minibatch = torch.stack([images[idx] for idx in image_idx]) if len(image_idx) > 0 else []  # mini_b c h w
-        videos_minibatch = torch.stack([images[idx] for idx in video_idx]) if len(video_idx) > 0 else []  # mini_b c t h w
+        def _is_raw_image_tensor(t: torch.Tensor) -> bool:
+            return t.ndim == 3 and t.shape[0] == 3 and t.shape[1] == t.shape[2]
 
-        tmp_image_features = [None] * (len(image_idx) + len(video_idx))
-        if getattr(images_minibatch, 'ndim', 0) == 4:  # batch consists of images, [mini_b, c, h, w]
+        precomp_image_idx = [idx for idx, img in enumerate(images) if img.ndim == 2]
+        raw_image_idx = [idx for idx, img in enumerate(images) if _is_raw_image_tensor(img)]
+        precomp_video_idx = [idx for idx, img in enumerate(images) if img.ndim == 3 and not _is_raw_image_tensor(img)]
+        raw_video_idx = [idx for idx, img in enumerate(images) if img.ndim == 4]
+
+        precomp_images_minibatch = torch.stack([images[idx] for idx in precomp_image_idx]) if precomp_image_idx else []
+        raw_images_minibatch = torch.stack([images[idx] for idx in raw_image_idx]) if raw_image_idx else []
+        precomp_videos_minibatch = torch.stack([images[idx] for idx in precomp_video_idx]) if precomp_video_idx else []
+        raw_videos_minibatch = torch.stack([images[idx] for idx in raw_video_idx]) if raw_video_idx else []
+
+        tmp_image_features = [None] * len(images)
+
+        # 1a. Pre-computed image features [mini_b, N_patches, D] -> skips frozen LanguageBind tower
+        if getattr(precomp_images_minibatch, 'ndim', 0) == 3:
+            precomp_img_feats = self.encode_images(precomp_images_minibatch)  # [mini_b, N_patches, hidden_size]
+            for i, pos in enumerate(precomp_image_idx):
+                tmp_image_features[pos] = precomp_img_feats[i]
+
+        # 1b. Raw pixel images [mini_b, 3, H, W] -> runs LanguageBind image tower + mm_projector
+        use_embed_cache = getattr(self.config, 'use_embed_cache', False)
+        if getattr(raw_images_minibatch, 'ndim', 0) == 4:
             if image_tower is not None:
-                image_features_minibatch = self.encode_images(images_minibatch)  # [mini_b, l, c]
+                image_features_minibatch = self.encode_images(raw_images_minibatch)  # [mini_b, l, c]
             else:
                 image_features_minibatch = torch.randn(1).to(self.device)  # dummy feature for video-only training under tuning
-            for i, pos in enumerate(image_idx):
+            for i, pos in enumerate(raw_image_idx):
                 tmp_image_features[pos] = image_features_minibatch[i]
+        elif image_tower is not None and not use_embed_cache:
+            # ZeRO-3: the frozen image tower is only called when the local
+            # micro-batch has a raw image. Ranks holding a video-only batch would
+            # skip it and their parameter all-gathers would not match, so run a
+            # throw-away dummy image to keep the module call sequence identical.
+            # (Skipped when use_embed_cache=True because all ranks use cached features.)
+            _ = self.encode_images(
+                torch.zeros(1, 3, 224, 224, device=self.device, dtype=torch.float32)
+            )
 
-        if getattr(videos_minibatch, 'ndim', 0) == 5:  # batch consists of videos, [mini_b, c, t, h, w]
-            video_features_minibatch = self.encode_videos(videos_minibatch)  # fake list [mini_b, t, l, c]
-            for i, pos in enumerate(video_idx):
+        # 2a. Pre-computed video features [mini_b, T, N_patches, D] -> skips frozen LanguageBind video tower
+        if getattr(precomp_videos_minibatch, 'ndim', 0) == 4:
+            precomp_vid_feats = self.encode_videos(precomp_videos_minibatch)  # [mini_b, T, l, c]
+            for i, pos in enumerate(precomp_video_idx):
+                t = precomp_vid_feats[i].shape[0]
+                tmp_image_features[pos] = [precomp_vid_feats[i][j] for j in range(t)]
+
+        # 2b. Raw pixel videos [mini_b, 3, T, H, W] -> runs LanguageBind video tower + mm_projector
+        if getattr(raw_videos_minibatch, 'ndim', 0) == 5:
+            video_features_minibatch = self.encode_videos(raw_videos_minibatch)  # [mini_b, t, l, c]
+            for i, pos in enumerate(raw_video_idx):
                 t = video_features_minibatch[i].shape[0]
                 tmp_image_features[pos] = [video_features_minibatch[i][j] for j in range(t)]
+        elif video_tower is not None and not use_embed_cache:
+            # Same as above, for ranks whose batch has no video.
+            _ = self.encode_videos(
+                torch.zeros(1, 3, 8, 224, 224, device=self.device, dtype=torch.float32)
+            )
 
         new_tmp = []
         for image in tmp_image_features:
@@ -517,6 +571,11 @@ class LlavaMetaForCausalLM(ABC):
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
 
+        # Safety net: visual features may have been produced in fp32 by a
+        # lazily-created projector; the LLM expects its own dtype.
+        _embed_dtype = self.get_model().embed_tokens.weight.dtype
+        new_input_embeds = [x.to(_embed_dtype) for x in new_input_embeds]
+
         # Truncate sequences to max length as image embeddings can make the sequence longer
         tokenizer_model_max_length = getattr(self.config, 'tokenizer_model_max_length', None)
         if tokenizer_model_max_length is not None:
@@ -571,8 +630,9 @@ class LlavaMetaForCausalLM(ABC):
         if _position_ids is None:
             position_ids = None
 
-        del images_minibatch, videos_minibatch, tmp_image_features, new_tmp, new_input_embeds_padded
-        if torch.cuda.is_available():
+        del precomp_images_minibatch, raw_images_minibatch, precomp_videos_minibatch, raw_videos_minibatch
+        del tmp_image_features, new_tmp, new_input_embeds_padded
+        if os.environ.get("VIDEOLLAVA_EMPTY_CACHE_EVERY_STEP", "0") == "1" and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels

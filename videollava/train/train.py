@@ -19,12 +19,15 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import sys
 import copy
 import random
+from collections import OrderedDict, deque
+from datetime import datetime
 from dataclasses import dataclass, field
 import json
 import logging
 import pathlib
 from typing import Dict, Optional, Sequence, List
 
+import numpy as np
 import torch
 import transformers
 
@@ -60,6 +63,62 @@ def rank0_print(*args):
         print(*args)
 
 
+class FusionTrainingGuardCallback(transformers.TrainerCallback):
+    """Logs 50-step avg loss/LR, stops on divergence (DIVERGE_GUARD), and supports STOP_AFTER_STEPS."""
+
+    def __init__(self):
+        self.loss_window = deque(maxlen=50)
+        self.best_avg = None
+        self.diverge_guard = os.environ.get("DIVERGE_GUARD", "1") != "0"
+        self.stop_after_steps = int(os.environ.get("STOP_AFTER_STEPS", "0") or 0)
+        self.status_file = os.environ.get(
+            "STATUS_FILE", "/home/aitech/hdd/pretrain_logs/pretrain_status.txt"
+        )
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs or "loss" not in logs:
+            return
+        loss_val = float(logs["loss"])
+        self.loss_window.append(loss_val)
+        avg_loss = sum(self.loss_window) / len(self.loss_window)
+        if len(self.loss_window) == 50:
+            self.best_avg = avg_loss if self.best_avg is None else min(self.best_avg, avg_loss)
+
+        if state.is_world_process_zero and state.global_step > 0 and state.global_step % 50 == 0:
+            lr = logs.get("learning_rate", float("nan"))
+            best_str = f"{self.best_avg:.4f}" if self.best_avg is not None else "N/A"
+            print(
+                f"[STEP {state.global_step}] lr={lr:.3e} loss_50avg={avg_loss:.4f} best_50avg={best_str}",
+                flush=True,
+            )
+
+        if (
+            self.diverge_guard
+            and state.global_step > 100
+            and len(self.loss_window) == 50
+            and self.best_avg is not None
+            and avg_loss > 1.5 * self.best_avg
+        ):
+            msg = f"DIVERGED at step {state.global_step} (avg {avg_loss:.4f}, best {self.best_avg:.4f})"
+            if state.is_world_process_zero:
+                os.makedirs(os.path.dirname(self.status_file), exist_ok=True)
+                with open(self.status_file, "a", encoding="utf-8") as f:
+                    f.write(f"{datetime.now():%c} {msg}\n")
+                print(f"[DIVERGE_GUARD] {msg}. Saving checkpoint and stopping cleanly.", flush=True)
+            control.should_save = True
+            control.should_training_stop = True
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.stop_after_steps > 0 and state.global_step >= self.stop_after_steps:
+            if state.is_world_process_zero:
+                print(
+                    f"[STOP_AFTER_STEPS] Reached step {state.global_step} (target {self.stop_after_steps}). Saving checkpoint and stopping cleanly.",
+                    flush=True,
+                )
+            control.should_save = True
+            control.should_training_stop = True
+
+
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
@@ -69,6 +128,7 @@ class ModelArguments:
     vision_tower: Optional[str] = field(default=None)
     mm_vision_select_layer: Optional[int] = field(default=-1)   # default to the last layer
     pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
+    freeze_mm_projector: bool = field(default=False)
     mm_projector_type: Optional[str] = field(default='linear')
     mm_use_im_start_end: bool = field(default=False)
     mm_use_im_patch_token: bool = field(default=True)
@@ -77,6 +137,7 @@ class ModelArguments:
     # ===================================================================
     image_tower: Optional[str] = field(default=None)
     video_tower: Optional[str] = field(default=None)
+    mha_fusion_heads: int = field(default=8)
     # ===================================================================
 
 @dataclass
@@ -362,7 +423,6 @@ def preprocess_multimodal(
                     sentence['value'] = sentence['value'].replace(DEFAULT_IMAGE_TOKEN * IMAGE_TOKEN_NUM, DEFAULT_IMAGE_TOKEN * MAX_IMAGE_LENGTH).strip()
                 VIDEO_TOKEN_NUM = sentence['value'].count(DEFAULT_VIDEO_TOKEN)
                 if VIDEO_TOKEN_NUM > MAX_VIDEO_LENGTH:
-                    raise ValueError(f"{sentence['value']}")
                     sentence['value'] = sentence['value'].replace(DEFAULT_VIDEO_TOKEN * VIDEO_TOKEN_NUM, DEFAULT_VIDEO_TOKEN * MAX_VIDEO_LENGTH).strip()
 
             # a <video> is treated as `num_frames * <image>`
@@ -703,11 +763,21 @@ class LazySupervisedDataset(Dataset):
         super(LazySupervisedDataset, self).__init__()
         # ================================================
         list_data_dict = []
+        video_skipped = 0
         for data in data_path:
-            data = json.load(open(data, "r"))
-            for i in data:
+            with open(data, "r") as f:
+                cur_data = json.load(f)
+            for i in cur_data:
+                # Image-only pipeline: filter out any video samples
+                if 'video' in i:
+                    video_skipped += 1
+                    continue
+                if 'id' in i and '_orig_id' not in i:
+                    i['_orig_id'] = str(i['id'])
                 i['id'] = len(list_data_dict)
                 list_data_dict.append(i)
+        if video_skipped > 0:
+            rank0_print(f"[Dataset] Image-only mode active: filtered out {video_skipped:,} video samples. Retained {len(list_data_dict):,} image/text samples.")
         # ================================================
 
         rank0_print("Formatting inputs...Skip in lazy mode")
@@ -716,14 +786,15 @@ class LazySupervisedDataset(Dataset):
         self.data_args = data_args
 
         # ── Pre-computed embedding cache (optional) ───────────────────────
-        # Populated when data_args.embed_cache_dir is set.  Stores open h5py
-        # file handles and index dicts for each HDF5 file found in the cache
-        # directory.  Each DataLoader worker re-opens the files independently
-        # in _ensure_h5_open() to avoid multiprocessing file-handle conflicts.
-        self._h5_handles: dict = {}          # name -> h5py.File (per worker)
-        self._embed_image_index: dict = {}   # rel_path -> row_int
-        self._embed_video_index: dict = {}   # rel_path -> row_int
-        self._embed_text_index: dict = {}    # sample_id/key -> {"offset": int, "length": int}
+        # Populated when data_args.embed_cache_dir is set.  Stores an LRU-bounded
+        # pool of open h5py file handles per worker PID to prevent hitting ulimit -n
+        # and to stay fork-safe across DataLoader worker processes.
+        self._h5_handles: OrderedDict = OrderedDict()  # path -> h5py.File (per worker)
+        self._h5_max_open: int = 32
+        self._h5_pid: int = os.getpid()
+        self._embed_image_index: dict = {}   # rel_path -> row_int or {"shard": ..., "idx": ...}
+        self._embed_video_index: dict = {}   # rel_path -> row_int or {"shard": ..., "idx": ...}
+        self._embed_text_index: dict = {}    # sample_id/media_path -> {"offset": int, "length": int, ...}
         self._embed_image_h5_name: Optional[str] = None
         self._embed_video_h5_name: Optional[str] = None
         self._embed_text_h5_name: Optional[str] = None
@@ -733,17 +804,57 @@ class LazySupervisedDataset(Dataset):
 
     # ── Embedding-cache helpers ───────────────────────────────────────────
 
+    def _get_h5(self, h5_path: str):
+        """Returns a fork-safe, LRU-cached read-only h5py.File handle."""
+        import h5py
+        cur_pid = os.getpid()
+        if cur_pid != self._h5_pid:
+            # Forked worker: discard inherited parent handles cleanly
+            self._h5_handles = OrderedDict()
+            self._h5_pid = cur_pid
+        if h5_path in self._h5_handles:
+            self._h5_handles.move_to_end(h5_path)
+            return self._h5_handles[h5_path]
+        while len(self._h5_handles) >= self._h5_max_open:
+            _, old_f = self._h5_handles.popitem(last=False)
+            try:
+                old_f.close()
+            except Exception:
+                pass
+        try:
+            f = h5py.File(h5_path, "r", swmr=True)
+        except Exception:
+            f = h5py.File(h5_path, "r")
+        self._h5_handles[h5_path] = f
+        return f
+
     def _init_embed_cache(self, cache_dir: str):
-        """Loads index JSONs and records HDF5 file names for later use."""
-        import glob
-        cdir = Path(cache_dir)
+        """Loads index JSONs matching the active dataset split and verifies key overlap."""
+        cdir = pathlib.Path(cache_dir)
         if not cdir.exists():
             rank0_print(f"[EmbedCache] WARNING: cache_dir does not exist: {cdir}")
             return
 
-        # Determine which HDF5 files apply for this run (pretrain vs finetune)
-        # by probing which index JSON contains keys present in our data.
-        for prefix in ["pretrain", "finetune"]:
+        # Pick preferred split order based on data_path names
+        data_paths_str = " ".join(str(p).lower() for p in (self.data_args.data_path or []))
+        if "tune" in data_paths_str:
+            prefixes = ["finetune", "pretrain"]
+        else:
+            prefixes = ["pretrain", "finetune"]
+
+        # Sample a handful of image paths & IDs from current dataset to verify overlap
+        probe_imgs = []
+        probe_ids = []
+        for s in self.list_data_dict[:200]:
+            if "image" in s:
+                img = s["image"][0] if isinstance(s["image"], list) else s["image"]
+                probe_imgs.append(img)
+            if "_orig_id" in s:
+                probe_ids.append(str(s["_orig_id"]))
+            if len(probe_imgs) >= 32 and len(probe_ids) >= 32:
+                break
+
+        for prefix in prefixes:
             img_idx_path = cdir / f"{prefix}_image_index.json"
             vid_idx_path = cdir / f"{prefix}_video_index.json"
             txt_idx_path = cdir / f"{prefix}_text_index.json"
@@ -751,47 +862,55 @@ class LazySupervisedDataset(Dataset):
             vid_h5_path  = cdir / f"{prefix}_videos.h5"
             txt_h5_path  = cdir / f"{prefix}_text.h5"
 
-            if img_idx_path.exists():
+            if img_idx_path.exists() and self._embed_image_h5_name is None:
                 has_img_h5 = img_h5_path.exists() or any(cdir.glob(f"{prefix}_images_shard_*.h5"))
                 if has_img_h5:
                     idx = json.loads(img_idx_path.read_text())
-                    if idx and self._embed_image_h5_name is None:
+                    overlap = sum(1 for p in probe_imgs if p in idx) if probe_imgs else 1
+                    if idx and overlap > 0:
                         self._embed_image_index   = idx
                         self._embed_image_h5_name = str(img_h5_path)
                         rank0_print(
-                            f"[EmbedCache] Image cache: {img_idx_path.stem}  "
-                            f"({len(idx):,} entries)"
+                            f"[EmbedCache] Image cache active: {img_idx_path.name} "
+                            f"({len(idx):,} entries, probe overlap {overlap}/{len(probe_imgs)})"
                         )
 
-            if vid_idx_path.exists():
+            if vid_idx_path.exists() and self._embed_video_h5_name is None:
                 has_vid_h5 = vid_h5_path.exists() or any(cdir.glob(f"{prefix}_videos_shard_*.h5"))
                 if has_vid_h5:
                     idx = json.loads(vid_idx_path.read_text())
-                    if idx and self._embed_video_h5_name is None:
+                    if idx:
                         self._embed_video_index   = idx
                         self._embed_video_h5_name = str(vid_h5_path)
                         rank0_print(
-                            f"[EmbedCache] Video cache: {vid_idx_path.stem}  "
+                            f"[EmbedCache] Video cache active: {vid_idx_path.name} "
                             f"({len(idx):,} entries)"
                         )
 
-            if txt_idx_path.exists() and txt_h5_path.exists():
+            if txt_idx_path.exists() and txt_h5_path.exists() and self._embed_text_h5_name is None:
                 idx = json.loads(txt_idx_path.read_text())
-                if idx and self._embed_text_h5_name is None:
+                overlap_id = sum(1 for k in probe_ids if k in idx) if probe_ids else 0
+                overlap_img = sum(1 for p in probe_imgs if p in idx) if probe_imgs else 0
+                if idx and (overlap_id > 0 or overlap_img > 0 or (not probe_ids and not probe_imgs)):
                     self._embed_text_index   = idx
                     self._embed_text_h5_name = str(txt_h5_path)
                     rank0_print(
-                        f"[EmbedCache] Text cache: {txt_h5_path.name}  "
-                        f"({len(idx):,} entries)"
+                        f"[EmbedCache] Text cache active: {txt_h5_path.name} "
+                        f"({len(idx):,} keys, probe id/img overlap {overlap_id}/{overlap_img})"
                     )
 
     def _load_image_feature(self, rel_path: str) -> Optional[torch.Tensor]:
-        """Returns pre-computed image feature tensor [N_patches, D] or None."""
-        if not self._embed_image_h5_name or rel_path not in self._embed_image_index:
+        """Returns pre-computed image feature tensor [N_patches, D] (fp16) or None."""
+        if not self._embed_image_h5_name:
+            return None
+        entry = self._embed_image_index.get(rel_path)
+        if entry is None and "/" in rel_path:
+            # Fallback: try stripping leading folder prefix (e.g. llava_image/...)
+            alt = rel_path.split("/", 1)[1]
+            entry = self._embed_image_index.get(alt)
+        if entry is None:
             return None
         try:
-            import h5py
-            entry = self._embed_image_index[rel_path]
             if isinstance(entry, dict):
                 shard_name = entry.get("shard", "")
                 h5_path = str(pathlib.Path(self._embed_image_h5_name).parent / shard_name)
@@ -800,20 +919,18 @@ class LazySupervisedDataset(Dataset):
                 h5_path = self._embed_image_h5_name
                 row = entry
 
-            if h5_path not in self._h5_handles:
-                self._h5_handles[h5_path] = h5py.File(h5_path, "r", swmr=True)
-            feat_np = self._h5_handles[h5_path]["features"][row]  # [N, D] np.float16
-            return torch.from_numpy(feat_np.astype("float32"))    # [N, D] fp32
+            h5 = self._get_h5(h5_path)
+            feat_np = np.array(h5["features"][row], copy=True)  # [N, D] np.float16
+            return torch.from_numpy(feat_np)                    # [N, D] torch.float16
         except Exception as exc:
             rank0_print(f"[EmbedCache] Failed to load image feature for {rel_path}: {exc}")
             return None
 
     def _load_video_feature(self, rel_path: str) -> Optional[torch.Tensor]:
-        """Returns pre-computed video feature tensor [T, N_patches, D] or None."""
+        """Returns pre-computed video feature tensor [T, N_patches, D] (fp16) or None."""
         if not self._embed_video_h5_name or rel_path not in self._embed_video_index:
             return None
         try:
-            import h5py
             entry = self._embed_video_index[rel_path]
             if isinstance(entry, dict):
                 shard_name = entry.get("shard", "")
@@ -823,40 +940,48 @@ class LazySupervisedDataset(Dataset):
                 h5_path = self._embed_video_h5_name
                 row = entry
 
-            if h5_path not in self._h5_handles:
-                self._h5_handles[h5_path] = h5py.File(h5_path, "r", swmr=True)
-            feat_np = self._h5_handles[h5_path]["features"][row]  # [T, N, D]
-            return torch.from_numpy(feat_np.astype("float32"))    # [T, N, D] fp32
+            h5 = self._get_h5(h5_path)
+            feat_np = np.array(h5["features"][row], copy=True)  # [T, N, D] np.float16
+            return torch.from_numpy(feat_np)                    # [T, N, D] torch.float16
         except Exception as exc:
             rank0_print(f"[EmbedCache] Failed to load video feature for {rel_path}: {exc}")
             return None
 
     def _load_text_feature(self, i: int) -> Optional[Dict[str, torch.Tensor]]:
-        """Returns pre-computed token_ids, labels, and text_embeddings for sample index i."""
+        """
+        Returns pre-tokenized input_ids and labels for sample index i.
+        Matches by image path or original JSON id and verifies media_path equality
+        so subset/reordered ablation datasets can never load a mismatched caption.
+        """
         if not self._embed_text_h5_name or not self._embed_text_index:
             return None
         sample = self.list_data_dict[i]
-        key = str(sample.get("id", i))
-        if key not in self._embed_text_index:
-            key = str(i)
-        if key not in self._embed_text_index:
+        expected_media = sample.get("image") if "image" in sample else sample.get("video")
+
+        meta = None
+        # 1. Preferred key: unique media path (immune to subset/reindexing)
+        if isinstance(expected_media, str) and expected_media in self._embed_text_index:
+            meta = self._embed_text_index[expected_media]
+        # 2. Original JSON sample id
+        if meta is None and "_orig_id" in sample:
+            cand = self._embed_text_index.get(str(sample["_orig_id"]))
+            if cand is not None and (expected_media is None or cand.get("media_path") == expected_media):
+                meta = cand
+        # 3. Sequential index fallback ONLY if media_path matches
+        if meta is None:
+            cand = self._embed_text_index.get(str(i))
+            if cand is not None and (expected_media is None or cand.get("media_path") == expected_media):
+                meta = cand
+        if meta is None:
             return None
         try:
-            import h5py
-            h5_path = self._embed_text_h5_name
-            if h5_path not in self._h5_handles:
-                self._h5_handles[h5_path] = h5py.File(h5_path, "r", swmr=True)
-            meta = self._embed_text_index[key]
+            h5 = self._get_h5(self._embed_text_h5_name)
             start = meta["offset"]
             length = meta["length"]
             end = start + length
-            h5 = self._h5_handles[h5_path]
-            input_ids = torch.from_numpy(h5["token_ids"][start:end].astype("int64"))
-            labels = torch.from_numpy(h5["labels"][start:end].astype("int64"))
-            res = {"input_ids": input_ids.unsqueeze(0), "labels": labels.unsqueeze(0)}
-            if "text_embeddings" in h5:
-                res["text_embeddings"] = torch.from_numpy(h5["text_embeddings"][start:end].astype("float32")).unsqueeze(0)
-            return res
+            input_ids = torch.from_numpy(np.array(h5["token_ids"][start:end], dtype=np.int64))
+            labels = torch.from_numpy(np.array(h5["labels"][start:end], dtype=np.int64))
+            return {"input_ids": input_ids.unsqueeze(0), "labels": labels.unsqueeze(0)}
         except Exception as exc:
             rank0_print(f"[EmbedCache] Failed to load text feature for sample {i}: {exc}")
             return None
@@ -1124,7 +1249,7 @@ def train():
             quantization_config=BitsAndBytesConfig(
                 load_in_4bit=training_args.bits == 4,
                 load_in_8bit=training_args.bits == 8,
-                llm_int8_skip_modules=["mm_projector", "early_fusion_attn", "early_fusion_ln", "early_fusion_kv_ln"],
+                llm_int8_skip_modules=["mm_projector", "early_fusion_attn", "early_fusion_ln", "early_fusion_kv_ln", "early_fusion_gate_linear"],
                 llm_int8_threshold=6.0,
                 llm_int8_has_fp16_weight=False,
                 bnb_4bit_compute_dtype=compute_dtype,
@@ -1159,6 +1284,10 @@ def train():
             **bnb_model_from_pretrained_args
         )
     model.config.use_cache = False
+    # publish the compute dtype so the multimodal assembler / fusion pick the
+    # same dtype as the LLM (they default to fp16 when this is unset).
+    model.config.bf16 = training_args.bf16
+    model.config.fp16 = training_args.fp16
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
@@ -1236,11 +1365,22 @@ def train():
 
     # =============================================================================================================
     if model_args.image_tower is not None or model_args.video_tower is not None:
+        model.config.mha_fusion_heads = model_args.mha_fusion_heads
+        model.config.use_embed_cache = bool(data_args.embed_cache_dir and os.path.isdir(data_args.embed_cache_dir))
         # print(model_args)
         model.get_model().initialize_vision_modules(
             model_args=model_args,
             fsdp=training_args.fsdp
         )
+        # initialize_vision_modules creates mm_projector / early_fusion_* lazily
+        # with the default fp32 dtype.  The LLM runs in bf16 here, so cast them
+        # to the same compute dtype; otherwise the concatenated visual tokens
+        # stay fp32 and the first Llama q_proj dies with "float != bfloat16".
+        for _name in ("mm_projector", "early_fusion_attn", "early_fusion_ln",
+                      "early_fusion_kv_ln", "early_fusion_gate_linear"):
+            _mod = getattr(model.get_model(), _name, None)
+            if _mod is not None:
+                _mod.to(dtype=compute_dtype)
         if model_args.image_tower is not None:
             image_tower = model.get_image_tower()
             image_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
@@ -1281,10 +1421,12 @@ def train():
         # =============================================================================================================
         
         model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
+        training_args.freeze_mm_projector = model_args.freeze_mm_projector
         if model_args.tune_mm_mlp_adapter:
             model.requires_grad_(False)
-            for p in model.get_model().mm_projector.parameters():
-                p.requires_grad = True
+            if not model_args.freeze_mm_projector:
+                for p in model.get_model().mm_projector.parameters():
+                    p.requires_grad = True
             for name, param in model.get_model().named_parameters():
                 if 'early_fusion' in name:
                     param.requires_grad = True
@@ -1297,6 +1439,13 @@ def train():
                 if 'early_fusion' in name:
                     param.requires_grad = False
 
+        trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
+        trainable_count = sum(p.numel() for _, p in model.named_parameters() if p.requires_grad)
+        rank0_print(f"[INFO] Learning rate: {training_args.learning_rate}")
+        rank0_print(f"[INFO] Trainable parameter count: {trainable_count:,} ({len(trainable_names)} tensors)")
+        for _tn in trainable_names:
+            rank0_print(f"  trainable: {_tn}")
+
         if training_args.bits in [4, 8]:
             # In native PyTorch FP16 AMP training, trainable parameters must have float32 master weights
             # so that their gradients are float32, allowing PyTorch's GradScaler to unscale them without error.
@@ -1306,8 +1455,6 @@ def train():
             for name, module in model.get_model().named_children():
                 if 'early_fusion' in name:
                     module.to(dtype=adapter_dtype, device=training_args.device)
-            if hasattr(model.get_model(), 'early_fusion_gate') and model.get_model().early_fusion_gate is not None:
-                model.get_model().early_fusion_gate.data = model.get_model().early_fusion_gate.data.to(dtype=adapter_dtype, device=training_args.device)
 
         model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_projector_lr = training_args.mm_projector_lr
@@ -1358,6 +1505,7 @@ def train():
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
+                    callbacks=[FusionTrainingGuardCallback()],
                     **data_module)
 
     if torch.cuda.is_available():
@@ -1365,32 +1513,66 @@ def train():
 
     ckpts = [p for p in pathlib.Path(training_args.output_dir).glob("checkpoint-*") if p.is_dir()]
     valid_resume_ckpts = [c for c in ckpts if (c / "trainer_state.json").exists()]
-    if valid_resume_ckpts:
+
+    # Helper: load adapter weights from a checkpoint's mm_projector.bin into the model
+    def _load_adapter_from_ckpt(ckpt_path):
+        adapter_path = ckpt_path / "mm_projector.bin"
+        if not adapter_path.exists():
+            return
+        rank0_print(f"[INFO] Loading adapter weights from {adapter_path} ...")
+        adapter_weights = torch.load(str(adapter_path), map_location="cpu")
+        proj_weights = {k.split("mm_projector.")[1]: v for k, v in adapter_weights.items() if "mm_projector." in k}
+        if proj_weights:
+            model.get_model().mm_projector.load_state_dict(proj_weights, strict=False)
+        early_attn = {k.split("early_fusion_attn.")[1]: v for k, v in adapter_weights.items() if "early_fusion_attn." in k}
+        if early_attn and hasattr(model.get_model(), "early_fusion_attn") and model.get_model().early_fusion_attn is not None:
+            model.get_model().early_fusion_attn.load_state_dict(early_attn, strict=False)
+        early_ln = {k.split("early_fusion_ln.")[1]: v for k, v in adapter_weights.items() if "early_fusion_ln." in k}
+        if early_ln and hasattr(model.get_model(), "early_fusion_ln") and model.get_model().early_fusion_ln is not None:
+            model.get_model().early_fusion_ln.load_state_dict(early_ln, strict=False)
+        early_kv_ln = {k.split("early_fusion_kv_ln.")[1]: v for k, v in adapter_weights.items() if "early_fusion_kv_ln." in k}
+        if early_kv_ln and hasattr(model.get_model(), "early_fusion_kv_ln") and model.get_model().early_fusion_kv_ln is not None:
+            model.get_model().early_fusion_kv_ln.load_state_dict(early_kv_ln, strict=False)
+        gate_lin_keys = {k.split('early_fusion_gate_linear.')[1]: v
+                         for k, v in adapter_weights.items()
+                         if 'early_fusion_gate_linear.' in k}
+        if gate_lin_keys and hasattr(model.get_model(), 'early_fusion_gate_linear') and model.get_model().early_fusion_gate_linear is not None:
+            model.get_model().early_fusion_gate_linear.load_state_dict(gate_lin_keys, strict=False)
+        rank0_print("[SUCCESS] Adapter weights loaded.")
+
+    if valid_resume_ckpts and getattr(training_args, 'tune_mm_mlp_adapter', False):
+        latest_ckpt = max(valid_resume_ckpts,
+                          key=lambda p: int(p.name.split("-")[1]) if len(p.name.split("-")) > 1 and p.name.split("-")[1].isdigit() else 0)
+        has_ds_shards = any(latest_ckpt.glob("global_step*"))
+        if has_ds_shards:
+            rank0_print(f"[INFO] Resuming full DeepSpeed checkpoint from {latest_ckpt}")
+            trainer.train(resume_from_checkpoint=str(latest_ckpt))
+        else:
+            rank0_print(f"[INFO] Adapter-only resume from {latest_ckpt} (restoring fusion weights, optimizer & scheduler)")
+            _load_adapter_from_ckpt(latest_ckpt)
+            import transformers.trainer as _trainer_mod
+            import transformers.integrations.deepspeed as _ds_mod
+            _orig_ds_load1 = getattr(_trainer_mod, 'deepspeed_load_checkpoint', None)
+            _orig_ds_load2 = getattr(_ds_mod, 'deepspeed_load_checkpoint', None)
+            def _noop_ds_load(engine, ckpt_path):
+                rank0_print(f"[INFO] Skipping deepspeed_load_checkpoint for adapter-only resume ({ckpt_path})")
+            _trainer_mod.deepspeed_load_checkpoint = _noop_ds_load
+            _ds_mod.deepspeed_load_checkpoint = _noop_ds_load
+            try:
+                trainer.train(resume_from_checkpoint=str(latest_ckpt))
+            finally:
+                if _orig_ds_load1 is not None:
+                    _trainer_mod.deepspeed_load_checkpoint = _orig_ds_load1
+                if _orig_ds_load2 is not None:
+                    _ds_mod.deepspeed_load_checkpoint = _orig_ds_load2
+    elif valid_resume_ckpts:
+        # Full-model checkpoints with DeepSpeed state — standard resume
         rank0_print(f"[INFO] Resuming training from checkpoint: {valid_resume_ckpts[-1]}")
         trainer.train(resume_from_checkpoint=True)
     elif ckpts:
         # Checkpoint directory exists but without trainer_state.json (e.g. from previous run)
         latest_ckpt = max(ckpts, key=lambda p: int(p.name.split("-")[1]) if len(p.name.split("-")) > 1 and p.name.split("-")[1].isdigit() else 0)
-        adapter_path = latest_ckpt / "mm_projector.bin"
-        if adapter_path.exists():
-            rank0_print(f"[INFO] Found previous adapter checkpoint at {adapter_path}. Loading weights into model...")
-            adapter_weights = torch.load(adapter_path, map_location="cpu")
-            proj_weights = {k.split("mm_projector.")[1]: v for k, v in adapter_weights.items() if "mm_projector." in k}
-            if proj_weights:
-                model.get_model().mm_projector.load_state_dict(proj_weights, strict=False)
-            early_attn = {k.split("early_fusion_attn.")[1]: v for k, v in adapter_weights.items() if "early_fusion_attn." in k}
-            if early_attn and hasattr(model.get_model(), "early_fusion_attn") and model.get_model().early_fusion_attn is not None:
-                model.get_model().early_fusion_attn.load_state_dict(early_attn, strict=False)
-            early_ln = {k.split("early_fusion_ln.")[1]: v for k, v in adapter_weights.items() if "early_fusion_ln." in k}
-            if early_ln and hasattr(model.get_model(), "early_fusion_ln") and model.get_model().early_fusion_ln is not None:
-                model.get_model().early_fusion_ln.load_state_dict(early_ln, strict=False)
-            early_kv_ln = {k.split("early_fusion_kv_ln.")[1]: v for k, v in adapter_weights.items() if "early_fusion_kv_ln." in k}
-            if early_kv_ln and hasattr(model.get_model(), "early_fusion_kv_ln") and model.get_model().early_fusion_kv_ln is not None:
-                model.get_model().early_fusion_kv_ln.load_state_dict(early_kv_ln, strict=False)
-            gate_key = [k for k in adapter_weights.keys() if "early_fusion_gate" in k]
-            if gate_key and hasattr(model.get_model(), "early_fusion_gate") and model.get_model().early_fusion_gate is not None:
-                model.get_model().early_fusion_gate.data.copy_(adapter_weights[gate_key[0]])
-            rank0_print("[SUCCESS] Successfully loaded previous adapter checkpoint weights.")
+        _load_adapter_from_ckpt(latest_ckpt)
         trainer.train()
     else:
         trainer.train()

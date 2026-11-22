@@ -1,4 +1,7 @@
 import os
+import shutil
+import subprocess
+import sys
 import torch
 
 from torch.utils.data import Sampler
@@ -83,6 +86,39 @@ def maybe_zero_3(param, ignore_status=False, name=None):
     else:
         param = param.detach().cpu().clone()
     return param
+
+
+def _maybe_async_upload_checkpoint_to_gdrive(checkpoint_dir: str, run_dir: str) -> None:
+    """
+    Spawns a non-blocking background rclone upload for a freshly saved checkpoint.
+    Controlled by env vars:
+      - GDRIVE_AUTO_UPLOAD (default "1"; set "0" to disable)
+      - GDRIVE_REMOTE      (default "gdrive:Video-LLaVA/checkpoints")
+    No-ops silently if rclone is missing or the remote is not configured yet.
+    """
+    if os.environ.get("GDRIVE_AUTO_UPLOAD", "1") == "0":
+        return
+    remote_base = os.environ.get("GDRIVE_REMOTE", "gdrive:Video-LLaVA/checkpoints").rstrip("/")
+    rclone_bin = shutil.which("rclone") or os.path.expanduser("~/.local/bin/rclone")
+    if not rclone_bin or not os.path.isfile(rclone_bin):
+        return
+    watcher_script = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "scripts", "gdrive_checkpoint_watcher.py")
+    )
+    run_name = os.path.basename(os.path.abspath(run_dir))
+    ckpt_name = os.path.basename(os.path.abspath(checkpoint_dir))
+    dst_remote = f"{remote_base}/{run_name}/{ckpt_name}"
+    log_path = os.path.join(run_dir, "gdrive_upload.log")
+    try:
+        log_f = open(log_path, "a", encoding="utf-8")
+        if os.path.isfile(watcher_script):
+            cmd = [sys.executable, "-u", watcher_script, "--once", checkpoint_dir, "--remote", dst_remote]
+        else:
+            cmd = [rclone_bin, "copy", checkpoint_dir, dst_remote, "--transfers", "2", "--retries", "5"]
+        subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, start_new_session=True)
+        logger.info(f"[GDriveSync] Triggered background upload: {checkpoint_dir} -> {dst_remote}")
+    except Exception as exc:
+        logger.warning(f"[GDriveSync] Failed to spawn background upload: {exc}")
 
 
 def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
@@ -323,17 +359,43 @@ class LLaVATrainer(Trainer):
 
             output_dir = os.path.join(run_dir, checkpoint_folder)
 
-            # Only save Adapter
+            # Always include mm_projector + early_fusion so each downloaded checkpoint
+            # is a 100% self-contained drop-in mm_projector.bin for benchmarking/eval.
             keys_to_match = ['mm_projector', 'vision_resampler', 'early_fusion']
             if getattr(self.args, "use_im_start_end", False):
                 keys_to_match.extend(['embed_tokens', 'embed_in'])
 
             weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
 
+            is_dist = torch.distributed.is_available() and torch.distributed.is_initialized()
+            rank = torch.distributed.get_rank() if is_dist else 0
+
             if getattr(self.args, "local_rank", -1) in [0, -1]:
+                os.makedirs(output_dir, exist_ok=True)
                 self.model.config.save_pretrained(output_dir)
                 torch.save(weight_to_save, os.path.join(output_dir, 'mm_projector.bin'))
                 self.state.save_to_json(os.path.join(output_dir, "trainer_state.json"))
+                if self.lr_scheduler is not None:
+                    torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+
+            if is_dist:
+                torch.distributed.barrier()
+
+            # Save trainable-only (fusion) optimizer state per rank (tiny; avoids saving 7B frozen model)
+            if self.optimizer is not None:
+                os.makedirs(output_dir, exist_ok=True)
+                try:
+                    opt_state = self.optimizer.state_dict()
+                    torch.save(opt_state, os.path.join(output_dir, f"fusion_optimizer_rank{rank}.pt"))
+                except Exception as exc:
+                    logger.warning(f"[Checkpoint] Failed to save fusion optimizer state on rank {rank}: {exc}")
+
+            if is_dist:
+                torch.distributed.barrier()
+
+            if getattr(self.args, "local_rank", -1) in [0, -1]:
+                self._rotate_checkpoints(use_mtime=False, output_dir=run_dir)
+                _maybe_async_upload_checkpoint_to_gdrive(output_dir, run_dir)
         else:
             try:
                 super()._save_checkpoint(model, trial, metrics=metrics)
@@ -348,3 +410,66 @@ class LLaVATrainer(Trainer):
                 super()._save(output_dir, state_dict=state_dict)
             except TypeError:
                 super()._save(output_dir)
+
+    def _load_optimizer_and_scheduler(self, checkpoint):
+        if checkpoint is None:
+            return
+        if getattr(self.args, 'tune_mm_mlp_adapter', False):
+            scheduler_file = os.path.join(checkpoint, "scheduler.pt")
+            if os.path.isfile(scheduler_file) and self.lr_scheduler is not None:
+                sched_state = torch.load(scheduler_file, map_location="cpu")
+                self.lr_scheduler.load_state_dict(sched_state)
+                logger.info(f"[Resume] Loaded lr_scheduler state from {scheduler_file}")
+            elif self.lr_scheduler is not None:
+                # Legacy checkpoint without scheduler.pt (e.g. checkpoint-4750):
+                # fast-forward lr_scheduler to trainer_state.json's global_step so cosine LR
+                # continues smoothly instead of restarting warmup from step 0.
+                resume_step = 0
+                ts_file = os.path.join(checkpoint, "trainer_state.json")
+                if os.path.isfile(ts_file):
+                    try:
+                        import json as _json
+                        with open(ts_file, "r", encoding="utf-8") as _f:
+                            resume_step = int(_json.load(_f).get("global_step", 0))
+                    except Exception as exc:
+                        logger.warning(f"[Resume] Failed to parse {ts_file}: {exc}")
+                if resume_step > 0:
+                    for _ in range(resume_step):
+                        self.lr_scheduler.step()
+                    cur_lr = self.lr_scheduler.get_last_lr() if hasattr(self.lr_scheduler, "get_last_lr") else None
+                    logger.info(f"[Resume] Fast-forwarded lr_scheduler by {resume_step} steps (no scheduler.pt); lr={cur_lr}")
+                else:
+                    logger.warning(f"[Resume] No scheduler.pt found at {checkpoint}; lr_scheduler will start from step 0")
+
+            if self.optimizer is not None:
+                is_dist = torch.distributed.is_available() and torch.distributed.is_initialized()
+                world_size = torch.distributed.get_world_size() if is_dist else 1
+                rank = torch.distributed.get_rank() if is_dist else 0
+                if hasattr(self.optimizer, "dp_world_size"):
+                    rank_files = [os.path.join(checkpoint, f"fusion_optimizer_rank{r}.pt") for r in range(world_size)]
+                    if all(os.path.isfile(f) for f in rank_files):
+                        state_list = [torch.load(f, map_location="cpu") for f in rank_files]
+                        self.optimizer.load_state_dict(state_list, load_optimizer_states=True)
+                        logger.info(f"[Resume] Loaded ZeRO-3 fusion optimizer states from {checkpoint} ({world_size} ranks)")
+                    else:
+                        logger.warning(f"[Resume] Missing fusion_optimizer_rank*.pt at {checkpoint}; skipping optimizer state")
+                else:
+                    opt_file = os.path.join(checkpoint, f"fusion_optimizer_rank{rank}.pt")
+                    if os.path.isfile(opt_file):
+                        self.optimizer.load_state_dict(torch.load(opt_file, map_location="cpu"))
+                        logger.info(f"[Resume] Loaded fusion optimizer state from {opt_file}")
+                    else:
+                        logger.warning(f"[Resume] Missing {opt_file}; skipping optimizer state")
+            return
+        return super()._load_optimizer_and_scheduler(checkpoint)
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        if resume_from_checkpoint is None:
+            return
+        if getattr(self.args, 'tune_mm_mlp_adapter', False):
+            logger.info(f"Adapter-only checkpoint: skipping full-model weight loading from {resume_from_checkpoint}")
+            return
+        try:
+            return super()._load_from_checkpoint(resume_from_checkpoint, model=model)
+        except TypeError:
+            return super()._load_from_checkpoint(resume_from_checkpoint)

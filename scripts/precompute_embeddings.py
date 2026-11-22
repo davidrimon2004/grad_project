@@ -161,6 +161,29 @@ def _safe_read_json(path: Path) -> Dict[str, Any]:
         return {}
 
 
+def _atomic_write_json(path: Path, data: Any) -> None:
+    """Atomically writes compact JSON via temp file + os.replace to prevent index corruption."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+    os.replace(str(tmp), str(path))
+
+
+def _expand2square(pil_img, background_color):
+    from PIL import Image as PILImage
+    width, height = pil_img.size
+    if width == height:
+        return pil_img
+    elif width > height:
+        result = PILImage.new(pil_img.mode, (width, width), background_color)
+        result.paste(pil_img, (0, (width - height) // 2))
+        return result
+    else:
+        result = PILImage.new(pil_img.mode, (height, height), background_color)
+        result.paste(pil_img, ((height - width) // 2, 0))
+        return result
+
+
 def load_json_cached(jp: Path, cache_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
     """
     Safely loads a JSON dataset file. If the file resides on Google Drive FUSE,
@@ -181,6 +204,8 @@ def load_json_cached(jp: Path, cache_dir: Optional[Path] = None) -> List[Dict[st
 
     if not is_network_fs:
         with open(str(jp), "r", encoding="utf-8") as f:
+            if p_str.endswith(".jsonl"):
+                return [json.loads(line) for line in f if line.strip()]
             return json.load(f)
 
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -272,14 +297,14 @@ def _open_or_create_hdf5(path: Path, n_samples: int, feat_shape: Tuple[int, ...]
 
 def _open_or_create_text_hdf5(
     path: Path,
-    vocab_weight: np.ndarray,
+    vocab_weight: Optional[np.ndarray],
     hidden_size: int,
     save_raw_embeds: bool = False,
 ):
     """
     Opens an existing text HDF5 file or creates a compact/extensible one.
     When save_raw_embeds=False (default), stores pre-tokenized token_ids and labels
-    (~500 MB total for 1.26M samples) without the redundant 1 TB float16 expansion.
+    (~300-500 MB total) without loading the 7B model or expanding 4096-dim floats.
     Returns (h5_file, dset_embeds, dset_tokens, dset_labels, dset_offsets, written_samples, total_tokens).
     """
     try:
@@ -309,13 +334,14 @@ def _open_or_create_text_hdf5(
     path.parent.mkdir(parents=True, exist_ok=True)
     h5 = h5py.File(str(path), "w")
 
-    # Store full vocabulary embedding table once for reference (260 MB)
-    h5.create_dataset(
-        "vocab_embeddings",
-        data=vocab_weight.astype(np.float16),
-        dtype=np.float16,
-        compression="lzf",
-    )
+    if vocab_weight is not None:
+        # Store full vocabulary embedding table once for reference (~260 MB)
+        h5.create_dataset(
+            "vocab_embeddings",
+            data=vocab_weight.astype(np.float16),
+            dtype=np.float16,
+            compression="lzf",
+        )
 
     dset_embeds = None
     if save_raw_embeds:
@@ -575,9 +601,12 @@ def load_text_embedder(
     model_name_or_path: str,
     device: torch.device,
     dtype: torch.dtype,
+    save_raw_embeds: bool = False,
 ):
     """
-    Loads tokenizer and Vicuna embed_tokens layer with low-memory CPU extraction.
+    Loads tokenizer (and Vicuna embed_tokens only when save_raw_embeds=True).
+    In default compact mode (save_raw_embeds=False), avoids loading the 13.5 GB
+    7B LLM checkpoint completely — runs purely on CPU in ~1 second.
     """
     log(f"Loading tokenizer: {model_name_or_path}")
     tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -587,6 +616,10 @@ def load_text_embedder(
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.unk_token
+
+    if not save_raw_embeds:
+        log_ok("Compact text mode: skipping 7B model load (tokenizer-only, 0 GB VRAM).")
+        return tokenizer, None, None, 4096
 
     log(f"Extracting embed_tokens from: {model_name_or_path}")
     from transformers import AutoModelForCausalLM
@@ -624,6 +657,50 @@ def load_text_embedder(
     return tokenizer, embed_tokens, vocab_weight, hidden_size
 
 
+class _ImagePreprocessDataset(torch.utils.data.Dataset):
+    """Multi-worker CPU image loader + CLIP/LanguageBind preprocessor."""
+
+    def __init__(
+        self,
+        rel_paths: List[str],
+        image_folder: Path,
+        processor,
+        img_pv_shape: Tuple[int, ...],
+        strip_prefix: Optional[str] = None,
+        aspect_ratio: str = "square",
+    ):
+        self.rel_paths = rel_paths
+        self.image_folder = image_folder
+        self.processor = processor
+        self.img_pv_shape = img_pv_shape
+        self.strip_prefix = strip_prefix
+        self.aspect_ratio = aspect_ratio
+        self.bg_color = tuple(int(x * 255) for x in getattr(processor, "image_mean", [0.48145466, 0.4578275, 0.40821073]))
+
+    def __len__(self) -> int:
+        return len(self.rel_paths)
+
+    def __getitem__(self, idx: int):
+        from PIL import Image as PILImage
+        rel_path = self.rel_paths[idx]
+        actual_rel = (
+            rel_path[len(self.strip_prefix):]
+            if self.strip_prefix and rel_path.startswith(self.strip_prefix)
+            else rel_path
+        )
+        full = self.image_folder / actual_rel
+        try:
+            img = PILImage.open(str(full)).convert("RGB")
+            if self.aspect_ratio == "pad":
+                img = _expand2square(img, self.bg_color)
+            pv = self.processor.preprocess(img, return_tensors="pt")["pixel_values"][0]
+            if tuple(pv.shape) != self.img_pv_shape:
+                return torch.zeros(self.img_pv_shape, dtype=torch.float32), rel_path, False
+            return pv.to(torch.float32), rel_path, True
+        except Exception:
+            return torch.zeros(self.img_pv_shape, dtype=torch.float32), rel_path, False
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Image embedding
 # ──────────────────────────────────────────────────────────────────────────────
@@ -641,20 +718,23 @@ def embed_images(
     projector: Optional[torch.nn.Module] = None,
     staging_dir: Optional[Path] = None,
     sync_interval_mins: float = 15.0,
-    images_per_shard: int = 2000,
+    images_per_shard: int = 20000,
     enable_sharding: bool = True,
     strip_prefix: Optional[str] = None,
     probe_path: Optional[Path] = None,
+    image_aspect_ratio: str = "square",
+    num_workers: int = 8,
+    multi_gpu: bool = False,
 ):
     """
     Encodes images through LanguageBind (and optional mm_projector) to HDF5.
-    When enable_sharding=True (default), writes into 5 GB shards (default 2,000 images/shard)
-    so Google Drive uploads and clears each shard from Colab SSD cache without overflow.
+    Uses a multi-worker DataLoader for parallel JPEG decoding + optional DataParallel
+    across all visible GPUs. Writes atomic JSON indices and resumable HDF5 shards.
     """
     from PIL import Image as PILImage
 
     n_total = len(file_list)
-    log_header(f"Embedding {n_total:,} images  ->  {h5_path.parent}")
+    log_header(f"Embedding {n_total:,} images  ->  {h5_path.parent} (aspect={image_aspect_ratio}, workers={num_workers})")
 
     # Probe feature shape
     if probe_path is None:
@@ -667,6 +747,9 @@ def embed_images(
 
     log_ok(f"Probing image feature shape using: {probe_path}")
     probe_img = PILImage.open(str(probe_path)).convert("RGB")
+    if image_aspect_ratio == "pad":
+        bg = tuple(int(x * 255) for x in getattr(processor, "image_mean", [0.48145466, 0.4578275, 0.40821073]))
+        probe_img = _expand2square(probe_img, bg)
     probe_tensor = processor.preprocess(probe_img, return_tensors="pt")["pixel_values"]
     img_pv_shape = tuple(probe_tensor[0].shape)
     with torch.no_grad():
@@ -676,6 +759,13 @@ def embed_images(
     feat_shape = tuple(probe_feat.shape[1:])
     log(f"  Feature shape per image: {feat_shape} (projected={projector is not None})")
     del probe_feat, probe_tensor
+
+    # Optional multi-GPU DataParallel acceleration
+    run_tower = tower
+    if multi_gpu and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        n_gpus = torch.cuda.device_count()
+        log_ok(f"Enabling DataParallel across {n_gpus} GPUs for image tower!")
+        run_tower = torch.nn.DataParallel(tower)
 
     index: Dict[str, Any] = _safe_read_json(index_path)
 
@@ -688,8 +778,27 @@ def embed_images(
         log_ok(f"All {n_total:,} images are already embedded!")
         return
 
+    ds = _ImagePreprocessDataset(
+        rel_paths=pending_files,
+        image_folder=image_folder,
+        processor=processor,
+        img_pv_shape=img_pv_shape,
+        strip_prefix=strip_prefix,
+        aspect_ratio=image_aspect_ratio,
+    )
+    loader = torch.utils.data.DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        prefetch_factor=4 if num_workers > 0 else None,
+        persistent_workers=(num_workers > 0),
+    )
+
     t0 = time.time()
     h5 = None
+    skipped_count = 0
 
     if enable_sharding:
         current_shard_idx = len(index) // images_per_shard
@@ -704,55 +813,45 @@ def embed_images(
             h5, dset, written_in_shard = _open_or_create_hdf5(shard_path, images_per_shard, feat_shape)
 
         try:
-            for batch_start in range(0, len(pending_files), batch_size):
-                batch_files = pending_files[batch_start : batch_start + batch_size]
-                tensors: List[torch.Tensor] = []
-                valid_files: List[str] = []
-
-                for rel_path in batch_files:
-                    actual_rel = rel_path[len(strip_prefix):] if strip_prefix and rel_path.startswith(strip_prefix) else rel_path
-                    full = image_folder / actual_rel
-                    try:
-                        img = PILImage.open(str(full)).convert("RGB")
-                        pv = processor.preprocess(img, return_tensors="pt")["pixel_values"][0]
-                        if tuple(pv.shape) != img_pv_shape:
-                            pv = torch.zeros(img_pv_shape, dtype=dtype)
-                        tensors.append(pv)
-                    except Exception as exc:
-                        log_warn(f"  Skipping {rel_path}: {exc}")
-                        tensors.append(torch.zeros(img_pv_shape, dtype=dtype))
-                    valid_files.append(rel_path)
-
-                batch_tensor = torch.stack(tensors).to(device=device, dtype=dtype)
+            for batch_idx, (batch_pv, batch_rel_paths, batch_ok) in enumerate(loader):
+                skipped_count += int((~batch_ok).sum().item())
+                batch_tensor = batch_pv.to(device=device, dtype=dtype, non_blocking=True)
                 with torch.no_grad():
-                    feats = tower(batch_tensor)
+                    feats = run_tower(batch_tensor)
                     if projector is not None:
                         feats = projector(feats.to(next(projector.parameters()).dtype))
 
                 feats_np = feats.cpu().to(torch.float16).numpy().astype(np.float16)
 
-                for k, rel_path in enumerate(valid_files):
+                # Write contiguous chunks into HDF5 for much higher HDD throughput
+                pos = 0
+                bsz = len(batch_rel_paths)
+                while pos < bsz:
                     if written_in_shard >= images_per_shard:
                         h5.attrs["written"] = written_in_shard
                         h5.flush()
                         h5.close()
                         log_ok(f"  [Shard {current_shard_idx:04d}] Full ({written_in_shard:,} images) -> {shard_filename}")
-                        index_path.write_text(json.dumps(index, separators=(",", ":")))
+                        _atomic_write_json(index_path, index)
 
                         current_shard_idx += 1
                         shard_filename = f"{h5_path.stem}_shard_{current_shard_idx:04d}.h5"
                         shard_path = h5_path.parent / shard_filename
                         h5, dset, written_in_shard = _open_or_create_hdf5(shard_path, images_per_shard, feat_shape)
 
-                    dset[written_in_shard] = feats_np[k]
-                    index[rel_path] = {"shard": shard_filename, "idx": written_in_shard}
-                    written_in_shard += 1
+                    space_left = images_per_shard - written_in_shard
+                    take = min(space_left, bsz - pos)
+                    dset[written_in_shard : written_in_shard + take] = feats_np[pos : pos + take]
+                    for j in range(take):
+                        index[batch_rel_paths[pos + j]] = {"shard": shard_filename, "idx": written_in_shard + j}
+                    written_in_shard += take
+                    pos += take
 
                 h5.attrs["written"] = written_in_shard
 
-                if (batch_start // batch_size) % 50 == 49:
+                if batch_idx % 50 == 49:
                     h5.flush()
-                    index_path.write_text(json.dumps(index, separators=(",", ":")))
+                    _atomic_write_json(index_path, index)
 
                 elapsed = time.time() - t0
                 cur_total = len(index)
@@ -761,7 +860,8 @@ def embed_images(
                 eta_s = (n_total - cur_total) / rate if rate > 0 else float("inf")
                 print(
                     f"\r  [{cur_total:>7,}/{n_total:,}] {pct:5.1f}% | "
-                    f"{rate:6.0f} img/s | shard {current_shard_idx:04d} ({written_in_shard}/{images_per_shard}) | ETA {eta_s/3600:.1f}h",
+                    f"{rate:6.0f} img/s | shard {current_shard_idx:04d} ({written_in_shard}/{images_per_shard}) | "
+                    f"skip {skipped_count} | ETA {eta_s/3600:.2f}h",
                     end="", flush=True,
                 )
         finally:
@@ -772,51 +872,48 @@ def embed_images(
                     h5.close()
                 except Exception:
                     pass
-            index_path.write_text(json.dumps(index, separators=(",", ":")))
+            _atomic_write_json(index_path, index)
             print()
     else:
-        # Legacy single-file mode
+        # Single-file mode
         work_h5, work_index, target_h5, target_index = _prepare_staged_paths(
             h5_path, index_path, staging_dir
         )
         h5, dset, written = _open_or_create_hdf5(work_h5, n_total, feat_shape)
         try:
-            for batch_start in range(written, n_total, batch_size):
-                batch_files = file_list[batch_start : batch_start + batch_size]
-                tensors = []
-                valid_files = []
-                for rel_path in batch_files:
-                    actual_rel = rel_path[len(strip_prefix):] if strip_prefix and rel_path.startswith(strip_prefix) else rel_path
-                    full = image_folder / actual_rel
-                    try:
-                        img = PILImage.open(str(full)).convert("RGB")
-                        pv = processor.preprocess(img, return_tensors="pt")["pixel_values"][0]
-                        if tuple(pv.shape) != img_pv_shape:
-                            pv = torch.zeros(img_pv_shape, dtype=dtype)
-                        tensors.append(pv)
-                    except Exception:
-                        tensors.append(torch.zeros(img_pv_shape, dtype=dtype))
-                    valid_files.append(rel_path)
-                batch_tensor = torch.stack(tensors).to(device=device, dtype=dtype)
+            for batch_idx, (batch_pv, batch_rel_paths, batch_ok) in enumerate(loader):
+                skipped_count += int((~batch_ok).sum().item())
+                batch_tensor = batch_pv.to(device=device, dtype=dtype, non_blocking=True)
                 with torch.no_grad():
-                    feats = tower(batch_tensor)
+                    feats = run_tower(batch_tensor)
                     if projector is not None:
                         feats = projector(feats.to(next(projector.parameters()).dtype))
                 feats_np = feats.cpu().to(torch.float16).numpy().astype(np.float16)
-                end_row = batch_start + len(valid_files)
-                dset[batch_start:end_row] = feats_np
-                for k, rel_path in enumerate(valid_files):
-                    index[rel_path] = batch_start + k
+                end_row = written + len(batch_rel_paths)
+                dset[written:end_row] = feats_np
+                for k, rel_path in enumerate(batch_rel_paths):
+                    index[rel_path] = written + k
                 written = end_row
                 h5.attrs["written"] = written
+                if batch_idx % 50 == 49:
+                    h5.flush()
+                    _atomic_write_json(work_index, index)
+                elapsed = time.time() - t0
+                pct = written / n_total * 100
+                rate = (written - already_done) / elapsed if elapsed > 1 else 0
+                eta_s = (n_total - written) / rate if rate > 0 else float("inf")
+                print(
+                    f"\r  [{written:>7,}/{n_total:,}] {pct:5.1f}% | {rate:6.0f} img/s | skip {skipped_count} | ETA {eta_s/3600:.2f}h",
+                    end="", flush=True,
+                )
         finally:
             h5.flush()
             h5.close()
-            work_index.write_text(json.dumps(index, separators=(",", ":")))
+            _atomic_write_json(work_index, index)
             print()
 
     elapsed = time.time() - t0
-    log_ok(f"Done {len(index):,} images in {elapsed/3600:.2f}h  ->  {index_path}")
+    log_ok(f"Done {len(index):,} images (skipped={skipped_count}) in {elapsed/3600:.2f}h  ->  {index_path}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1089,7 +1186,7 @@ def embed_text(
     json_paths: List[Path],
     tokenizer: transformers.PreTrainedTokenizer,
     embed_tokens_layer: Optional[torch.nn.Module],
-    vocab_weight: np.ndarray,
+    vocab_weight: Optional[np.ndarray],
     hidden_size: int,
     h5_path: Path,
     index_path: Path,
@@ -1099,11 +1196,12 @@ def embed_text(
     staging_dir: Optional[Path] = None,
     sync_interval_mins: float = 15.0,
     save_raw_embeds: bool = False,
+    image_only: bool = False,
 ):
     """
     Precomputes pre-tokenized token_ids, labels, and offsets into an HDF5 file.
-    By default, saves in compact mode (~500 MB for 1.26M samples) without the
-    redundant 1 TB float16 expansion, enabling fast tokenization without filling SSD cache.
+    By default, saves in compact mode (~300 MB for 558k samples) without the
+    redundant 1 TB float16 expansion, enabling fast tokenization without GPU VRAM.
     """
     # Load all items across JSONs
     all_samples: List[Dict[str, Any]] = []
@@ -1113,6 +1211,8 @@ def embed_text(
             continue
         try:
             data = load_json_cached(jp, staging_dir)
+            if image_only:
+                data = [s for s in data if "video" not in s]
             all_samples.extend(data)
         except Exception as exc:
             log_warn(f"Failed to parse {jp}: {exc}")
@@ -1215,8 +1315,11 @@ def embed_text(
                     "media_type": meta["media_type"],
                     "media_path": meta["media_path"],
                 }
+                if isinstance(meta["media_path"], str):
+                    index[meta["media_path"]] = index_entry
                 index[str(meta["id"])] = index_entry
-                index[str(meta["idx"])] = index_entry
+                if str(meta["idx"]) not in index:
+                    index[str(meta["idx"])] = index_entry
                 cur_offset += length
 
             cur_offsets_len = dset_offsets.shape[0]
@@ -1232,7 +1335,7 @@ def embed_text(
             # Flush periodically to local disk
             if (batch_start // batch_size) % 50 == 49:
                 h5.flush()
-                work_index.write_text(json.dumps(index, separators=(",", ":")))
+                _atomic_write_json(work_index, index)
                 if target_h5 is not None and (time.time() - last_sync >= sync_interval_sec):
                     _sync_staged_files(work_h5, work_index, target_h5, target_index)
                     last_sync = time.time()
@@ -1244,13 +1347,13 @@ def embed_text(
             eta_s = (n_samples - written) / rate_samp if rate_samp > 0 else float("inf")
             print(
                 f"\r  [{written:>7,}/{n_samples:,}] {pct:5.1f}% | "
-                f"{rate_samp:5.0f} samp/s | {rate_tok:7.0f} tok/s | ETA {eta_s/3600:.1f}h",
+                f"{rate_samp:5.0f} samp/s | {rate_tok:7.0f} tok/s | ETA {eta_s/3600:.2f}h",
                 end="", flush=True,
             )
     finally:
         h5.flush()
         h5.close()
-        work_index.write_text(json.dumps(index, separators=(",", ":")))
+        _atomic_write_json(work_index, index)
         if target_h5 is not None:
             _sync_staged_files(work_h5, work_index, target_h5, target_index)
         print()
@@ -1582,8 +1685,8 @@ def main():
     parser.add_argument(
         "--images_per_shard",
         type=int,
-        default=2000,
-        help="Images per HDF5 shard (default: 2000, ~4.2 GB uncompressed). Prevents Colab SSD cache overflow.",
+        default=20000,
+        help="Images per HDF5 shard (default: 20000, ~10 GB uncompressed / ~8 GB LZF for [256, 1024] fp16).",
     )
     parser.add_argument(
         "--videos_per_shard",
@@ -1599,7 +1702,41 @@ def main():
     parser.add_argument(
         "--save_raw_text_embeddings",
         action="store_true",
-        help="Save raw 4096-dim float16 embeddings (~1 TB). Default is False (compact pre-tokenized token_ids & labels ~500 MB).",
+        help="Save raw 4096-dim float16 embeddings (~1 TB). Default is False (compact pre-tokenized token_ids & labels ~300 MB).",
+    )
+    parser.add_argument(
+        "--image_only",
+        action="store_true",
+        help="Skip all video datasets (e.g. valley_.json) and video samples.",
+    )
+    parser.add_argument(
+        "--image_aspect_ratio",
+        choices=["square", "pad"],
+        default="square",
+        help="Image preprocessing aspect ratio matching training (default: square for pretrain, pad for finetune/eval).",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=8,
+        help="Number of CPU DataLoader workers for parallel JPEG decoding (default: 8).",
+    )
+    parser.add_argument(
+        "--multi_gpu",
+        action="store_true",
+        help="Use DataParallel across all visible CUDA GPUs for faster visual embedding extraction.",
+    )
+    parser.add_argument(
+        "--json_path",
+        type=str,
+        default=None,
+        help="Optional explicit JSON or JSONL annotation file (overrides auto-discovery; useful for custom/eval splits).",
+    )
+    parser.add_argument(
+        "--custom_split_name",
+        type=str,
+        default=None,
+        help="Output filename prefix when using --json_path (e.g. 'sqa_eval' -> sqa_eval_images_shard_0000.h5).",
     )
     args = parser.parse_args()
 
@@ -1652,39 +1789,41 @@ def main():
     splits_to_run = ["pretrain", "finetune"] if args.split == "all" else [args.split]
 
     run_images = args.action in ["images", "visual", "all"]
-    run_videos = args.action in ["videos", "visual", "all"]
+    run_videos = (args.action in ["videos", "visual", "all"]) and (not args.image_only)
     run_text = args.action in ["text", "all"]
 
     log_header(f"Resolving Dataset Paths under {base}")
     cfg = {}
-    if "pretrain" in splits_to_run:
-        pretrain_jsons = resolve_json_paths(
-            base,
-            [
-                ["llava_image_.json", "llava_image.json"],
-                ["valley_.json", "valley.json"],
-            ],
-        )
-        cfg["pretrain"] = {
-            "jsons": pretrain_jsons,
+    if args.json_path:
+        custom_name = args.custom_split_name or (splits_to_run[0] if len(splits_to_run) == 1 else "custom")
+        splits_to_run = [custom_name]
+        cfg[custom_name] = {
+            "jsons": [Path(args.json_path)],
             "image_folder_name": "llava_image",
             "video_folder_name": "valley",
         }
+    else:
+        if "pretrain" in splits_to_run:
+            pretrain_groups = [["llava_image_.json", "llava_image.json"]]
+            if not args.image_only:
+                pretrain_groups.append(["valley_.json", "valley.json"])
+            pretrain_jsons = resolve_json_paths(base, pretrain_groups)
+            cfg["pretrain"] = {
+                "jsons": pretrain_jsons,
+                "image_folder_name": "llava_image",
+                "video_folder_name": "valley",
+            }
 
-    if "finetune" in splits_to_run:
-        finetune_jsons = resolve_json_paths(
-            base,
-            [
-                ["llava_image_tune_.json", "llava_image_tune.json"],
-                ["videochatgpt_tune_.json", "videochatgpt_.json", "videochatgpt_tune.json"],
-                ["nlp_tune.json"],
-            ],
-        )
-        cfg["finetune"] = {
-            "jsons": finetune_jsons,
-            "image_folder_name": "llava_image_tune",
-            "video_folder_name": "videochatgpt_tune",
-        }
+        if "finetune" in splits_to_run:
+            finetune_groups = [["llava_image_tune_.json", "llava_image_tune.json"], ["nlp_tune.json"]]
+            if not args.image_only:
+                finetune_groups.insert(1, ["videochatgpt_tune_.json", "videochatgpt_.json", "videochatgpt_tune.json"])
+            finetune_jsons = resolve_json_paths(base, finetune_groups)
+            cfg["finetune"] = {
+                "jsons": finetune_jsons,
+                "image_folder_name": "llava_image_tune",
+                "video_folder_name": "videochatgpt_tune",
+            }
 
     # -- lazy model loading --------------------------------------------------
     image_tower = image_proc = None
@@ -1713,6 +1852,7 @@ def main():
             args.model_name_or_path,
             device=device,
             dtype=dtype,
+            save_raw_embeds=args.save_raw_text_embeddings,
         )
 
     # -- per-split embedding --------------------------------------------------
@@ -1764,6 +1904,9 @@ def main():
                         enable_sharding=not args.no_sharding,
                         strip_prefix=img_strip_prefix,
                         probe_path=img_probe,
+                        image_aspect_ratio=args.image_aspect_ratio,
+                        num_workers=args.num_workers,
+                        multi_gpu=args.multi_gpu,
                     )
 
         # 2. Videos
@@ -1824,23 +1967,28 @@ def main():
                 staging_dir=staging_dir,
                 sync_interval_mins=args.sync_interval_mins,
                 save_raw_embeds=args.save_raw_text_embeddings,
+                image_only=args.image_only,
             )
 
     # -- write meta -----------------------------------------------------------
     meta = {
         "image_tower": args.image_tower,
-        "video_tower": args.video_tower,
+        "video_tower": None if args.image_only else args.video_tower,
         "model_name_or_path": args.model_name_or_path,
         "project_visual": args.project_visual,
         "visual_dim": 4096 if args.project_visual else 1024,
+        "mm_vision_select_layer": -2,
+        "mm_vision_select_feature": "patch",
+        "image_aspect_ratio": args.image_aspect_ratio,
+        "image_only": args.image_only,
+        "images_per_shard": args.images_per_shard,
         "text_hidden_size": hidden_size,
         "storage_dtype": "float16",
         "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "note": (
-            "Visual features are in {split}_images.h5 and {split}_videos.h5. "
-            "Textual features and embeddings are in {split}_text.h5. "
-            "Pass --embed_cache_dir <dir> during training to bypass frozen encoders "
-            "and embedding lookups."
+            "Visual features are in {split}_images_shard_*.h5 (pre-projector [256, 1024] fp16). "
+            "Pre-tokenized conversations are in {split}_text.h5. "
+            "Pass --embed_cache_dir <dir> (or EMBED_CACHE_DIR=<dir>) during training."
         ),
     }
     meta_json_str = json.dumps(meta, indent=2)

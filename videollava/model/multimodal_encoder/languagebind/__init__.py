@@ -46,6 +46,7 @@ def sanitize_position_ids(vision_model):
             pos_ids.device != dev or
             pos_ids.shape[-1] != num_pos or
             pos_ids.dtype != torch.long or
+            pos_ids.numel() == 0 or
             pos_ids.max() >= num_pos or
             pos_ids.min() < 0):
             embeddings.position_ids = torch.arange(num_pos, device=dev).unsqueeze(0)

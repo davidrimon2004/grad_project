@@ -18,8 +18,20 @@ try:
 except Exception:
     pass
 
+def _import_video_transforms():
+    # torchvision 0.16 still only ships these classes in the private,
+    # deprecated _transforms_video module.  Import them quietly so the
+    # deprecation notice does not pollute every run.
+    import warnings as _warnings
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore")
+        from torchvision.transforms._transforms_video import (
+            NormalizeVideo, RandomCropVideo, RandomHorizontalFlipVideo, CenterCropVideo,
+        )
+    return NormalizeVideo, RandomCropVideo, RandomHorizontalFlipVideo, CenterCropVideo
+
 try:
-    from torchvision.transforms._transforms_video import NormalizeVideo, RandomCropVideo, RandomHorizontalFlipVideo, CenterCropVideo
+    NormalizeVideo, RandomCropVideo, RandomHorizontalFlipVideo, CenterCropVideo = _import_video_transforms()
 except Exception:
     from torchvision.transforms import NormalizeVideo, RandomCropVideo, RandomHorizontalFlipVideo, CenterCropVideo
 
