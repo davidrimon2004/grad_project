@@ -274,8 +274,18 @@ class LlavaMetaForCausalLM(ABC):
         kv_ln_layer  = self.get_early_fusion_kv_ln()
         gate_linear  = self.get_early_fusion_gate_linear()
 
-        # Target dtype (bf16 preferred on Ada Lovelace; fp16 fallback; else input dtype)
-        if getattr(self.config, 'bf16', False):
+        if (
+            not torch.is_grad_enabled()
+            and gate_linear.weight.detach().abs().max().item() == 0.0
+            and (gate_linear.bias is None or gate_linear.bias.detach().abs().max().item() == 0.0)
+        ):
+            return text_embeds
+
+        # Match incoming text_embeds dtype during eval (e.g. fp16 / 4-bit fp16) while
+        # preserving bf16/fp16 training config when text_embeds isn't floating point.
+        if text_embeds.dtype.is_floating_point:
+            target_dtype = text_embeds.dtype
+        elif getattr(self.config, 'bf16', False):
             target_dtype = torch.bfloat16
         elif getattr(self.config, 'fp16', False):
             target_dtype = torch.float16
@@ -405,7 +415,12 @@ class LlavaMetaForCausalLM(ABC):
         )
         if (not has_vision) or images is None or input_ids.shape[1] == 1:
             if past_key_values is not None and has_vision and images is not None and input_ids.shape[1] == 1:
-                target_shape = past_key_values[-1][-1].shape[-2] + 1
+                past_len = (
+                    past_key_values.get_seq_length()
+                    if hasattr(past_key_values, 'get_seq_length')
+                    else past_key_values[-1][-1].shape[-2]
+                )
+                target_shape = past_len + 1
                 attention_mask = torch.cat((attention_mask, torch.ones(
                     (attention_mask.shape[0], target_shape - attention_mask.shape[1]),
                     dtype=attention_mask.dtype,
@@ -613,7 +628,12 @@ class LlavaMetaForCausalLM(ABC):
                     position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
 
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
-        target_dtype = torch.bfloat16 if getattr(self.config, 'bf16', False) else torch.float16
+        embed_dtype = self.get_model().embed_tokens.weight.dtype
+        target_dtype = (
+            embed_dtype
+            if embed_dtype.is_floating_point
+            else (torch.bfloat16 if getattr(self.config, 'bf16', False) else torch.float16)
+        )
         if new_input_embeds.dtype != target_dtype:
             new_input_embeds = new_input_embeds.to(target_dtype)
 

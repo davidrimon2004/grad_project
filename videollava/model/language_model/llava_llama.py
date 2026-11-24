@@ -66,6 +66,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         output_hidden_states: Optional[bool] = None,
         images: Optional[torch.FloatTensor] = None,
         return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         if inputs_embeds is None:
@@ -84,6 +85,20 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 labels,
                 images
             )
+            if 'cache_position' in kwargs and kwargs['cache_position'] is not None:
+                if inputs_embeds is not None:
+                    kwargs['cache_position'] = torch.arange(
+                        inputs_embeds.shape[1], device=inputs_embeds.device, dtype=torch.long
+                    )
+                elif past_key_values is not None and input_ids is not None and input_ids.shape[1] == 1:
+                    past_len = (
+                        past_key_values.get_seq_length()
+                        if hasattr(past_key_values, 'get_seq_length')
+                        else past_key_values[-1][-1].shape[-2]
+                    )
+                    kwargs['cache_position'] = torch.tensor(
+                        [past_len], device=input_ids.device, dtype=torch.long
+                    )
 
         return super().forward(
             input_ids=input_ids,
@@ -95,7 +110,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict
+            return_dict=return_dict,
+            **kwargs,
         )
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):

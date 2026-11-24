@@ -1,4 +1,5 @@
 import os
+import warnings
 from .clip_encoder import CLIPVisionTower
 from .languagebind import LanguageBindImageTower, LanguageBindVideoTower
 
@@ -13,6 +14,11 @@ def build_image_tower(image_tower_cfg, **kwargs):
     # CLIPVisionTower builds a default ViT-B (hidden 768) and then fails to
     # load the real ViT-L (hidden 1024) weights.
     if image_tower.endswith('LanguageBind_Image'):
+        if not os.path.exists(image_tower) and image_tower != 'LanguageBind/LanguageBind_Image':
+            warnings.warn(
+                f"Local image_tower path '{image_tower}' not found; falling back to 'LanguageBind/LanguageBind_Image'."
+            )
+            image_tower = 'LanguageBind/LanguageBind_Image'
         return LanguageBindImageTower(image_tower, args=image_tower_cfg, cache_dir='./cache_dir', **kwargs)
     is_absolute_path_exists = os.path.exists(image_tower)
     if is_absolute_path_exists or image_tower.startswith("openai") or image_tower.startswith("laion"):
@@ -25,6 +31,11 @@ def build_video_tower(video_tower_cfg, **kwargs):
     if video_tower is None:
         return None
     if video_tower.endswith('LanguageBind_Video_merge'):
+        if not os.path.exists(video_tower) and video_tower != 'LanguageBind/LanguageBind_Video_merge':
+            warnings.warn(
+                f"Local video_tower path '{video_tower}' not found; falling back to 'LanguageBind/LanguageBind_Video_merge'."
+            )
+            video_tower = 'LanguageBind/LanguageBind_Video_merge'
         return LanguageBindVideoTower(video_tower, args=video_tower_cfg, cache_dir='./cache_dir', **kwargs)
     raise ValueError(f'Unknown video tower: {video_tower}')
 # ============================================================================================================
