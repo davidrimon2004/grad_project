@@ -585,6 +585,7 @@ def run_pope_eval(
                 input_ids = tokenizer_image_token(
                     prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
                 ).unsqueeze(0).to(model.device)
+                attention_mask = torch.ones_like(input_ids)
 
                 image_path = image_folder / line["image"]
                 image = Image.open(image_path).convert("RGB")
@@ -594,6 +595,8 @@ def run_pope_eval(
                 with torch.inference_mode():
                     output_ids = model.generate(
                         input_ids,
+                        attention_mask=attention_mask,
+                        pad_token_id=tokenizer.eos_token_id,
                         images=image_tensor,
                         do_sample=False,
                         num_beams=1,

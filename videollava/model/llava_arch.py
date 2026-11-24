@@ -421,11 +421,18 @@ class LlavaMetaForCausalLM(ABC):
                     else past_key_values[-1][-1].shape[-2]
                 )
                 target_shape = past_len + 1
-                attention_mask = torch.cat((attention_mask, torch.ones(
-                    (attention_mask.shape[0], target_shape - attention_mask.shape[1]),
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device
-                )), dim=1)
+                if attention_mask is None:
+                    attention_mask = torch.ones(
+                        (input_ids.shape[0], target_shape),
+                        dtype=torch.long,
+                        device=input_ids.device,
+                    )
+                elif target_shape > attention_mask.shape[1]:
+                    attention_mask = torch.cat((attention_mask, torch.ones(
+                        (attention_mask.shape[0], target_shape - attention_mask.shape[1]),
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device
+                    )), dim=1)
                 position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
