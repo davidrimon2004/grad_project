@@ -83,7 +83,7 @@ def _align_fusion_modules(model, compute_dtype, zero_gate=False):
                     gate_lin.bias.zero_()
 
 
-def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", load_video_tower=True, torch_dtype=torch.float16, load_mm_projector=True, **kwargs):
+def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", load_video_tower=True, torch_dtype=torch.float16, load_mm_projector=True, zero_early_fusion_gate=False, **kwargs):
     kwargs = {"device_map": device_map, **kwargs}
 
     if device != "cuda":
@@ -166,7 +166,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 mm_projector_weights = torch.load(mm_proj_path, map_location='cpu')
                 mm_projector_weights = {k: v.to(compute_dtype) for k, v in mm_projector_weights.items()}
                 load_res = model.load_state_dict(mm_projector_weights, strict=False)
-                _align_fusion_modules(model, compute_dtype, zero_gate=False)
+                _align_fusion_modules(model, compute_dtype, zero_gate=zero_early_fusion_gate)
 
                 proj_keys = [k for k in mm_projector_weights if 'mm_projector' in k]
                 fusion_keys = [k for k in mm_projector_weights if 'early_fusion' in k]
@@ -182,6 +182,8 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 else:
                     gate_str = "N/A"
                 print(f"Loaded adapter weights from {model_path}: {len(proj_keys)} mm_projector keys, {len(fusion_keys)} early_fusion keys, {gate_str}")
+                if zero_early_fusion_gate:
+                    print("Early-fusion gate zeroed for projector-only baseline ablation")
                 if load_res.unexpected_keys:
                     print(f"[Info] Unexpected adapter keys ignored: {load_res.unexpected_keys}")
             else:
