@@ -18,6 +18,7 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import sys
 import copy
+import math
 import random
 from collections import OrderedDict, deque
 from datetime import datetime
@@ -46,7 +47,7 @@ from videollava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_
     DEFAULT_IM_END_TOKEN, DEFAULT_VIDEO_TOKEN, DEFAULT_VID_START_TOKEN, DEFAULT_VID_END_TOKEN, MAX_IMAGE_LENGTH, \
     MAX_VIDEO_LENGTH
 from torch.utils.data import Dataset
-from videollava.train.llava_trainer import LLaVATrainer
+from videollava.train.llava_trainer import LLaVATrainer, _maybe_async_upload_checkpoint_to_gdrive
 
 from videollava import conversation as conversation_lib
 from videollava.model import *
@@ -64,21 +65,47 @@ def rank0_print(*args):
 
 
 class FusionTrainingGuardCallback(transformers.TrainerCallback):
-    """Logs 50-step avg loss/LR, stops on divergence (DIVERGE_GUARD), and supports STOP_AFTER_STEPS."""
+    """Logs 50-step avg loss/LR/gate_v2, stops on divergence (DIVERGE_GUARD), and supports STOP_AFTER_STEPS."""
 
     def __init__(self):
         self.loss_window = deque(maxlen=50)
         self.best_avg = None
         self.diverge_guard = os.environ.get("DIVERGE_GUARD", "1") != "0"
+        self.diverge_ratio_env = os.environ.get("DIVERGE_RATIO", "").strip()
         self.stop_after_steps = int(os.environ.get("STOP_AFTER_STEPS", "0") or 0)
-        self.status_file = os.environ.get(
-            "STATUS_FILE", "/home/aitech/hdd/pretrain_logs/pretrain_status.txt"
-        )
+        self.status_file = os.environ.get("STATUS_FILE", "").strip()
+
+    def _resolve_status_file(self, args) -> str:
+        if self.status_file:
+            return self.status_file
+        out_dir = getattr(args, "output_dir", ".") or "."
+        return os.path.join(out_dir, "train_status.txt")
+
+    def _write_status(self, args, msg: str) -> None:
+        try:
+            path = self._resolve_status_file(args)
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now():%c} {msg}\n")
+        except Exception:
+            pass
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         if not logs or "loss" not in logs:
             return
         loss_val = float(logs["loss"])
+        if not math.isfinite(loss_val):
+            if self.diverge_guard:
+                msg = f"NON-FINITE loss ({loss_val}) at step {state.global_step}"
+                if state.is_world_process_zero:
+                    self._write_status(args, msg)
+                    print(f"[DIVERGE_GUARD] {msg}. Saving checkpoint and stopping cleanly.", flush=True)
+                control.should_save = True
+                control.should_training_stop = True
+            return
+
         self.loss_window.append(loss_val)
         avg_loss = sum(self.loss_window) / len(self.loss_window)
         if len(self.loss_window) == 50:
@@ -87,23 +114,31 @@ class FusionTrainingGuardCallback(transformers.TrainerCallback):
         if state.is_world_process_zero and state.global_step > 0 and state.global_step % 50 == 0:
             lr = logs.get("learning_rate", float("nan"))
             best_str = f"{self.best_avg:.4f}" if self.best_avg is not None else "N/A"
+            gate_str = ""
+            if "gate_v2_w_norm" in logs:
+                gate_str = f" gate_w={logs['gate_v2_w_norm']:.4f}"
+                if "gate_v2_bias" in logs:
+                    gate_str += f" gate_b={logs['gate_v2_bias']:.4f}"
             print(
-                f"[STEP {state.global_step}] lr={lr:.3e} loss_50avg={avg_loss:.4f} best_50avg={best_str}",
+                f"[STEP {state.global_step}] lr={lr:.3e} loss_50avg={avg_loss:.4f} best_50avg={best_str}{gate_str}",
                 flush=True,
             )
+
+        if self.diverge_ratio_env:
+            diverge_ratio = float(self.diverge_ratio_env)
+        else:
+            diverge_ratio = 1.5 if getattr(args, "tune_mm_mlp_adapter", False) else 2.0
 
         if (
             self.diverge_guard
             and state.global_step > 100
             and len(self.loss_window) == 50
             and self.best_avg is not None
-            and avg_loss > 1.5 * self.best_avg
+            and avg_loss > diverge_ratio * self.best_avg
         ):
-            msg = f"DIVERGED at step {state.global_step} (avg {avg_loss:.4f}, best {self.best_avg:.4f})"
+            msg = f"DIVERGED at step {state.global_step} (avg {avg_loss:.4f}, best {self.best_avg:.4f}, ratio={diverge_ratio})"
             if state.is_world_process_zero:
-                os.makedirs(os.path.dirname(self.status_file), exist_ok=True)
-                with open(self.status_file, "a", encoding="utf-8") as f:
-                    f.write(f"{datetime.now():%c} {msg}\n")
+                self._write_status(args, msg)
                 print(f"[DIVERGE_GUARD] {msg}. Saving checkpoint and stopping cleanly.", flush=True)
             control.should_save = True
             control.should_training_stop = True
@@ -245,10 +280,13 @@ def get_peft_state_maybe_zero_3(named_params, bias):
     return to_return
 
 
-def get_peft_state_non_lora_maybe_zero_3(named_params, require_grad_only=True):
+def get_peft_state_non_lora_maybe_zero_3(named_params, require_grad_only=True, always_include=("mm_projector", "early_fusion")):
     to_return = {k: t for k, t in named_params if "lora_" not in k}
     if require_grad_only:
-        to_return = {k: t for k, t in to_return.items() if t.requires_grad}
+        to_return = {
+            k: t for k, t in to_return.items()
+            if t.requires_grad or any(kw in k for kw in always_include)
+        }
     to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
     return to_return
 
@@ -262,7 +300,10 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
-    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'early_fusion']
+    multimodal_keywords = [
+        'mm_projector', 'vision_tower', 'vision_resampler',
+        'early_fusion', 'image_tower', 'video_tower',
+    ]
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
@@ -1430,6 +1471,9 @@ def train():
             for name, param in model.get_model().named_parameters():
                 if 'early_fusion' in name:
                     param.requires_grad = True
+        elif model_args.freeze_mm_projector:
+            for p in model.get_model().mm_projector.parameters():
+                p.requires_grad = False
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:
@@ -1439,12 +1483,28 @@ def train():
                 if 'early_fusion' in name:
                     param.requires_grad = False
 
-        trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
-        trainable_count = sum(p.numel() for _, p in model.named_parameters() if p.requires_grad)
-        rank0_print(f"[INFO] Learning rate: {training_args.learning_rate}")
-        rank0_print(f"[INFO] Trainable parameter count: {trainable_count:,} ({len(trainable_names)} tensors)")
-        for _tn in trainable_names:
-            rank0_print(f"  trainable: {_tn}")
+        trainable_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        trainable_names = [n for n, _ in trainable_params]
+        trainable_count = sum(p.numel() for _, p in trainable_params)
+        lora_elems = sum(p.numel() for n, p in trainable_params if "lora_" in n)
+        proj_elems = sum(p.numel() for n, p in trainable_params if "mm_projector" in n)
+        ef_elems = sum(p.numel() for n, p in trainable_params if "early_fusion" in n)
+        rank0_print(f"[INFO] Learning rate: {training_args.learning_rate} (mm_projector_lr={training_args.mm_projector_lr})")
+        rank0_print(
+            f"[INFO] Trainable parameter count: {trainable_count:,} ({len(trainable_names)} tensors) "
+            f"[lora={lora_elems:,}, mm_projector={proj_elems:,}, early_fusion={ef_elems:,}]"
+        )
+        non_lora_trainable = [n for n in trainable_names if "lora_" not in n]
+        lora_trainable = [n for n in trainable_names if "lora_" in n]
+        for _tn in non_lora_trainable:
+            rank0_print(f"  trainable (non-lora): {_tn}")
+        if len(lora_trainable) <= 20:
+            for _tn in lora_trainable:
+                rank0_print(f"  trainable (lora): {_tn}")
+        else:
+            for _tn in lora_trainable[:4]:
+                rank0_print(f"  trainable (lora): {_tn}")
+            rank0_print(f"  ... ({len(lora_trainable) - 4} more LoRA tensors)")
 
         if training_args.bits in [4, 8]:
             # In native PyTorch FP16 AMP training, trainable parameters must have float32 master weights
@@ -1566,9 +1626,13 @@ def train():
                 if _orig_ds_load2 is not None:
                     _ds_mod.deepspeed_load_checkpoint = _orig_ds_load2
     elif valid_resume_ckpts:
-        # Full-model checkpoints with DeepSpeed state — standard resume
-        rank0_print(f"[INFO] Resuming training from checkpoint: {valid_resume_ckpts[-1]}")
-        trainer.train(resume_from_checkpoint=True)
+        # Full-model / LoRA checkpoints with DeepSpeed state — standard resume (sorted numerically by step)
+        latest_ckpt = max(
+            valid_resume_ckpts,
+            key=lambda p: int(p.name.split("-")[1]) if len(p.name.split("-")) > 1 and p.name.split("-")[1].isdigit() else 0,
+        )
+        rank0_print(f"[INFO] Resuming training from checkpoint: {latest_ckpt}")
+        trainer.train(resume_from_checkpoint=str(latest_ckpt))
     elif ckpts:
         # Checkpoint directory exists but without trainer_state.json (e.g. from previous run)
         latest_ckpt = max(ckpts, key=lambda p: int(p.name.split("-")[1]) if len(p.name.split("-")) > 1 and p.name.split("-")[1].isdigit() else 0)
@@ -1594,6 +1658,14 @@ def train():
     else:
         safe_save_model_for_hf_trainer(trainer=trainer,
                                        output_dir=training_args.output_dir)
+
+    if training_args.local_rank in [0, -1] and not getattr(training_args, "tune_mm_mlp_adapter", False):
+        _maybe_async_upload_checkpoint_to_gdrive(
+            training_args.output_dir,
+            training_args.output_dir,
+            ckpt_name="final",
+            exclude_checkpoints=True,
+        )
 
 
 if __name__ == "__main__":

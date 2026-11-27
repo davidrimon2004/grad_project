@@ -30,6 +30,8 @@ def _is_llava_checkpoint(model_path, model_name):
         return True
     if os.path.exists(os.path.join(model_path, 'mm_projector.bin')):
         return True
+    if os.path.exists(os.path.join(model_path, 'non_lora_trainables.bin')):
+        return True
     cfg_path = os.path.join(model_path, 'config.json')
     if os.path.exists(cfg_path):
         try:
@@ -106,9 +108,10 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
 
     if is_llava:
         # Load LLaVA model
-        if 'lora' in model_name.lower() and model_base is None:
-            warnings.warn('There is `lora` in model name but no `model_base` is provided. If you are loading a LoRA model, please provide the `model_base` argument. Detailed instruction: https://github.com/haotian-liu/LLaVA#launch-a-model-worker-lora-weights-unmerged.')
-        if 'lora' in model_name.lower() and model_base is not None:
+        is_lora = ('lora' in model_name.lower()) or os.path.exists(os.path.join(model_path, 'adapter_config.json'))
+        if is_lora and model_base is None:
+            warnings.warn('There is `lora` in model name (or adapter_config.json present) but no `model_base` is provided. If you are loading a LoRA model, please provide the `model_base` argument. Detailed instruction: https://github.com/haotian-liu/LLaVA#launch-a-model-worker-lora-weights-unmerged.')
+        if is_lora and model_base is not None:
             lora_cfg_pretrained = AutoConfig.from_pretrained(model_path)
             _sanitize_tower_paths(lora_cfg_pretrained, load_video_tower=load_video_tower)
             tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
@@ -118,6 +121,9 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             if model.lm_head.weight.shape[0] != token_num:
                 model.lm_head.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
                 model.model.embed_tokens.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
+
+            embed_dtype = model.get_model().embed_tokens.weight.dtype
+            compute_dtype = embed_dtype if embed_dtype.is_floating_point else torch_dtype
 
             print('Loading additional LLaVA weights...')
             if os.path.exists(os.path.join(model_path, 'non_lora_trainables.bin')):
@@ -135,13 +141,34 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             non_lora_trainables = {(k[11:] if k.startswith('base_model.') else k): v for k, v in non_lora_trainables.items()}
             if any(k.startswith('model.model.') for k in non_lora_trainables):
                 non_lora_trainables = {(k[6:] if k.startswith('model.') else k): v for k, v in non_lora_trainables.items()}
-            model.load_state_dict(non_lora_trainables, strict=False)
+            non_lora_trainables = {k: v.to(compute_dtype) for k, v in non_lora_trainables.items()}
+            load_res = model.load_state_dict(non_lora_trainables, strict=False)
 
             from peft import PeftModel
             print('Loading LoRA weights...')
             model = PeftModel.from_pretrained(model, model_path)
-            print('Merging LoRA weights...')
-            model = model.merge_and_unload()
+            if not load_4bit and not load_8bit:
+                print('Merging LoRA weights...')
+                model = model.merge_and_unload()
+            else:
+                print('Keeping LoRA adapters unmerged for quantized (4-bit/8-bit) inference...')
+            _align_fusion_modules(model, compute_dtype, zero_gate=zero_early_fusion_gate)
+
+            proj_keys = [k for k in non_lora_trainables if 'mm_projector' in k]
+            fusion_keys = [k for k in non_lora_trainables if 'early_fusion' in k]
+            base_m = model.get_model()
+            gate_lin = getattr(base_m, 'early_fusion_gate_linear', None)
+            if gate_lin is not None:
+                w_norm = gate_lin.weight.float().norm().item()
+                b_val = gate_lin.bias.float().item() if gate_lin.bias is not None and gate_lin.bias.numel() == 1 else 0.0
+                gate_str = f"gate_v2(w_norm={w_norm:.6f}, bias={b_val:.6f})"
+            else:
+                gate_str = "N/A"
+            print(f"Loaded Stage 2 LoRA + non-LoRA weights from {model_path}: {len(proj_keys)} mm_projector keys, {len(fusion_keys)} early_fusion keys, {gate_str}")
+            if zero_early_fusion_gate:
+                print("Early-fusion gate zeroed for projector+LoRA ablation")
+            if load_res.unexpected_keys:
+                print(f"[Info] Unexpected non-LoRA keys ignored: {load_res.unexpected_keys}")
             print('Model is loaded...')
         elif model_base is not None:
             # Stage 1 / adapter-only checkpoint (mm_projector.bin + optional early_fusion_*)

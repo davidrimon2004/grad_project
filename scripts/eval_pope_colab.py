@@ -291,14 +291,21 @@ def download_checkpoint(
 
 
 def inspect_checkpoint(ckpt_dir: Path) -> Dict[str, Any]:
-    """Inspect mm_projector.bin weights, learned gate value, and trainer_state.json."""
+    """Inspect Stage 1 (mm_projector.bin) or Stage 2 LoRA (non_lora_trainables.bin + adapter_config.json) checkpoint."""
     import torch
 
     bin_path = ckpt_dir / "mm_projector.bin"
-    if not bin_path.exists():
-        raise FileNotFoundError(f"Missing {bin_path}")
+    non_lora_path = ckpt_dir / "non_lora_trainables.bin"
+    adapter_cfg_path = ckpt_dir / "adapter_config.json"
 
-    state = torch.load(bin_path, map_location="cpu")
+    if non_lora_path.exists():
+        weights_path = non_lora_path
+    elif bin_path.exists():
+        weights_path = bin_path
+    else:
+        raise FileNotFoundError(f"Missing mm_projector.bin or non_lora_trainables.bin in {ckpt_dir}")
+
+    state = torch.load(weights_path, map_location="cpu")
     groups: Dict[str, Dict[str, Any]] = {}
     gate_raw: Optional[float] = None
     tanh_g: Optional[float] = None
@@ -330,8 +337,25 @@ def inspect_checkpoint(ckpt_dir: Path) -> Dict[str, Any]:
 
     summary: Dict[str, Any] = {
         "checkpoint_dir": str(ckpt_dir),
+        "weights_file": weights_path.name,
         "groups": groups,
     }
+    if adapter_cfg_path.exists():
+        try:
+            with open(adapter_cfg_path, "r", encoding="utf-8") as f:
+                acfg = json.load(f)
+            adapter_file = next(
+                (n for n in ("adapter_model.safetensors", "adapter_model.bin") if (ckpt_dir / n).exists()),
+                None,
+            )
+            summary["lora"] = {
+                "adapter_file": adapter_file,
+                "r": acfg.get("r"),
+                "lora_alpha": acfg.get("lora_alpha"),
+                "target_modules": acfg.get("target_modules"),
+            }
+        except Exception:
+            pass
     if gate_v2_weight_norm is not None:
         summary["gate_v2"] = {
             "weight_l2_norm": gate_v2_weight_norm,
@@ -497,6 +521,7 @@ def run_pope_eval(
     save_every: int = 100,
     label: Optional[str] = None,
     untrained: bool = False,
+    zero_gate: bool = False,
 ) -> Dict[str, Any]:
     """Run POPE inference (with resume support) and compute exact metrics."""
     import torch
@@ -547,7 +572,7 @@ def run_pope_eval(
             torch.manual_seed(42)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(42)
-        print(f"[eval] Loading model='{model_path}' (base={model_base}, untrained={untrained}) in {prec_desc}...")
+        print(f"[eval] Loading model='{model_path}' (base={model_base}, untrained={untrained}, zero_gate={zero_gate}) in {prec_desc}...")
         tokenizer, model, processor, _ = load_pretrained_model(
             model_path=model_path,
             model_base=model_base,
@@ -556,6 +581,7 @@ def run_pope_eval(
             load_video_tower=False,
             torch_dtype=torch_dtype,
             load_mm_projector=not untrained,
+            zero_early_fusion_gate=zero_gate,
         )
         model.config.use_cache = True
         model.eval()
@@ -813,6 +839,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--model_base", type=str, default=None)
     parser.add_argument("--untrained", action="store_true", help="Skip loading mm_projector.bin to evaluate step-0 model.")
+    parser.add_argument("--zero_gate", action="store_true", help="Zero the early-fusion gate for no-fusion ablation.")
     parser.add_argument("--baseline_model_path", type=str, default=DEFAULT_BASELINE_MODEL)
     parser.add_argument("--skip_official_baseline", action="store_true")
     parser.add_argument("--answers_file", type=Path, default=None)
@@ -879,7 +906,16 @@ def main() -> None:
             save_every=args.save_every,
             label=args.label,
             untrained=args.untrained,
+            zero_gate=args.zero_gate,
         )
+        if args.drive_output_dir is not None:
+            drive_root = Path("/content/drive/MyDrive")
+            if drive_root.exists() or args.drive_output_dir.parent.exists():
+                args.drive_output_dir.mkdir(parents=True, exist_ok=True)
+                for src in (metrics_file, answers_file):
+                    if src.exists():
+                        shutil.copy2(src, args.drive_output_dir / src.name)
+                print(f"[eval] Synced POPE results to Google Drive: {args.drive_output_dir}")
     elif args.action == "compare":
         if args.metrics_files:
             loaded_models = []

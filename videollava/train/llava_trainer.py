@@ -88,7 +88,12 @@ def maybe_zero_3(param, ignore_status=False, name=None):
     return param
 
 
-def _maybe_async_upload_checkpoint_to_gdrive(checkpoint_dir: str, run_dir: str) -> None:
+def _maybe_async_upload_checkpoint_to_gdrive(
+    checkpoint_dir: str,
+    run_dir: str,
+    ckpt_name: Optional[str] = None,
+    exclude_checkpoints: bool = False,
+) -> None:
     """
     Spawns a non-blocking background rclone upload for a freshly saved checkpoint.
     Controlled by env vars:
@@ -106,15 +111,31 @@ def _maybe_async_upload_checkpoint_to_gdrive(checkpoint_dir: str, run_dir: str) 
         os.path.join(os.path.dirname(__file__), "..", "..", "scripts", "gdrive_checkpoint_watcher.py")
     )
     run_name = os.path.basename(os.path.abspath(run_dir))
-    ckpt_name = os.path.basename(os.path.abspath(checkpoint_dir))
+    if ckpt_name is None:
+        ckpt_name = os.path.basename(os.path.abspath(checkpoint_dir))
     dst_remote = f"{remote_base}/{run_name}/{ckpt_name}"
     log_path = os.path.join(run_dir, "gdrive_upload.log")
     try:
+        os.makedirs(run_dir, exist_ok=True)
         log_f = open(log_path, "a", encoding="utf-8")
         if os.path.isfile(watcher_script):
             cmd = [sys.executable, "-u", watcher_script, "--once", checkpoint_dir, "--remote", dst_remote]
+            if exclude_checkpoints:
+                cmd.append("--exclude-checkpoints")
         else:
-            cmd = [rclone_bin, "copy", checkpoint_dir, dst_remote, "--transfers", "2", "--retries", "5"]
+            cmd = [
+                rclone_bin, "copy", checkpoint_dir, dst_remote,
+                "--transfers", "2", "--retries", "5",
+                "--exclude", "global_step*/**",
+                "--exclude", "optimizer.pt",
+                "--exclude", "rng_state*.pth",
+                "--exclude", "zero_to_fp32.py",
+                "--exclude", "latest",
+                "--exclude", "*.tmp",
+                "--exclude", "gdrive_upload.log",
+            ]
+            if exclude_checkpoints:
+                cmd.extend(["--exclude", "checkpoint-*/**"])
         subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, start_new_session=True)
         logger.info(f"[GDriveSync] Triggered background upload: {checkpoint_dir} -> {dst_remote}")
     except Exception as exc:
@@ -123,6 +144,42 @@ def _maybe_async_upload_checkpoint_to_gdrive(checkpoint_dir: str, run_dir: str) 
 
 def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     to_return = {k: t for k, t in named_params if any(key_match in k for key_match in keys_to_match)}
+    to_return = {k: maybe_zero_3(v, ignore_status=True, name=k).cpu() for k, v in to_return.items()}
+    return to_return
+
+
+def get_non_lora_trainable_state_maybe_zero_3(named_params, always_include=("mm_projector", "early_fusion")):
+    """Collects non-LoRA trainable weights (plus mm_projector/early_fusion even if frozen) under ZeRO-2/3."""
+    to_return = {
+        k: t for k, t in named_params
+        if "lora_" not in k and (t.requires_grad or any(kw in k for kw in always_include))
+    }
+    to_return = {k: maybe_zero_3(v, ignore_status=True, name=k).cpu() for k, v in to_return.items()}
+    return to_return
+
+
+def get_peft_lora_state_maybe_zero_3(named_params, bias="none"):
+    """Collects PEFT LoRA weights safely under ZeRO-2/3."""
+    if bias == "none":
+        to_return = {k: t for k, t in named_params if "lora_" in k}
+    elif bias == "all":
+        to_return = {k: t for k, t in named_params if "lora_" in k or "bias" in k}
+    elif bias == "lora_only":
+        to_return = {}
+        maybe_lora_bias = {}
+        lora_bias_names = set()
+        for k, t in named_params:
+            if "lora_" in k:
+                to_return[k] = t
+                bias_name = k.split("lora_")[0] + "bias"
+                lora_bias_names.add(bias_name)
+            elif "bias" in k:
+                maybe_lora_bias[k] = t
+        for k, t in maybe_lora_bias.items():
+            if k in lora_bias_names:
+                to_return[k] = t
+    else:
+        raise NotImplementedError(f"Unsupported lora_bias='{bias}'")
     to_return = {k: maybe_zero_3(v, ignore_status=True, name=k).cpu() for k, v in to_return.items()}
     return to_return
 
@@ -273,8 +330,11 @@ class LLaVATrainer(Trainer):
             decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
             if self.args.mm_projector_lr is not None:
-                projector_parameters = [name for name, _ in opt_model.named_parameters() if "mm_projector" in name]
-                optimizer_grouped_parameters = [
+                projector_parameters = [
+                    name for name, _ in opt_model.named_parameters()
+                    if ("mm_projector" in name or "early_fusion" in name)
+                ]
+                raw_groups = [
                     {
                         "params": [
                             p for n, p in opt_model.named_parameters() if (n in decay_parameters and n not in projector_parameters and p.requires_grad)
@@ -302,8 +362,27 @@ class LLaVATrainer(Trainer):
                         "lr": self.args.mm_projector_lr,
                     },
                 ]
+                optimizer_grouped_parameters = [g for g in raw_groups if len(g["params"]) > 0]
+                if getattr(self.args, "local_rank", -1) in [0, -1]:
+                    base_tensors = [
+                        (n, p) for n, p in opt_model.named_parameters()
+                        if p.requires_grad and n not in projector_parameters
+                    ]
+                    proj_tensors = [
+                        (n, p) for n, p in opt_model.named_parameters()
+                        if p.requires_grad and n in projector_parameters
+                    ]
+                    ef_tensors = [n for n, _ in proj_tensors if "early_fusion" in n]
+                    base_elems = sum(p.numel() for _, p in base_tensors)
+                    proj_elems = sum(p.numel() for _, p in proj_tensors)
+                    logger.info(
+                        f"[Optimizer] base group (lr={self.args.learning_rate}): "
+                        f"{len(base_tensors)} tensors ({base_elems:,} params) | "
+                        f"mm_projector+early_fusion group (lr={self.args.mm_projector_lr}): "
+                        f"{len(proj_tensors)} tensors ({proj_elems:,} params, {len(ef_tensors)} early_fusion)"
+                    )
             else:
-                optimizer_grouped_parameters = [
+                raw_groups = [
                     {
                         "params": [
                             p for n, p in opt_model.named_parameters() if (n in decay_parameters and p.requires_grad)
@@ -317,6 +396,7 @@ class LLaVATrainer(Trainer):
                         "weight_decay": 0.0,
                     },
                 ]
+                optimizer_grouped_parameters = [g for g in raw_groups if len(g["params"]) > 0]
 
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
 
@@ -401,6 +481,70 @@ class LLaVATrainer(Trainer):
                 super()._save_checkpoint(model, trial, metrics=metrics)
             except TypeError:
                 super()._save_checkpoint(model, trial)
+
+            from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+            if hasattr(self, "_get_output_dir"):
+                try:
+                    run_dir = self._get_output_dir(trial=trial)
+                except Exception:
+                    run_dir = self.args.output_dir
+            else:
+                run_dir = self.args.output_dir
+            output_dir = os.path.join(run_dir, checkpoint_folder)
+
+            is_dist = torch.distributed.is_available() and torch.distributed.is_initialized()
+            if getattr(self.args, "lora_enable", False):
+                # Gather non-LoRA trainable params + mm_projector + early_fusion across ALL ranks (ZeRO-3 safe)
+                non_lora_state_dict = get_non_lora_trainable_state_maybe_zero_3(self.model.named_parameters())
+
+                # Defensive rescue: verify LoRA adapter file exists and is non-empty after HF save
+                if is_dist:
+                    torch.distributed.barrier()
+                adapter_sft = os.path.join(output_dir, "adapter_model.safetensors")
+                adapter_bin = os.path.join(output_dir, "adapter_model.bin")
+                has_adapter = (
+                    (os.path.isfile(adapter_sft) and os.path.getsize(adapter_sft) >= 1024)
+                    or (os.path.isfile(adapter_bin) and os.path.getsize(adapter_bin) >= 1024)
+                )
+                peft_state = None
+                if not has_adapter:
+                    peft_state = get_peft_lora_state_maybe_zero_3(
+                        self.model.named_parameters(),
+                        getattr(self.args, "lora_bias", "none"),
+                    )
+
+                if getattr(self.args, "local_rank", -1) in [0, -1]:
+                    os.makedirs(output_dir, exist_ok=True)
+                    if peft_state is not None:
+                        self.model.save_pretrained(output_dir, state_dict=peft_state)
+                    self.model.config.save_pretrained(output_dir)
+                    torch.save(non_lora_state_dict, os.path.join(output_dir, "non_lora_trainables.bin"))
+                    logger.info(
+                        f"[Checkpoint] Saved Stage 2 LoRA config.json + non_lora_trainables.bin "
+                        f"({len(non_lora_state_dict)} tensors) to {output_dir}"
+                    )
+
+                if is_dist:
+                    torch.distributed.barrier()
+
+            if getattr(self.args, "local_rank", -1) in [0, -1] and os.path.isdir(output_dir):
+                _maybe_async_upload_checkpoint_to_gdrive(output_dir, run_dir)
+
+    def log(self, logs, *args, **kwargs):
+        if isinstance(logs, dict) and "loss" in logs:
+            try:
+                base_model = self.model.get_model() if hasattr(self.model, "get_model") else self.model
+                gate_lin = getattr(base_model, "early_fusion_gate_linear", None)
+                if gate_lin is not None and hasattr(gate_lin, "weight") and gate_lin.weight.numel() > 0:
+                    w = gate_lin.weight.detach().float()
+                    logs["gate_v2_w_norm"] = round(float(w.norm().item()), 6)
+                    logs["gate_v2_max_abs"] = round(float(w.abs().max().item()), 6)
+                    if gate_lin.bias is not None and gate_lin.bias.numel() == 1:
+                        logs["gate_v2_bias"] = round(float(gate_lin.bias.detach().float().item()), 6)
+            except Exception:
+                pass
+        return super().log(logs, *args, **kwargs)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):

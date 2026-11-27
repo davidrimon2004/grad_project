@@ -191,6 +191,32 @@ class LlavaMetaModel:
             if len(gate_lin_weights) > 0:
                 self.early_fusion_gate_linear.load_state_dict(gate_lin_weights)
 
+            early_total = (
+                len(early_attn_weights)
+                + len(early_ln_weights)
+                + len(early_kv_ln_weights)
+                + len(gate_lin_weights)
+            )
+            if early_total > 0:
+                gate_w_norm = float(self.early_fusion_gate_linear.weight.detach().float().norm().item())
+                gate_b_val = (
+                    float(self.early_fusion_gate_linear.bias.detach().float().item())
+                    if self.early_fusion_gate_linear.bias is not None and self.early_fusion_gate_linear.bias.numel() == 1
+                    else 0.0
+                )
+                print(
+                    f"[INFO] Loaded early_fusion from {pretrain_mm_mlp_adapter}: "
+                    f"{early_total} keys matched (attn={len(early_attn_weights)}, "
+                    f"ln={len(early_ln_weights)}, kv_ln={len(early_kv_ln_weights)}, "
+                    f"gate_linear={len(gate_lin_weights)}), "
+                    f"gate_v2(w_norm={gate_w_norm:.6f}, bias={gate_b_val:.6f})"
+                )
+            else:
+                print(
+                    f"[WARN] Loaded mm_projector from {pretrain_mm_mlp_adapter} with 0 early_fusion keys; "
+                    "early_fusion_* remains at initial state."
+                )
+
 
 class LlavaMetaForCausalLM(ABC):
 

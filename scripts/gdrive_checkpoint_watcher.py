@@ -37,7 +37,24 @@ DEFAULT_LOG_FILES = [
     "/home/aitech/pretrain_status.txt",
     "/home/aitech/precompute_embeddings.log",
     "/home/aitech/boot_resume.log",
+    "/home/aitech/finetune_lora_log.txt",
+    "/home/aitech/finetune_lora_status.txt",
+    "/home/aitech/hdd/pretrain_logs/pretrain_status.txt",
+    "/home/aitech/hdd/finetune_logs/finetune_lora_status.txt",
 ]
+
+# Giant DeepSpeed / optimizer state shards that do not need to be mirrored to Drive
+# by default (weight files + configs + adapter/trainer state are sufficient for eval
+# and lightweight resume). Override with --include-optimizer or GDRIVE_UPLOAD_OPTIMIZER=1.
+DEFAULT_DIR_EXCLUDES = (
+    "global_step*/**",
+    "optimizer.pt",
+    "rng_state*.pth",
+    "zero_to_fp32.py",
+    "latest",
+    "*.tmp",
+    "gdrive_upload.log",
+)
 
 # Files we consider part of a usable weight checkpoint
 WEIGHT_FILENAMES = (
@@ -148,6 +165,8 @@ def rclone_upload(
     dst_remote: str,
     retries: int = 5,
     bwlimit: Optional[str] = None,
+    include_optimizer: bool = False,
+    exclude_checkpoints: bool = False,
 ) -> bool:
     cmd = [
         rclone_bin,
@@ -161,6 +180,13 @@ def rclone_upload(
         "--stats-one-line",
         "--stats", "30s",
     ]
+    if src.is_dir():
+        use_opt = include_optimizer or (os.environ.get("GDRIVE_UPLOAD_OPTIMIZER", "0") == "1")
+        if not use_opt:
+            for pat in DEFAULT_DIR_EXCLUDES:
+                cmd.extend(["--exclude", pat])
+        if exclude_checkpoints:
+            cmd.extend(["--exclude", "checkpoint-*/**"])
     if bwlimit:
         cmd.extend(["--bwlimit", bwlimit])
 
@@ -220,20 +246,24 @@ def discover_upload_targets(
         if run_name in ("downloaded_projector",):
             continue
 
-        # 1. Final weights at <run_dir>/mm_projector.bin (highest priority = 0)
+        # 1. Final weights at <run_dir>/ (mm_projector.bin or LoRA adapter + non_lora_trainables.bin)
+        found_final_weight = False
         for fname in WEIGHT_FILENAMES:
             fpath = run_dir / fname
             if fpath.is_file() and _is_file_settled(fpath, settle_secs):
+                found_final_weight = True
                 sig = _file_signature(fpath)
                 if sig:
                     targets.append((0, 0, f"{run_name}/final/{fname}", fpath, f"{run_name}/final", sig))
-                # Also attach config.json / trainer_state.json alongside final weights
-                for mname in META_FILENAMES:
-                    mpath = run_dir / mname
-                    if mpath.is_file() and _is_file_settled(mpath, settle_secs):
-                        msig = _file_signature(mpath)
-                        if msig:
-                            targets.append((0, 1, f"{run_name}/final/{mname}", mpath, f"{run_name}/final", msig))
+
+        if found_final_weight:
+            # Attach config.json / trainer_state.json / adapter_config.json ONCE per run_dir
+            for mname in META_FILENAMES:
+                mpath = run_dir / mname
+                if mpath.is_file() and _is_file_settled(mpath, settle_secs):
+                    msig = _file_signature(mpath)
+                    if msig:
+                        targets.append((0, 1, f"{run_name}/final/{mname}", mpath, f"{run_name}/final", msig))
 
         # 2. Intermediate checkpoint-<step> dirs (newest step first!)
         for child in run_dir.iterdir():
@@ -252,6 +282,26 @@ def discover_upload_targets(
             if not all(_is_file_settled(wf, settle_secs) for wf in weight_files):
                 continue
 
+            # For Stage 2 LoRA checkpoints, wait until non_lora_trainables.bin and config.json
+            # are also written & settled (with a 60s legacy fallback based on trainer_state.json).
+            if (child / "adapter_config.json").is_file():
+                legacy_settled = False
+                if ts_file.is_file():
+                    try:
+                        legacy_settled = (time.time() - ts_file.stat().st_mtime) >= 60.0
+                    except OSError:
+                        legacy_settled = False
+                if not legacy_settled:
+                    req_non_lora = child / "non_lora_trainables.bin"
+                    req_cfg = child / "config.json"
+                    if not (
+                        req_non_lora.is_file()
+                        and _is_file_settled(req_non_lora, settle_secs)
+                        and req_cfg.is_file()
+                        and _is_file_settled(req_cfg, settle_secs)
+                    ):
+                        continue
+
             # Build composite signature of weight + meta files in this checkpoint dir
             sig_parts = []
             for fn in sorted(set(WEIGHT_FILENAMES + META_FILENAMES)):
@@ -268,7 +318,31 @@ def discover_upload_targets(
     return [(k, p, sub, sig) for _, _, k, p, sub, sig in targets]
 
 
-def _write_live_status_snapshot(out_path: Path) -> None:
+def _collect_log_files(watch_root: Optional[Path] = None) -> List[Path]:
+    """Collect existing training/status log files across Stage 1, Stage 2, and custom env overrides."""
+    candidates: List[Path] = [Path(p) for p in DEFAULT_LOG_FILES]
+    extra = os.environ.get("GDRIVE_EXTRA_LOGS", "").strip()
+    if extra:
+        for item in extra.split(":"):
+            if item.strip():
+                candidates.append(Path(item.strip()))
+    if watch_root is not None and watch_root.is_dir():
+        for run_dir in sorted(watch_root.iterdir()):
+            if run_dir.is_dir():
+                for name in ("finetune_lora_status.txt", "pretrain_status.txt", "train_status.txt"):
+                    candidates.append(run_dir / name)
+
+    seen = set()
+    existing: List[Path] = []
+    for p in candidates:
+        key = str(p)
+        if key not in seen and p.is_file():
+            seen.add(key)
+            existing.append(p)
+    return existing
+
+
+def _write_live_status_snapshot(out_path: Path, watch_root: Optional[Path] = None) -> None:
     """Writes a compact status snapshot (timestamp, GPU stats, latest training log tail)."""
     lines = [f"Updated: {_ts()}", ""]
     try:
@@ -281,15 +355,13 @@ def _write_live_status_snapshot(out_path: Path) -> None:
     except Exception as exc:
         lines.append(f"nvidia-smi unavailable: {exc}")
 
-    for log_file in DEFAULT_LOG_FILES:
-        lp = Path(log_file)
-        if lp.is_file():
-            lines.append(f"\n=== TAIL {lp.name} ===")
-            try:
-                content = lp.read_text(encoding="utf-8", errors="replace").splitlines()
-                lines.extend(content[-30:])
-            except Exception as exc:
-                lines.append(f"(read error: {exc})")
+    for lp in _collect_log_files(watch_root):
+        lines.append(f"\n=== TAIL {lp.parent.name}/{lp.name} ===")
+        try:
+            content = lp.read_text(encoding="utf-8", errors="replace").splitlines()
+            lines.extend(content[-30:])
+        except Exception as exc:
+            lines.append(f"(read error: {exc})")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -306,6 +378,7 @@ def watch_loop(
     sync_logs: bool = True,
     log_sync_interval: float = 900.0,
     max_existing: int = 0,
+    include_optimizer: bool = False,
 ) -> None:
     rclone_bin = find_rclone()
     if not rclone_bin:
@@ -363,7 +436,7 @@ def watch_loop(
             if state.get(key) == sig:
                 continue
             dst = f"{remote_base}/{remote_subpath}"
-            if rclone_upload(rclone_bin, local_path, dst, bwlimit=bwlimit):
+            if rclone_upload(rclone_bin, local_path, dst, bwlimit=bwlimit, include_optimizer=include_optimizer):
                 state[key] = sig
                 _save_state(state_path, state)
                 uploaded_any = True
@@ -372,14 +445,12 @@ def watch_loop(
         now = time.time()
         if sync_logs and running and (uploaded_any or (now - last_log_sync >= log_sync_interval)):
             try:
-                _write_live_status_snapshot(status_snapshot)
+                _write_live_status_snapshot(status_snapshot, watch_root=watch_root)
                 rclone_upload(rclone_bin, status_snapshot, f"{remote_base}/logs", retries=2, bwlimit=bwlimit)
             except Exception as exc:
                 log(f"WARN failed to sync live_status.txt: {exc}")
-            for log_file in DEFAULT_LOG_FILES:
-                lp = Path(log_file)
-                if lp.is_file():
-                    rclone_upload(rclone_bin, lp, f"{remote_base}/logs", retries=2, bwlimit=bwlimit)
+            for lp in _collect_log_files(watch_root):
+                rclone_upload(rclone_bin, lp, f"{remote_base}/logs", retries=2, bwlimit=bwlimit)
             last_log_sync = time.time()
 
         for _ in range(int(max(1, interval))):
@@ -407,6 +478,16 @@ def main() -> None:
         default=1,
         help="On first start with empty state, upload at most N newest pre-existing checkpoints (0 = upload all existing; default: 1 = latest + all future).",
     )
+    parser.add_argument(
+        "--include-optimizer",
+        action="store_true",
+        help="Also upload DeepSpeed global_step*/optimizer shards (excluded by default to save Drive space/bandwidth).",
+    )
+    parser.add_argument(
+        "--exclude-checkpoints",
+        action="store_true",
+        help="In --once mode, exclude checkpoint-*/ subdirs (used when uploading a run_dir's top-level final weights).",
+    )
     args = parser.parse_args()
 
     if args.once:
@@ -421,7 +502,14 @@ def main() -> None:
         if not src.exists():
             log(f"ERR path does not exist: {src}")
             sys.exit(1)
-        ok = rclone_upload(rclone_bin, src, args.remote, bwlimit=args.bwlimit)
+        ok = rclone_upload(
+            rclone_bin,
+            src,
+            args.remote,
+            bwlimit=args.bwlimit,
+            include_optimizer=args.include_optimizer,
+            exclude_checkpoints=args.exclude_checkpoints,
+        )
         sys.exit(0 if ok else 1)
 
     watch_loop(
@@ -434,6 +522,7 @@ def main() -> None:
         bwlimit=args.bwlimit,
         sync_logs=not args.no_logs,
         max_existing=args.max_existing,
+        include_optimizer=args.include_optimizer,
     )
 
 
